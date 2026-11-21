@@ -27,6 +27,7 @@ import android.widget.TextView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
@@ -1562,7 +1563,7 @@ class MainActivity : Activity() {
         val session = current
         if (session.isEmpty() || Files.origin(this) == null) return
         if (workingOf != session) {
-            workingOf = session; showWorking(null); showWorkingBubble("", ""); showMinionStrip(null)
+            workingOf = session; showWorking(null); showWorkingBubble("", ""); showMinionStrip(null, null)
         }
         // This is also the phone-open heartbeat for a delegated child. Ask independently: working status may wait
         // behind a busy agent for up to a minute, while end safety needs this refresh every few seconds.
@@ -1588,22 +1589,28 @@ class MainActivity : Activity() {
     private var minionRows: LinearLayout? = null
     private var minionTitle: TextView? = null
     private var minionChain: JSONObject? = null
+    private var minionHelpers: JSONArray? = null  // Claude's own subagents and workflow runs: status only
     private var decidingMinion = ""
 
     private fun pollMinions(session: String) {
         ask("/chat/minions/view", JSONObject().put("session", session)) { answer ->
             if (session != current || chatScreen.visibility != View.VISIBLE) return@ask
             val chain = answer.optJSONObject("chain")
-            showMinionStrip(chain)
+            showMinionStrip(chain, answer.optJSONArray("subagents"))
             maybeOfferMinionEnd(chain)
         }
     }
 
-    /** The boss chat's compact crew card. A child row opens that chat; the card's heading opens all hand-offs. */
-    private fun showMinionStrip(chain: JSONObject?) {
+    /** The boss chat's compact crew card. A child row opens that chat; the card's heading opens all hand-offs.
+     *  Claude's own helpers (subagents, workflow runs) are counted in the heading while running and listed in the
+     *  sheet, status only: they run inside the chat (the user's wish, 2026-11-21). */
+    private fun showMinionStrip(chain: JSONObject?, helpers: JSONArray?) {
         minionChain = chain
-        val minions = chain?.optJSONArray("minions")
-        if (chain == null || !chain.optBoolean("is_boss") || minions == null || minions.length() == 0) {
+        minionHelpers = helpers
+        val delegated = chain?.takeIf { it.optBoolean("is_boss") }?.optJSONArray("minions") ?: JSONArray()
+        val running = (0 until (helpers?.length() ?: 0)).count { helpers!!.getJSONObject(it).optString("state") == "running" }
+        val minions = delegated
+        if (minions.length() == 0 && running == 0) {
             minionRow?.let { (it.parent as? android.view.ViewGroup)?.removeView(it) }
             minionRow = null; minionRows = null; minionTitle = null
             return
@@ -1636,8 +1643,11 @@ class MainActivity : Activity() {
             }
         }
         minionTitle?.apply {
-            text = "Delegated agents · ${chain.optInt("used")}/${chain.optInt("slots")} slots  ›"
-            contentDescription = "Delegated agents, ${chain.optInt("used")} of ${chain.optInt("slots")} slots. Open hand-offs"
+            val parts = listOfNotNull(
+                if (minions.length() > 0) "${chain?.optInt("used") ?: 0}/${chain?.optInt("slots") ?: 0} slots" else null,
+                if (running > 0) "$running ${if (running == 1) "subagent" else "subagents"}" else null)
+            text = "Delegated agents · ${parts.joinToString(" · ")}  ›"
+            contentDescription = "Delegated agents, ${parts.joinToString(", ")}. Open the list"
         }
         minionRows?.removeAllViews()
         for (i in 0 until minions.length()) {
@@ -1684,8 +1694,8 @@ class MainActivity : Activity() {
     }
 
     private fun showMinions() {
-        val chain = minionChain ?: return
-        panel = MinionSheet(this, chain,
+        val chain = minionChain ?: JSONObject()
+        panel = MinionSheet(this, chain, minionHelpers ?: JSONArray(),
             onOpen = { session -> open(session) },
             onDecide = { session, decision -> decideMinion(session, decision) }).also { it.show() }
     }

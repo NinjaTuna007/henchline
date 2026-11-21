@@ -63,14 +63,26 @@ class Routes(AioHTTPTestCase):
         shown = {"boss": "boss", "used": 1, "slots": 8, "minions": []}
         with mock.patch.object(server.chains, "view", return_value=shown) as view:
             answer = await self.client.get("/chat/minions?session=boss", headers=self.origin())
-        self.assertEqual(await answer.json(), {"chain": shown})
+        self.assertEqual(await answer.json(), {"chain": shown, "subagents": []})  # not a Claude chat: none
         view.assert_called_once_with("boss")
 
         with mock.patch.object(server.chains, "note_phone_view") as note, \
                 mock.patch.object(server.chains, "view", return_value=shown):
             answer = await self.client.post("/chat/minions/view", json={"session": "child"}, headers=self.origin())
-        self.assertEqual(await answer.json(), {"chain": shown})
+        self.assertEqual(await answer.json(), {"chain": shown, "subagents": []})
         note.assert_called_once_with("child")
+
+    async def test_a_claude_chats_own_helpers_ride_along_and_never_break_the_strip(self):
+        helper = {"id": "a1", "description": "Measuring", "kind": "subagent", "state": "running", "started": 1, "last": 2}
+        with mock.patch.object(server.chains, "view", return_value={}), \
+                mock.patch.object(server.subagents, "helpers", return_value=[helper]) as helpers:
+            answer = await self.client.get("/chat/minions?session=claude-x", headers=self.origin())
+        self.assertEqual(await answer.json(), {"chain": None, "subagents": [helper]})
+        helpers.assert_called_once_with("claude-x")
+        with mock.patch.object(server.chains, "view", return_value={}), \
+                mock.patch.object(server.subagents, "helpers", side_effect=OSError("odd")):
+            answer = await self.client.get("/chat/minions?session=claude-x", headers=self.origin())
+        self.assertEqual(await answer.json(), {"chain": None, "subagents": []})
 
     async def test_end_or_keep_requires_a_waiting_request(self):
         with mock.patch.object(server.chains, "decide_end", return_value=True) as decide:

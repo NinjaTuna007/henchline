@@ -1031,13 +1031,15 @@ class UsageSheet(activity: Activity, private val usage: JSONObject) : BottomPane
 class MinionSheet(
     activity: Activity,
     private val chain: JSONObject,
+    private val helpers: org.json.JSONArray,
     private val onOpen: (String) -> Unit,
     private val onDecide: (String, String) -> Unit,
 ) : BottomPanel(activity) {
     fun show() {
-        val sheet = open("Delegated agents", "${chain.optInt("used")} of ${chain.optInt("slots")} slots in use")
+        val minions = chain.takeIf { it.optBoolean("is_boss") }?.optJSONArray("minions")
+        val sheet = open("Delegated agents", if ((minions?.length() ?: 0) > 0)
+            "${chain.optInt("used")} of ${chain.optInt("slots")} slots in use" else "None started from this chat")
         val rows = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        val minions = chain.optJSONArray("minions")
         for (i in 0 until (minions?.length() ?: 0)) {
             val item = minions!!.getJSONObject(i)
             val session = item.optString("session")
@@ -1055,7 +1057,8 @@ class MinionSheet(
                 rows.addView(choices, wide(10))
             }
         }
-        val handoffs = chain.optJSONArray("handoffs")
+        addHelpersTo(rows, helpers, first = (minions?.length() ?: 0) == 0)
+        val handoffs = if (minions != null) chain.optJSONArray("handoffs") else null
         if (handoffs != null && handoffs.length() > 0) rows.addView(label("HAND-OFFS IN ORDER"), wide(20))
         for (i in 0 until (handoffs?.length() ?: 0)) {
             val handoff = handoffs!!.getJSONObject(i)
@@ -1076,6 +1079,55 @@ class MinionSheet(
                 height = minOf(px(560), (activity.resources.displayMetrics.heightPixels * 0.68).toInt()) })
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
+    }
+
+    /** Claude's own helpers, after the delegated chats: a row each (state dot, what it was asked, its kind and how long
+     *  it has run), not tappable, with one line saying why. Done green, failed red, running cyan, stopped grey. */
+    private fun addHelpersTo(rows: LinearLayout, helpers: org.json.JSONArray, first: Boolean) {
+        if (helpers.length() == 0) return
+        rows.addView(label("CLAUDE'S OWN HELPERS"), wide(if (first) 12 else 20))
+        val now = System.currentTimeMillis() / 1000.0
+        for (i in 0 until helpers.length()) {
+            val item = helpers.getJSONObject(i)
+            val state = item.optString("state")
+            val kind = if (item.optString("kind") == "workflow") "workflow" else "subagent"
+            val seconds = ((if (state == "running") now else item.optDouble("last", now)) - item.optDouble("started", now)).coerceAtLeast(0.0)
+            val took = when {
+                seconds < 60 -> "${seconds.toInt()} s"
+                seconds < 3600 -> "${(seconds / 60).toInt()} min"
+                else -> "${(seconds / 3600).toInt()} h ${((seconds % 3600) / 60).toInt()} min"
+            }
+            val progress = item.optString("progress").takeIf { it.isNotEmpty() }?.let { " · $it agents" }.orEmpty()
+            val detail = when (state) {
+                "running" -> "$kind · running $took$progress"
+                "done" -> "$kind · done after $took$progress"
+                "failed" -> "$kind · failed after $took"
+                else -> "$kind · stopped"
+            }
+            val dot = colour(when (state) {
+                "running" -> R.color.cyan; "done" -> R.color.call_live; "failed" -> R.color.hang; else -> R.color.muted
+            })
+            rows.addView(LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = px(48); setPadding(px(4), px(6), px(4), px(6))
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+                contentDescription = "${item.optString("description")}. $detail. Status only"
+                addView(View(activity).apply { background = rounded(dot, 5f) },
+                    LinearLayout.LayoutParams(px(10), px(10)).apply { marginEnd = px(14) })
+                addView(LinearLayout(activity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(TextView(activity).apply {
+                        text = item.optString("description"); setTextColor(colour(R.color.text)); textSize = 14f
+                        maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END
+                    })
+                    addView(TextView(activity).apply { text = detail; setTextColor(colour(R.color.muted)); textSize = 12f })
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }, wide(2))
+        }
+        rows.addView(TextView(activity).apply {
+            text = "Status only: these run inside the chat and can't be opened."
+            setTextColor(colour(R.color.muted)); textSize = 12f; setPadding(px(4), px(4), px(4), 0)
+        }, wide(2))
     }
 }
 

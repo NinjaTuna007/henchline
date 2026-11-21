@@ -41,7 +41,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent), str(HERE.parent / "handsfree/core")]  # voice/, and hands-free's routing
 import routing  # noqa: E402
 from routing import Heard  # noqa: E402
-from voice import chains, commands, cursor_cli, files, minions, pickup, plans, reminders, snaps, spool, screenshot, usage, voices, workflows  # noqa: E402
+from voice import chains, commands, cursor_cli, files, minions, pickup, plans, reminders, snaps, spool, screenshot, subagents, usage, voices, workflows  # noqa: E402
 from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
 from voice.desktop import current as desktop, cursor_bridge, tmux  # noqa: E402
 from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CALL_SILENT, CALL_STAY_ON, CALL_HANGUP, CALL_MIRROR, CALL_ORIGIN,  # noqa: E402
@@ -1019,11 +1019,25 @@ async def chat_workflows(request: web.Request) -> web.Response:
 
 
 async def chat_minions(request: web.Request) -> web.Response:
-    """The delegated job containing this chat, shaped for its strip and hand-off sheet."""
+    """The delegated job containing this chat, shaped for its strip and hand-off sheet, and the chat's own helpers
+    (Claude's subagents and workflow runs: status only, voice/subagents.py)."""
     trusted(request)
     session = request.query.get("session", "")
-    found = await asyncio.get_running_loop().run_in_executor(None, chains.view, session)
-    return web.json_response({"chain": found or None})
+    loop = asyncio.get_running_loop()
+    found = await loop.run_in_executor(None, chains.view, session)
+    helpers = await loop.run_in_executor(None, _helpers, session)
+    return web.json_response({"chain": found or None, "subagents": helpers})
+
+
+def _helpers(session: str) -> list[dict]:
+    """A Claude chat's own helpers for the strip; never fails the strip it rides along with."""
+    if not session.startswith("claude-"):
+        return []
+    try:
+        return subagents.helpers(session)
+    except Exception as e:  # noqa: BLE001 (Claude's record format may change under us)
+        print(f"subagents: couldn't read {session}'s helpers: {e}", file=sys.stderr)
+        return []
 
 
 async def chat_minion_view(request: web.Request) -> web.Response:
@@ -1038,7 +1052,8 @@ async def chat_minion_view(request: web.Request) -> web.Response:
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, chains.note_phone_view, session)
     found = await loop.run_in_executor(None, chains.view, session)
-    return web.json_response({"chain": found or None})
+    helpers = await loop.run_in_executor(None, _helpers, session)
+    return web.json_response({"chain": found or None, "subagents": helpers})
 
 
 async def chat_minion_decide(request: web.Request) -> web.Response:
