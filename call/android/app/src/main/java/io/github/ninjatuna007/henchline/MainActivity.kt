@@ -2390,7 +2390,7 @@ class MainActivity : Activity() {
         val words = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, 0, 0) }
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         top.addView(TextView(this).apply {
-            text = (if (session in pins()) "📌 " else "") + project.replace("_", " ")
+            text = project.replace("_", " ")  // the "Pinned" section header already says so
             setTextColor(getColor(R.color.text)); textSize = 17f; typeface = android.graphics.Typeface.DEFAULT_BOLD
             maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -2524,10 +2524,11 @@ class MainActivity : Activity() {
         chip.text = if (on) "☰ Plan" else "◇ Agent"
         chip.setTextColor(getColor(if (on) R.color.navy else R.color.muted))
         chip.typeface = if (on) android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL) else android.graphics.Typeface.DEFAULT
-        chip.background = android.graphics.drawable.GradientDrawable().apply {
+        // Drawn 40dp tall inside the 48dp chip, so the whole 48dp takes the tap (the design audit)
+        chip.background = android.graphics.drawable.InsetDrawable(android.graphics.drawable.GradientDrawable().apply {
             cornerRadius = dp(18).toFloat()
             if (on) setColor(getColor(R.color.cyan)) else { setColor(android.graphics.Color.TRANSPARENT); setStroke(dp(1), getColor(R.color.surface_high)) }
-        }
+        }, 0, dp(4), 0, dp(4))
         chip.contentDescription = if (on) "Plan mode on: tap to leave it" else "Agent mode: tap for plan mode"
     }
 
@@ -2696,9 +2697,13 @@ class MainActivity : Activity() {
             addView(TextView(this@MainActivity).apply {
                 text = title; textSize = 16f; setTextColor(getColor(R.color.text))
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            // A value, not the one action: muted, with a chevron saying the row opens
             value.textSize = 14f
-            value.setTextColor(getColor(R.color.cyan))
+            value.setTextColor(getColor(R.color.muted))
             addView(value)
+            addView(TextView(this@MainActivity).apply {
+                text = "›"; textSize = 18f; setTextColor(getColor(R.color.muted)); setPadding(dp(8), 0, 0, 0)
+            })
         }
         val stayValue = TextView(this)
         val cutValue = TextView(this)
@@ -2708,9 +2713,9 @@ class MainActivity : Activity() {
         }
         showDefaults()
         list.addView(UsageDraw(this).label("VOICES").apply { setPadding(dp(20), dp(24), dp(20), dp(6)) })
-        list.addView(line("Agents' voices", TextView(this).apply { text = "Choose"; textSize = 14f; setTextColor(getColor(R.color.cyan)) }) { voices() })
+        list.addView(line("Agents' voices", TextView(this).apply { text = "Choose" }) { voices() })
         list.addView(TextView(this).apply {
-            text = "Each agent its own, one voice for all, or surprise me. A tap on a voice picks the next one."
+            text = "Each agent its own, one voice for all, or surprise me."
             textSize = 13f; setTextColor(getColor(R.color.muted)); setPadding(dp(20), 0, dp(20), dp(10))
         })
         list.addView(UsageDraw(this).label("NEW CALLS").apply { setPadding(dp(20), dp(24), dp(20), dp(6)) })

@@ -238,6 +238,13 @@ open class BottomPanel(protected val activity: Activity) {
         background = rounded(fill, 24f); stateListAnimator = null
     }
 
+    /** The system's touch ripple, for rows and small buttons that act when tapped. */
+    protected fun ripple(): android.graphics.drawable.Drawable? {
+        val value = android.util.TypedValue()
+        activity.theme.resolveAttribute(android.R.attr.selectableItemBackground, value, true)
+        return activity.getDrawable(value.resourceId)
+    }
+
     protected fun quiet(words: String, then: () -> Unit) = Button(activity).apply {
         text = words; isAllCaps = false; textSize = 16f; setTextColor(colour(R.color.cyan))
         setBackgroundColor(Color.TRANSPARENT); stateListAnimator = null
@@ -480,7 +487,8 @@ class ChatActionsSheet(
         val rows = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         sheet.addView(rows, wide(16))
         onPin?.let { pin ->
-            rows.addView(row(if (pinned) "📌" else "📌", if (pinned) "Unpin chat" else "Pin chat",
+            // Unpin has no pin: the same 📌 for both read as the same action (the design audit, 2026-11-21)
+            rows.addView(row(if (pinned) "" else "📌", if (pinned) "Unpin chat" else "Pin chat",
                 if (pinned) "It goes back with the others" else "Stays at the top of the list",
                 R.color.text) { pin(!pinned); close() })
         }
@@ -1517,12 +1525,16 @@ class VoicesSheet(
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
     }
 
+    private var picking: String? = null  // the agent whose voice list is open
+    private var playing: String? = null  // the voice being previewed, cyan for a few seconds
+
     private fun draw(body: LinearLayout) {
         body.removeAllViews()
         val mode = setup.optString("mode", "own")
+        // On the sheet's surface the track needs the darker navy to show (the Chat|Plan switch sits on navy)
         val track = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
-            background = rounded(colour(R.color.surface), 20f); setPadding(px(3), px(3), px(3), px(3))
+            background = rounded(colour(R.color.navy), 20f); setPadding(px(3), px(3), px(3), px(3))
         }
         for ((id, label) in listOf("own" to "Each its own", "one" to "One voice", "surprise" to "Surprise me")) {
             track.addView(TextView(activity).apply {
@@ -1532,42 +1544,102 @@ class VoicesSheet(
                 setOnClickListener {
                     val change = JSONObject().put("mode", id)
                     if (id == "surprise") change.put("again", true)
+                    picking = null
                     save(change) { setup = it; draw(body) }
                 }
-            }, LinearLayout.LayoutParams(0, px(40), 1f))
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
         }
-        body.addView(track, wide(4))
+        body.addView(track, wide(4, px(40)))
+        body.addView(TextView(activity).apply {
+            text = when (mode) {
+                "one" -> "One voice for every agent: tap an agent to pick it"
+                "surprise" -> "Surprise me: tap it again for new voices"
+                else -> "Each agent sounds different: tap one to pick its voice"
+            }
+            textSize = 13f; setTextColor(colour(R.color.muted))
+        }, wide(8))
         val showing = setup.optJSONObject("showing")
         val choices = setup.optJSONArray("choices")
+        val canPick = mode != "surprise" && choices != null && choices.length() > 0
         for ((id, name) in agents) {
             val voice = showing?.optJSONObject(id)
             val voiceId = voice?.optString("id").orEmpty()
             val voiceName = voice?.optString("name").orEmpty().ifEmpty { voiceId }
+            val open = canPick && picking == id
             body.addView(LinearLayout(activity).apply {
                 orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, px(10), 0, px(4))
+                minimumHeight = px(64)
+                if (canPick) {
+                    background = ripple()
+                    setOnClickListener { picking = if (open) null else id; draw(body) }
+                }
                 addView(ImageView(activity).apply { setImageResource(MainActivity.avatarOf(id)) },
                     LinearLayout.LayoutParams(px(40), px(40)))
                 addView(LinearLayout(activity).apply {
                     orientation = LinearLayout.VERTICAL
                     addView(TextView(activity).apply { text = name; setTextColor(colour(R.color.text)); textSize = 15f })
-                    addView(TextView(activity).apply {
-                        text = voiceName; setTextColor(colour(R.color.cyan)); textSize = 13f
-                        if (mode != "surprise" && choices != null) setOnClickListener {
-                            val next = nextVoice(choices, voiceId)
-                            val change = JSONObject().put("mode", mode).put("voice", next)
-                            if (mode == "own") change.put("agent", id)
-                            save(change) { setup = it; draw(body) }
-                        }
-                    })
+                    addView(TextView(activity).apply { text = voiceName; setTextColor(colour(R.color.muted)); textSize = 13f })
                 }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = px(12) })
+                if (canPick) addView(TextView(activity).apply {
+                    text = if (open) "⌄" else "›"; textSize = 18f; setTextColor(colour(R.color.muted))
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(px(24), px(48)))
                 addView(TextView(activity).apply {
-                    text = "▶"; textSize = 18f; setTextColor(colour(R.color.cyan)); setPadding(px(12), px(8), px(4), px(8))
-                    contentDescription = "Play $name"
-                    setOnClickListener { if (voiceId.isNotEmpty()) preview(voiceId) }
-                })
+                    text = "▶"; textSize = 18f; gravity = Gravity.CENTER
+                    setTextColor(colour(if (voiceId.isNotEmpty() && voiceId == playing) R.color.cyan else R.color.text))
+                    background = ripple(); contentDescription = "Play $name's voice"
+                    setOnClickListener { if (voiceId.isNotEmpty()) play(body, voiceId) }
+                }, LinearLayout.LayoutParams(px(48), px(48)))
+            })
+            if (open) addVoiceList(body, choices!!, voiceId, mode, id)
+        }
+    }
+
+    /** The voices to choose from, as in the model picker: one row each, the chosen one marked. */
+    private fun addVoiceList(body: LinearLayout, choices: org.json.JSONArray, current: String, mode: String, agent: String) {
+        val list = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded(colour(R.color.navy), 18f); setPadding(px(4), px(4), px(4), px(4))
+        }
+        for (i in 0 until choices.length()) {
+            val choice = choices.optJSONObject(i) ?: continue
+            val vid = choice.optString("id")
+            if (vid.isEmpty()) continue
+            val chosen = vid == current
+            list.addView(LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = px(48); setPadding(px(12), 0, px(4), 0); background = ripple()
+                addView(TextView(activity).apply {
+                    text = choice.optString("name").ifEmpty { vid }; textSize = 14f
+                    setTextColor(colour(if (chosen) R.color.text else R.color.muted))
+                    if (chosen) typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                if (chosen) addView(TextView(activity).apply { text = "✓"; textSize = 15f; setTextColor(colour(R.color.text)) },
+                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                        .apply { marginEnd = px(8) })
+                addView(TextView(activity).apply {
+                    text = "▶"; textSize = 15f; gravity = Gravity.CENTER; background = ripple()
+                    setTextColor(colour(if (vid == playing) R.color.cyan else R.color.muted))
+                    contentDescription = "Play ${choice.optString("name").ifEmpty { vid }}"
+                    setOnClickListener { play(body, vid) }
+                }, LinearLayout.LayoutParams(px(48), px(48)))
+                setOnClickListener {
+                    if (chosen) { picking = null; draw(body); return@setOnClickListener }
+                    val change = JSONObject().put("mode", mode).put("voice", vid)
+                    if (mode == "own") change.put("agent", agent)
+                    picking = null
+                    save(change) { setup = it; draw(body) }
+                }
             })
         }
+        body.addView(list, wide(2))
+    }
+
+    /** A preview: its ▶ turns cyan while it plays (about the length of a sample line). */
+    private fun play(body: LinearLayout, voice: String) {
+        preview(voice)
+        playing = voice; draw(body)
+        body.postDelayed({ if (playing == voice) { playing = null; if (isOpen) draw(body) } }, 4000)
     }
 
     private fun nextVoice(choices: org.json.JSONArray, current: String): String {

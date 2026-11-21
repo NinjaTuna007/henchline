@@ -214,13 +214,13 @@ class PlanView(private val activity: Activity) {
                 setPadding(dp(14), dp(14), dp(14), dp(14))
                 gravity = Gravity.CENTER_HORIZONTAL
                 addView(TextView(activity).apply {
-                    text = "Diagram"; textSize = 12f; setTextColor(colour(R.color.cyan))
+                    text = "Diagram"; textSize = 12f; setTextColor(colour(R.color.muted))
                     letterSpacing = 0.08f
                 })
                 val nodes = b.optJSONArray("nodes")
                 for (n in 0 until (nodes?.length() ?: 0)) {
                     if (n > 0) addView(TextView(activity).apply {
-                        text = "↓"; textSize = 16f; gravity = Gravity.CENTER; setTextColor(colour(R.color.cyan))
+                        text = "↓"; textSize = 16f; gravity = Gravity.CENTER; setTextColor(colour(R.color.muted))
                     }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
                     addView(TextView(activity).apply {
                         text = nodes!!.optString(n); textSize = 14f; gravity = Gravity.CENTER

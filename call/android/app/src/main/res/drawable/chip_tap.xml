@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The chip drawn 40dp tall inside a 48dp view: the whole 48dp is the touch target (the design audit, 2026-11-21). -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/chip"
+    android:insetTop="4dp"
+    android:insetBottom="4dp" />
