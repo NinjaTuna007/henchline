@@ -134,6 +134,20 @@ class Authenticate(AioHTTPTestCase):
         answer = await self.client.post("/api/v1/x", data=b"{}")
         self.assertEqual(answer.status, 401)
 
+    async def test_a_request_id_has_one_spelling(self):
+        for rid in (str(__import__("uuid").uuid4()).upper(), "{%s}" % __import__("uuid").uuid4(),
+                    __import__("uuid").uuid4().hex):
+            with self.subTest(rid=rid):
+                status, body = await self.send(request_id=rid)
+                self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+
+    async def test_a_malformed_escape_is_refused_not_guessed(self):
+        signed = hostkit.signed_headers(self.key, self.device, "GET", "/api/v1/chats")
+        from yarl import URL  # sent exactly as written: the client would otherwise fix the escape itself
+        raw = URL(str(self.client.make_url("/api/v1/chats")) + "?cursor=ab%2", encoded=True)
+        answer = await self.client.session.get(raw, headers=signed)
+        self.assertEqual((answer.status, (await answer.json())["error"]["code"]), (400, "invalid_request"))
+
     async def test_the_error_envelope(self):
         status, body = await self.send(api_version="2.0")
         self.assertEqual(set(body["error"]), {"code", "message", "retryable", "request_id"})

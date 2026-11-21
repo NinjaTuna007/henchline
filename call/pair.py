@@ -6,6 +6,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -65,11 +66,38 @@ class HostSigner:
         return descriptor
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Create a short-lived Henchline phone pairing code")
+def devices_main(argv: list[str]) -> int:
+    """`voice-call devices list` and `voice-call devices revoke DEVICE_ID`: the host owner's side of
+    removal, for a phone that is lost or was paired by someone else."""
+    parser = argparse.ArgumentParser(prog="voice-call devices")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    args = parser.parse_args()
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("list", help="every phone ever paired, revoked ones too")
+    revoke = sub.add_parser("revoke", help="that phone's key stops working at once")
+    revoke.add_argument("device_id")
+    args = parser.parse_args(argv)
+    store = HostStore(HostConfig.load(args.config).database)
+    try:
+        if args.action == "list":
+            for device in store.devices():
+                state = "revoked" if device["revoked_at"] else "active"
+                print(f"{device['device_id']}  {state:7}  {device['algorithm']:7}  {device['label']}")
+            return 0
+        if not store.revoke(args.device_id.lower()):
+            print(f"no device {args.device_id}", file=sys.stderr)
+            return 1
+        print(f"revoked {args.device_id}")
+        return 0
+    finally:
+        store.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="voice-call pair", description="Create a short-lived Henchline phone pairing code")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    args = parser.parse_args(argv)
     config = HostConfig.load(args.config)
+    config.validate_private_paths()
     signer = HostSigner.load_or_create(config.key_file)
     store = HostStore(config.database)
     now = time.time()

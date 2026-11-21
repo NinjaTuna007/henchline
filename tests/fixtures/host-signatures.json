@@ -151,8 +151,54 @@
       "canonical": "HENCHLINE-SIG-V1\n1.0\n00000000-0000-4000-8000-000000000001\nhttps\nhost-a.example.ts.net\nGET\n/api/v1/chats\ncursor=a%2Fb%3Ac&limit=10\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n11111111-1111-4111-8111-111111111111\n1795000000\nAAECAwQFBgcICQoLDA0ODw\n22222222-2222-4222-8222-222222222222\n",
       "canonical_sha256": "61ffa35ad4719c29d20146541b92950ebda631c83b4413349df85d7f119dbc8c",
       "ed25519_signature": "TP7mAxyXx-EJ4vWn_6eWaLSmWAKJ74li3kVJrZjDW3fQ2iBigLcR7qxcvF8k76TEfnPHm6U5WqLkqo2c5338Cg"
+    },
+    {
+      "name": "empty query items are dropped; a key without = has an empty value",
+      "input": {
+        "api_version": "1.0",
+        "authority_id": "00000000-0000-4000-8000-000000000001",
+        "scheme": "https",
+        "authority": "host-a.example.ts.net",
+        "device_id": "11111111-1111-4111-8111-111111111111",
+        "timestamp": "1795000000",
+        "nonce": "AAECAwQFBgcICQoLDA0ODw",
+        "request_id": "22222222-2222-4222-8222-222222222222",
+        "method": "GET",
+        "path": "/api/v1/chats",
+        "query": "&limit=5&&flag&",
+        "body_utf8": ""
+      },
+      "canonical": "HENCHLINE-SIG-V1\n1.0\n00000000-0000-4000-8000-000000000001\nhttps\nhost-a.example.ts.net\nGET\n/api/v1/chats\nflag=&limit=5\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n11111111-1111-4111-8111-111111111111\n1795000000\nAAECAwQFBgcICQoLDA0ODw\n22222222-2222-4222-8222-222222222222\n",
+      "canonical_sha256": "0e121e02cf082aeff4d0c5f6dd1eba143e76a6ce7ebaf9488504d19e3d05d32e",
+      "ed25519_signature": "4bPAldyuGxKnC2-H3_QrAEIOAua7edNHndkm_Lic4Y6JMUM2x4Qg8qVsZ_7-iHjLVLOtJeYxeYQbgjB5Qo2PCQ"
     }
   ],
+  "rejected_requests": [
+    {
+      "name": "malformed percent escape in the path",
+      "path": "/api/v1/chats/a%zz",
+      "query": ""
+    },
+    {
+      "name": "truncated percent escape in the query",
+      "path": "/api/v1/chats",
+      "query": "cursor=ab%2"
+    },
+    {
+      "name": "relative path",
+      "path": "api/v1/chats",
+      "query": ""
+    }
+  ],
+  "request_id_rule": "lowercase hyphenated UUID text, exactly as signed and sent; the host refuses any other spelling",
+  "pairing_proof": {
+    "host_id": "00000000-0000-4000-8000-000000000001",
+    "nonce": "c2FtcGxlLXBhaXJpbmctbm9uY2UtMjRi",
+    "algorithm": "ed25519",
+    "public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+    "canonical": "HENCHLINE-PAIR-V1\n00000000-0000-4000-8000-000000000001\nc2FtcGxlLXBhaXJpbmctbm9uY2UtMjRi\ned25519\nA6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg\n",
+    "ed25519_signature": "TIfp_djwaOd91KZgs_ixGzRRctyH6s4vr-yQKWJcGGHLzzD_tIXsVvRpKIpzhLvdxVReNrIM5W6Tng95iR-DDg"
+  },
   "descriptor": {
     "unsigned": {
       "schema": "henchline.host/v1",

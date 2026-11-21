@@ -3,7 +3,9 @@
 
     call/server.py [--port 8790] [--host serve|tailscale|ADDRESS] [--cert PEM --key PEM]
     call/server.py --behind-tailscale-serve [--listen 127.0.0.1:8790]
+    call/server.py [...] --api-v1
     call/server.py backup --output FILE
+    call/server.py pair | devices list | devices revoke DEVICE_ID
 
 With --behind-tailscale-serve it listens on loopback in plain http and never runs
 `tailscale`: whoever installed the https name in front of it owns that route.
@@ -2749,7 +2751,7 @@ async def reminders_cancel(request: web.Request) -> web.Response:
     return web.json_response({"ok": reminders.cancel(rid)})
 
 
-LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+LOOPBACK = {"127.0.0.1", "::1"}  # addresses, not a name a resolver could change
 
 
 def listen_address(text: str) -> tuple[str, int]:
@@ -2774,8 +2776,8 @@ def backup_main(argv: list[str]) -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                         help="host.json, for its database path (without it, the default database)")
     args = parser.parse_args(argv)
-    database = HostConfig.load(args.config).database if args.config.exists() else DEFAULT_DATABASE
     try:
+        database = HostConfig.load(args.config).database if args.config.exists() else DEFAULT_DATABASE
         print(json.dumps(backup(database, args.output)))
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"backup failed: {exc}", file=sys.stderr)
@@ -2783,9 +2785,50 @@ def backup_main(argv: list[str]) -> int:
     return 0
 
 
+class LocalHost:
+    """This machine, as the signed API (call/api_v1.py) sees it: the same delivery and agent list the phone's
+    legacy routes use."""
+
+    def deliver(self, text: str, session_id: str) -> tuple[str, str]:
+        # TEXTED, as the legacy /text route: typed in Henchline's chat, tagged [phone · text], answered by text.
+        # Not TYPED: that is the call page's chat, tagged hands-free, and would tell the agent a call is up.
+        # No switch: a message sent to one chat never moves where spoken words go.
+        return to_agent(text, session_id, Heard.TEXTED, False)
+
+    def chats(self) -> list[dict]:
+        listed = agents()
+        return [{"session_id": a["session"], "name": a["name"], "current": a["session"] == listed["current"]}
+                for a in listed["agents"]]
+
+    def announce(self, words: str) -> None:
+        log(HANDSFREE_LOG, words)
+        subprocess.run([sys.executable, str(HERE.parent / "handsfree/handsfree.py"), "text", words],
+                       capture_output=True, timeout=30)
+
+
+def mount_api_v1(app: web.Application) -> str:
+    """--api-v1: the signed host API beside the legacy routes, from ~/.config/henchline/host.json. "" or why not."""
+    from call import api_v1
+    from call.host_config import HostConfig
+    from call.host_store import HostStore
+    from call.pair import HostSigner
+    try:
+        config = HostConfig.load()
+        config.validate_private_paths()
+        signer = HostSigner.load_or_create(config.key_file)
+        store = HostStore(config.database)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return str(exc)
+    api_v1.setup(app, config, store, LocalHost(), signer)
+    return ""
+
+
 def main() -> int:
     if sys.argv[1:2] == ["backup"]:
         return backup_main(sys.argv[2:])
+    if sys.argv[1:2] in (["pair"], ["devices"]):
+        from call import pair
+        return (pair.main if sys.argv[1] == "pair" else pair.devices_main)(sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=CALL_PORT)
     parser.add_argument("--cert", type=Path, help="serve https with this certificate (and --key): a self-signed one\n"
@@ -2801,6 +2844,8 @@ def main() -> int:
     parser.add_argument("--behind-tailscale-serve", action="store_true",
                         help="plain http on loopback (default 127.0.0.1:%d) behind an https name someone else "
                              "set up: never runs `tailscale`, never adds or removes its route" % CALL_PORT)
+    parser.add_argument("--api-v1", action="store_true",
+                        help="also serve the signed host API (/api/v1) for paired phones; needs host.json")
     args = parser.parse_args()
     if args.behind_tailscale_serve:
         if args.cert or args.key:
@@ -2866,6 +2911,9 @@ def main() -> int:
     app.on_cleanup.append(stop_reminders)
     app.router.add_post("/crew/model", crew_model)
     app.router.add_get("/files/{secret}/{name}", sent_file)
+    if args.api_v1 and (why := mount_api_v1(app)):
+        print(f"--api-v1: {why}", file=sys.stderr)
+        return 1
     proxied = args.behind_tailscale_serve
     if args.listen is None and args.host in ("serve", "tailscale"):
         try:

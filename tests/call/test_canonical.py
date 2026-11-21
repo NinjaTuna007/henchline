@@ -31,6 +31,23 @@ class RequestVectors(unittest.TestCase):
                 self.assertEqual(canonical.b64url(key.sign(vector["canonical"].encode())),
                                  vector["ed25519_signature"])
 
+    def test_rejected_vectors_are_refused(self):
+        for item in VECTORS["rejected_requests"]:
+            fields = dict(VECTORS["requests"][0]["input"])
+            fields.pop("body_utf8")
+            fields.update(path=item["path"], query=item["query"])
+            with self.subTest(item["name"]), self.assertRaises(ValueError):
+                canonical.request_bytes(body=b"", **fields)
+
+    def test_pairing_proof_vector(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        vector = VECTORS["pairing_proof"]
+        message = canonical.pairing_bytes(host_id=vector["host_id"], nonce=vector["nonce"],
+                                          algorithm=vector["algorithm"], public_key=vector["public_key"])
+        self.assertEqual(message.decode(), vector["canonical"])
+        key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(VECTORS["device_key"]["private_seed_hex"]))
+        self.assertEqual(canonical.b64url(key.sign(message)), vector["ed25519_signature"])
+
     def test_equivalent_spellings_sign_alike(self):
         self.assertEqual(canonical.canonical_path("/a/%7Eb%2f"), canonical.canonical_path("/a/~b%2F"))
         self.assertEqual(canonical.canonical_query("b=1&a=2"), canonical.canonical_query([("a", "2"), ("b", "1")]))

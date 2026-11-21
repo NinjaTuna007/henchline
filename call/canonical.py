@@ -18,6 +18,7 @@ PREFIX = "HENCHLINE-SIG-V1"
 UNRESERVED = "-._~"
 MAX_SAFE_INTEGER = 2 ** 53 - 1
 B64URL = re.compile(r"[A-Za-z0-9_-]+")
+BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 def b64url(data: bytes) -> str:
@@ -44,11 +45,9 @@ def _component(value: str) -> str:
     spellings from producing different signatures. Literal ``+`` remains a
     plus byte (and is encoded as ``%2B``); it is never form-decoded to space.
     """
-    try:
-        raw = unquote_to_bytes(value)
-    except Exception as exc:  # pragma: no cover - urllib is deliberately permissive
-        raise ValueError("invalid percent encoding") from exc
-    return quote_from_bytes(raw, safe=UNRESERVED)
+    if BAD_ESCAPE.search(value):  # urllib would keep "%zz" literally; that is a second spelling, so refuse it
+        raise ValueError("invalid percent encoding")
+    return quote_from_bytes(unquote_to_bytes(value), safe=UNRESERVED)
 
 
 def canonical_path(path: str) -> str:
@@ -64,6 +63,8 @@ def canonical_query(query: str | Iterable[tuple[str, str]]) -> str:
         pairs: list[tuple[str, str]] = []
         if query:
             for item in query.split("&"):
+                if not item:  # "a=1&&b=2" and a trailing "&" add nothing
+                    continue
                 key, sep, value = item.partition("=")
                 pairs.append((_component(key), _component(value if sep else "")))
     else:
@@ -146,3 +147,17 @@ def canonical_json(value: Any) -> bytes:
         raise ValueError(f"cannot sign a {type(item).__name__}")
 
     return encode(value).encode("utf-8")
+
+
+PAIR_PREFIX = "HENCHLINE-PAIR-V1"
+
+
+def pairing_bytes(*, host_id: str, nonce: str, algorithm: str, public_key: str) -> bytes:
+    """What a phone signs with its new key when it claims a pairing code: proof it holds that key.
+
+    public_key is the base64url text exactly as sent in the claim.
+    """
+    fields = (PAIR_PREFIX, host_id.lower(), nonce, algorithm, public_key)
+    if any("\n" in field or "\r" in field for field in fields):
+        raise ValueError("pairing field contains a newline")
+    return ("\n".join(fields) + "\n").encode("utf-8")

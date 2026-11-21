@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from call.canonical import b64url
+from call.sqlite_backup import backup  # noqa: F401  (voice-call backup)
 
 
 SCHEMA_VERSION = 1
@@ -46,7 +47,7 @@ class HostStore:
         # Private from the first byte: SQLite gives its -wal and -shm files the database's own mode.
         os.close(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600))
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        self._db = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -173,6 +174,11 @@ class HostStore:
                 (self._pair_digest(nonce),),
             )
 
+    def devices(self) -> list[dict]:
+        with self._lock:
+            return [dict(row) | {"public_key": b64url(bytes(row["public_key"]))} for row in self._db.execute(
+                "SELECT device_id,algorithm,public_key,label,enrolled_at,revoked_at FROM devices ORDER BY enrolled_at")]
+
     def device(self, device_id: str) -> Device | None:
         with self._lock:
             row = self._db.execute("SELECT * FROM devices WHERE device_id=?", (device_id,)).fetchone()
@@ -279,35 +285,3 @@ class HostStore:
                 (session_id, since, since, last, limit),
             ))
 
-
-def backup(source: Path, output: Path) -> dict:
-    """A consistent copy of a live SQLite database (its WAL included), private, written then renamed.
-
-    Never overwrites: an existing output is an error, so a backup cannot clobber an earlier one. Returns what
-    a manifest records: the path, its SHA-256 and size.
-    """
-    source, output = Path(source), Path(output)
-    if not source.is_file():
-        raise FileNotFoundError(f"no database at {source}")
-    if output.exists():
-        raise FileExistsError(f"{output} already exists")
-    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    partial = output.with_name(f".{output.name}.partial")
-    partial.unlink(missing_ok=True)
-    os.close(os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600))
-    try:
-        live = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30)
-        copy = sqlite3.connect(partial)
-        try:
-            live.backup(copy)
-            copy.execute("PRAGMA journal_mode=DELETE")  # one self-contained file, no -wal beside it
-            if copy.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-                raise RuntimeError("the copy failed its integrity check")
-        finally:
-            copy.close()
-            live.close()
-        os.link(partial, output)  # fails rather than replaces, should the output appear meanwhile
-    finally:
-        partial.unlink(missing_ok=True)
-    digest = hashlib.sha256(output.read_bytes()).hexdigest()
-    return {"path": str(output), "sha256": digest, "bytes": output.stat().st_size}

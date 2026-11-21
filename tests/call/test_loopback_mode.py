@@ -62,7 +62,7 @@ class Startup(unittest.TestCase):
                 self.assertEqual((started["host"], started["port"]), (host, 8795))
 
     def test_behind_serve_refuses_anything_but_loopback(self):
-        for listen in ("0.0.0.0:8790", "100.64.0.7:8790", "[::]:8790"):
+        for listen in ("0.0.0.0:8790", "100.64.0.7:8790", "[::]:8790", "localhost:8790"):
             with self.subTest(listen=listen):
                 started, tailscale, code, err = self.start("--behind-tailscale-serve", "--listen", listen)
                 self.assertEqual((started, tailscale, code), (None, [], 2))
@@ -95,6 +95,35 @@ class Startup(unittest.TestCase):
                 (tls / "cert.pem").unlink()
         self.assertEqual((code, tailscale), (0, []))
         self.assertIs(started["ssl_context"], context.return_value)
+
+
+class Commands(unittest.TestCase):
+    def test_api_v1_without_a_host_identity_refuses_to_start(self):
+        started, _, code, err = Startup.start(Startup(), "--behind-tailscale-serve", "--api-v1")
+        self.assertEqual((started, code), (None, 1))
+        self.assertIn("--api-v1: cannot read host config", err)
+
+    def test_devices_list_and_revoke(self):
+        folder = Path(tempfile.mkdtemp(dir=sandbox.HOME))
+        config = folder / "host.json"
+        config.write_text(json.dumps({
+            "host_id": "00000000-0000-4000-8000-000000000001", "label": "M", "base_url": "https://m.example/",
+            "tls_authority": "m.example", "updated_at": "2026-11-21T12:00:00Z",
+            "database": str(folder / "host.sqlite3")}))
+        store = HostStore(folder / "host.sqlite3")
+        device = store.claim_pairing(store.new_pairing(), "ed25519", b"k" * 32, "Test phone").device_id
+        store.close()
+        out = io.StringIO()
+        with mock.patch("sys.argv", ["voice-call", "devices", "--config", str(config), "revoke", device]), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(server.main(), 0)
+        with mock.patch("sys.argv", ["voice-call", "devices", "--config", str(config), "list"]), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(server.main(), 0)
+        self.assertIn(f"{device}  revoked  ed25519  Test phone", out.getvalue())
+        with mock.patch("sys.argv", ["voice-call", "devices", "--config", str(config), "revoke", "nope"]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(server.main(), 1)
 
 
 class Backup(unittest.TestCase):
@@ -138,6 +167,22 @@ class Backup(unittest.TestCase):
         code, _, err = self.run_backup("--config", str(self.config), "--output", str(output))
         self.assertEqual((code, output.read_bytes()), (1, b"earlier"))
         self.assertIn("already exists", err)
+
+    def test_a_shared_folder_is_refused(self):
+        HostStore(self.database).close()
+        shared = self.folder / "shared"
+        shared.mkdir()
+        shared.chmod(0o777)
+        code, _, err = self.run_backup("--config", str(self.config), "--output", str(shared / "c.sqlite3"))
+        self.assertEqual(code, 1)
+        self.assertIn("writable by group or others", err)
+        self.assertEqual(list(shared.iterdir()), [])
+
+    def test_a_broken_config_is_a_clean_error(self):
+        self.config.write_text("{not json")
+        code, _, err = self.run_backup("--config", str(self.config), "--output", str(self.folder / "c.sqlite3"))
+        self.assertEqual(code, 1)
+        self.assertIn("backup failed", err)
 
     def test_no_database_is_an_error(self):
         code, _, err = self.run_backup("--config", str(self.config), "--output", str(self.folder / "c.sqlite3"))
