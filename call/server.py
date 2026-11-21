@@ -459,6 +459,7 @@ def agents() -> dict:
                "workflow": workflows.live(s.session) if s.agent == "claude" else None}
               for s in recent_speakers() if routing.reachable(s)]
     return {"agents": listed,
+            "away": AWAY.exists(),  # the phone's avatar follows Away set anywhere (the tray, the laptop's /away)
             "current": current.session if current else "",
             "ended": over,
             "renamed": read_json(RENAMED)}  # chats the phone moves to an agent's own key

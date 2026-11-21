@@ -492,6 +492,7 @@ class MainActivity : Activity() {
         CallService.Bus.listener = { message -> main.post { fromServer(message) } }
         RingService.share(this)  // where texts reach this app: the laptop kept an old address after a reinstall
         main.removeCallbacks(textsPoll); main.post(textsPoll)
+        refreshAway()  // the laptop may have changed Away while the app was in the background
         if (Outbox.all(this).isNotEmpty()) {  // messages that waited: now, maybe, and on any change of network
             Outbox.watch(this)
             Thread { Outbox.flush(this) }.start()
@@ -557,6 +558,7 @@ class MainActivity : Activity() {
         // Leaving mid-recording: the mic is never left open with nothing on screen. Held, it is dropped (the
         // finger left with the app); locked, it was meant to be sent
         if (voiceNote != null) endVoiceNote(keep = locked, why = "Dropped: you left the app")
+        stopSound()  // nor a sound playing on with nothing on screen to stop it
         super.onPause()
     }
 
@@ -2838,16 +2840,19 @@ class MainActivity : Activity() {
                     val url = heard.optString("url")
                     if (url.isEmpty()) android.widget.Toast.makeText(this, heard.optString("note").ifEmpty { "Couldn't play that." },
                         android.widget.Toast.LENGTH_LONG).show()
-                    else playOrPause(url, ImageButton(this), TextView(this), "Preview")
+                    else { stopSound(); AudioCard(url, "Preview", autoplay = true, headless = true) }  // a voice sample: no card, played once loaded
                 }
             }).also { it.show() }
         }
     }
 
+    private var awayToggledAt = 0L  // the user's own Away tap: crew answers already on their way don't undo it
+
     private fun toggleAway(to: Boolean = !away, undo: Boolean = true) {
         if (onCall()) return android.widget.Toast.makeText(this, "End the call first.", android.widget.Toast.LENGTH_SHORT).show()
         findViewById<View>(R.id.profile).performHapticFeedback(android.view.HapticFeedbackConstants.CONFIRM)
         showAway(to)
+        awayToggledAt = System.currentTimeMillis()
         ask("/away", JSONObject().put("on", to)) { answer ->
             if (!answer.has("away")) {  // not reached: as it was
                 showAway(!to)
@@ -3086,6 +3091,10 @@ class MainActivity : Activity() {
 
     private fun takeCrew(answer: JSONObject) {
         followRenames(answer)
+        // Away set on the laptop reaches the phone with the crew (and the status push), not only on the chat list
+        // ...but never in the few seconds after a tap here: a crew answer sent before it would flip it back
+        if (answer.has("away") && answer.optBoolean("away") != prefs().getBoolean("away", false) &&
+            System.currentTimeMillis() - awayToggledAt > 8_000) showAway(answer.optBoolean("away"))
         val found = answer.optJSONArray("agents") ?: return
         names = (0 until found.length()).associate { found.getJSONObject(it).getString("session") to found.getJSONObject(it).getString("name") }
         teams = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
@@ -3902,73 +3911,194 @@ class MainActivity : Activity() {
         chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
-    /** Play and pause, streamed from the laptop: one sound at a time. On a call it plays alongside the agents'
-     *  voices (it asks for no audio focus of its own, so the call isn't paused for it). */
-    private fun audioRow(url: String, name: String, size: Long): View {
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        val button = ImageButton(this).apply {
+    /** One sound's card: play / pause, a bar to seek, "0:12 / 1:12". The file is fetched into the app's cache first
+     *  (streamed over the network an ogg had no length, couldn't seek and didn't replay: the user's catch,
+     *  2026-11-21), so the length shows before playing and the bar can jump anywhere. One sound at a time. */
+    private inner class AudioCard(val url: String, val name: String, val autoplay: Boolean = false, val headless: Boolean = false) {
+        val row = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        val button = ImageButton(this@MainActivity).apply {
             setImageResource(android.R.drawable.ic_media_play)
             setBackgroundResource(R.drawable.round_call)
             backgroundTintList = android.content.res.ColorStateList.valueOf(getColor(R.color.cyan))
             contentDescription = "Play $name"
         }
-        val label = TextView(this).apply {
-            text = "$name\n${Files.sizeText(size)}"
-            setTextColor(getColor(R.color.text))
-            textSize = 14f
-            setPadding(dp(12), 0, 0, 0)
+        val title = TextView(this@MainActivity).apply {
+            text = name; setTextColor(getColor(R.color.text)); textSize = 14f
+            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
         }
-        row.addView(button, LinearLayout.LayoutParams(dp(44), dp(44)))
-        row.addView(label, LinearLayout.LayoutParams(dp(190), LinearLayout.LayoutParams.WRAP_CONTENT))
-        button.setOnClickListener { playOrPause(url, button, label, name) }
-        return row
+        val bar = android.widget.SeekBar(this@MainActivity).apply {
+            progressTintList = android.content.res.ColorStateList.valueOf(getColor(R.color.cyan))
+            progressBackgroundTintList = android.content.res.ColorStateList.valueOf(getColor(R.color.surface_high))
+            thumbTintList = android.content.res.ColorStateList.valueOf(getColor(R.color.cyan))
+            minimumHeight = dp(48)  // a finger's worth to grab, around a thin line
+            setPadding(dp(6), 0, dp(6), 0)
+            max = 1000
+            isEnabled = false
+            contentDescription = "Position in $name"
+        }
+        val time = TextView(this@MainActivity).apply { setTextColor(getColor(R.color.muted)); textSize = 12f; text = "Loading…" }
+        var file: java.io.File? = null
+        var length = 0  // ms, 0 while unknown
+        var position = 0  // ms: where play starts, kept while paused or after a seek
+        var finished = false
+        var dragging = false
+
+        init {
+            val column = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), 0, 0, 0) }
+            column.addView(title)
+            column.addView(bar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
+            column.addView(time)
+            row.addView(button, LinearLayout.LayoutParams(dp(44), dp(44)))
+            row.addView(column, LinearLayout.LayoutParams(dp(200), LinearLayout.LayoutParams.WRAP_CONTENT))
+            button.setOnClickListener { playOrPause(this) }
+            bar.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(b: android.widget.SeekBar, value: Int, fromUser: Boolean) {
+                    if (fromUser && length > 0) showTime(value.toLong() * length / 1000)
+                }
+                override fun onStartTrackingTouch(b: android.widget.SeekBar) { dragging = true }
+                override fun onStopTrackingTouch(b: android.widget.SeekBar) {
+                    dragging = false
+                    if (length <= 0) return
+                    position = (b.progress.toLong() * length / 1000).toInt()
+                    finished = false
+                    if (sound != null && soundCard === this@AudioCard) try { sound?.seekTo(position) } catch (_: Exception) {}
+                    showTime(position.toLong())
+                }
+            })
+            // Gone from the screen (the chat left or redrawn): its sound stops with it
+            row.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {}
+                override fun onViewDetachedFromWindow(v: View) { if (soundCard === this@AudioCard) stopSound() }
+            })
+            Thread {
+                val address = Files.resolve(this@MainActivity, url)
+                val got = try { address?.let { Files.fetched(this@MainActivity, it) } } catch (_: Exception) { null }
+                val ms = got?.let { f ->
+                    try {
+                        android.media.MediaMetadataRetriever().run {
+                            try { setDataSource(f.path); extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toIntOrNull() ?: 0 }
+                            finally { release() }
+                        }
+                    } catch (_: Exception) { 0 }
+                } ?: 0
+                main.post {
+                    file = got
+                    length = ms
+                    if (got == null) time.text = "Couldn't load it here: tap and hold to download"
+                    else { bar.isEnabled = length > 0; showTime(0); if (autoplay && (headless || row.isAttachedToWindow)) playOrPause(this) }
+                }
+            }.start()
+        }
+
+        fun showTime(ms: Long) {
+            time.text = if (length > 0) "${clock(ms)} / ${clock(length.toLong())}" else clock(ms)
+            if (!dragging && length > 0) bar.progress = (ms * 1000 / length).toInt().coerceIn(0, 1000)
+        }
+
+        fun playing(on: Boolean) {
+            button.setImageResource(if (on) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
+            button.contentDescription = (if (on) "Pause " else "Play ") + name
+        }
     }
 
-    private var sound: android.media.MediaPlayer? = null
-    private var soundUrl = ""
-    private var soundButton: ImageButton? = null
+    private fun clock(ms: Long) = "${ms / 60000}:${"%02d".format(ms / 1000 % 60)}"
 
-    private fun playOrPause(url: String, button: ImageButton, label: TextView, name: String) {
-        val playing = sound
-        if (playing != null && soundUrl == url) {
-            if (playing.isPlaying) { playing.pause(); button.setImageResource(android.R.drawable.ic_media_play) }
-            else { playing.start(); button.setImageResource(android.R.drawable.ic_media_pause) }
+    private fun audioRow(url: String, name: String, size: Long, autoplay: Boolean = false): View = AudioCard(url, name, autoplay).row
+
+    private var sound: android.media.MediaPlayer? = null
+    private var soundCard: AudioCard? = null
+    private var soundFocus: android.media.AudioFocusRequest? = null
+    private val soundTick = object : Runnable {
+        override fun run() {
+            val card = soundCard ?: return
+            val player = sound ?: return
+            try { if (player.isPlaying) { card.position = player.currentPosition; card.showTime(card.position.toLong()) } } catch (_: Exception) {}
+            main.postDelayed(this, 200)
+        }
+    }
+
+    private fun playOrPause(card: AudioCard) {
+        val player = sound
+        if (player != null && soundCard === card) {
+            try {
+                if (player.isPlaying) {
+                    player.pause(); card.position = player.currentPosition; card.playing(false); main.removeCallbacks(soundTick)
+                    dropSoundFocus()  // paused: another app's music may play again; the next play asks again
+                } else {
+                    if (card.finished) { card.position = 0; card.finished = false }
+                    player.seekTo(card.position)
+                    if (!takeSoundFocus()) return
+                    player.start(); card.playing(true); main.removeCallbacks(soundTick); main.post(soundTick)
+                }
+            } catch (_: Exception) { stopSound() }
             return
         }
         stopSound()
-        val address = Files.resolve(this, url) ?: return
-        soundUrl = url
-        soundButton = button
-        label.text = "$name\nLoading…"
-        sound = android.media.MediaPlayer().apply {
-            setAudioAttributes(android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC).build())
-            setOnPreparedListener {
-                label.text = "$name\n${it.duration / 60000}:${"%02d".format(it.duration / 1000 % 60)}"
-                it.start()
-                button.setImageResource(android.R.drawable.ic_media_pause)
+        val file = card.file ?: run { card.time.text = "Still loading…"; return }
+        if (!takeSoundFocus()) return
+        soundCard = card
+        if (card.finished) { card.position = 0; card.finished = false }
+        sound = try {
+            android.media.MediaPlayer().apply {
+                setAudioAttributes(android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                setDataSource(file.path)
+                prepare()  // a local file: quick
+                if (card.length <= 0 && duration > 0) { card.length = duration; card.bar.isEnabled = true }
+                setOnCompletionListener {
+                    card.finished = true
+                    card.position = card.length
+                    card.showTime(card.length.toLong())
+                    card.playing(false)
+                    main.removeCallbacks(soundTick)
+                    dropSoundFocus()
+                }
+                setOnErrorListener { _, _, _ -> card.time.text = "Couldn't play it here: tap and hold to download"; stopSound(); true }
+                seekTo(card.position)
+                start()
             }
-            setOnCompletionListener { button.setImageResource(android.R.drawable.ic_media_play) }
-            setOnErrorListener { _, _, _ ->
-                label.text = "$name\nCouldn't play it here: tap and hold to download"
-                stopSound()
-                true
-            }
-            try {
-                setDataSource(address)
-                prepareAsync()
-            } catch (e: Exception) {
-                label.text = "$name\nCouldn't play it: ${e.message}"
-            }
+        } catch (e: Exception) {
+            card.time.text = "Couldn't play it: ${e.message}"
+            soundCard = null
+            dropSoundFocus()
+            null
         }
+        if (sound != null) { card.playing(true); main.post(soundTick) }
+    }
+
+    /** Off a call it asks for focus (another app's music pauses; a notification or a call taking it pauses this). On
+     *  a call it asks for none: it plays alongside the agents' voices and the call isn't paused for it. */
+    private fun takeSoundFocus(): Boolean {
+        if (CallService.Bus.service != null) return true
+        val audio = getSystemService(android.media.AudioManager::class.java)
+        val request = android.media.AudioFocusRequest.Builder(android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+            .setAudioAttributes(android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_MEDIA).build())
+            .setOnAudioFocusChangeListener({ change ->
+                if (change < 0) {  // lost, for a while or for good: paused where it was
+                    val player = sound ?: return@setOnAudioFocusChangeListener
+                    try { if (player.isPlaying) { player.pause(); soundCard?.position = player.currentPosition } } catch (_: Exception) {}
+                    soundCard?.playing(false)
+                    main.removeCallbacks(soundTick)
+                }
+            }, main)
+            .build()
+        val granted = audio.requestAudioFocus(request) == android.media.AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        if (granted) soundFocus = request
+        return granted
+    }
+
+    private fun dropSoundFocus() {
+        soundFocus?.let { getSystemService(android.media.AudioManager::class.java).abandonAudioFocusRequest(it) }
+        soundFocus = null
     }
 
     private fun stopSound() {
-        sound?.release()
+        main.removeCallbacks(soundTick)
+        sound?.let { try { it.release() } catch (_: Exception) {} }
         sound = null
-        soundUrl = ""
-        soundButton?.setImageResource(android.R.drawable.ic_media_play)
-        soundButton = null
+        soundCard?.playing(false)
+        soundCard = null
+        dropSoundFocus()
     }
 
     /** A picture whole, as a messaging app's viewer (the user's wish, 2026-11-16: it was a grey box): black, the
@@ -4199,14 +4329,13 @@ class MainActivity : Activity() {
             type.startsWith("image/") -> showPicture(url, name, type)
             type.startsWith("audio/") -> {
                 val holder = LinearLayout(this).apply { setPadding(dp(24), dp(16), dp(24), 0) }
-                val row = audioRow(url, name, intent.getLongExtra(Files.SIZE, 0)) as LinearLayout
+                val row = audioRow(url, name, intent.getLongExtra(Files.SIZE, 0), autoplay = true) as LinearLayout
                 holder.addView(row)
                 AlertDialog.Builder(this).setTitle(name).setView(holder)
                     .setPositiveButton("Save and open") { _, _ -> Files.open(this, url, name, type, intent.getLongExtra(Files.SIZE, 0), from, note) }
                     .setNegativeButton("Close", null)
                     .setOnDismissListener { stopSound() }
                     .show()
-                row.getChildAt(0).performClick()  // it starts playing
             }
             else -> Files.open(this, url, name, type, intent.getLongExtra(Files.SIZE, 0), from, note)
         }

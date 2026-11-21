@@ -159,15 +159,19 @@ object Files {
     }
 
     /** The file itself in the app's cache, fetched once (a screen rebuilt doesn't fetch it again), or null. */
-    private fun fetched(context: Context, address: String): File? {
+    fun fetched(context: Context, address: String): File? {
         val cached = cacheFile(context, address)
         if (cached.exists()) return cached
         cached.parentFile?.mkdirs()
         client.newCall(Request.Builder().url(address).build()).execute().use { answer ->
             if (!answer.isSuccessful) return null
             val part = File(cached.path + "." + java.util.UUID.randomUUID() + ".part")  // two fetches never share one
-            part.outputStream().use { out -> answer.body!!.byteStream().copyTo(out) }
-            part.renameTo(cached)
+            try {
+                part.outputStream().use { out -> answer.body!!.byteStream().copyTo(out) }
+                part.renameTo(cached)
+            } finally {
+                part.delete()  // a dropped connection leaves no half file behind (after a rename it's already gone)
+            }
         }
         return cached.takeIf { it.exists() }
     }
