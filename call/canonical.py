@@ -161,3 +161,27 @@ def pairing_bytes(*, host_id: str, nonce: str, algorithm: str, public_key: str) 
     if any("\n" in field or "\r" in field for field in fields):
         raise ValueError("pairing field contains a newline")
     return ("\n".join(fields) + "\n").encode("utf-8")
+
+
+CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  # Crockford base32: no I, L, O or U to misread
+
+
+def crockford(data: bytes, length: int) -> str:
+    bits = int.from_bytes(data, "big")
+    total = len(data) * 8
+    return "".join(CODE_ALPHABET[(bits >> (total - 5 * (i + 1))) & 31] for i in range(length))
+
+
+def fingerprint(public_key: bytes) -> str:
+    """What both screens show before pairing, for the user to compare: 80 bits of the key's SHA-256 as
+    XXXX-XXXX-XXXX-XXXX in Crockford base32."""
+    text = crockford(hashlib.sha256(public_key).digest()[:10], 16)
+    return "-".join(text[i:i + 4] for i in range(0, 16, 4))
+
+
+def pairing_code(text: str) -> str:
+    """A typed one-time code as the host stores it: case, spaces and dashes dropped, O read as 0, I and L as 1."""
+    cleaned = text.upper().replace("-", "").replace(" ", "").replace("O", "0").replace("I", "1").replace("L", "1")
+    if not cleaned or any(ch not in CODE_ALPHABET for ch in cleaned):
+        raise ValueError("a pairing code is letters and digits")
+    return cleaned

@@ -84,6 +84,27 @@ object Canonical {
     fun pairingBytes(authorityId: String, nonce: String, algorithm: String, publicKey: String): ByteArray =
         lines(listOf(PAIR_PREFIX, authorityId.lowercase(), nonce, algorithm, publicKey))
 
+    const val CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"  // Crockford base32: no I, L, O or U
+
+    fun crockford(data: ByteArray, length: Int): String {
+        val bits = BigInteger(1, data)
+        val total = data.size * 8
+        return (0 until length).map { CODE_ALPHABET[bits.shiftRight(total - 5 * (it + 1)).toInt() and 31] }
+            .joinToString("")
+    }
+
+    /** XXXX-XXXX-XXXX-XXXX: 80 bits of the key's SHA-256, what both screens show before pairing. */
+    fun fingerprint(publicKey: ByteArray): String =
+        crockford(MessageDigest.getInstance("SHA-256").digest(publicKey).copyOf(10), 16).chunked(4).joinToString("-")
+
+    /** A typed one-time code as the host stores it: case, spaces and dashes dropped, O read as 0, I and L as 1. */
+    fun pairingCode(text: String): String {
+        val cleaned = text.uppercase().replace("-", "").replace(" ", "")
+            .replace('O', '0').replace('I', '1').replace('L', '1')
+        require(cleaned.isNotEmpty() && cleaned.all { it in CODE_ALPHABET }) { "a pairing code is letters and digits" }
+        return cleaned
+    }
+
     fun b64url(data: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(data)
 
     /** Strict unpadded base64url: one spelling per byte string. */

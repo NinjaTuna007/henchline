@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from call.canonical import b64url, canonical_json
+from call.canonical import b64url, canonical_json, fingerprint
 from call.host_config import DEFAULT_CONFIG, HostConfig
 from call.host_store import PAIRING_LIFETIME, HostStore
 
@@ -111,8 +111,9 @@ def devices_main(argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="voice-call pair", description="Create a short-lived Henchline phone pairing code")
+    parser = argparse.ArgumentParser(prog="voice-call pair", description="Show a five-minute code that pairs a phone")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--json", action="store_true", help="the code as one JSON line (for a QR code or a script)")
     args = parser.parse_args(argv)
     config = HostConfig.load(args.config)
     config.validate_private_paths()
@@ -120,20 +121,28 @@ def main(argv: list[str] | None = None) -> int:
     store = HostStore(config.database)
     now = time.time()
     nonce = store.new_pairing(now)
-    print(json.dumps({
-        "schema": "henchline.pair/v1",
-        "host_id": config.host_id,
-        "label": config.label,
-        "base_url": config.base_url,
-        "tls_authority": config.tls_authority,
-        "host_signing_key": b64url(signer.public_bytes()),
-        "host_key_algorithm": "ed25519",
-        "nonce": nonce,
-        "expires_at": dt.datetime.fromtimestamp(int(now + PAIRING_LIFETIME), dt.timezone.utc)
-                      .strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }, separators=(",", ":")))
+    store.close()
+    expires = dt.datetime.fromtimestamp(int(now + PAIRING_LIFETIME), dt.timezone.utc)
+    key = b64url(signer.public_bytes())
+    if args.json:
+        print(json.dumps({
+            "schema": "henchline.pair/v1",
+            "host_id": config.host_id,
+            "label": config.label,
+            "base_url": config.base_url,
+            "tls_authority": config.tls_authority,
+            "host_signing_key": key,
+            "host_key_algorithm": "ed25519",
+            "fingerprint": fingerprint(signer.public_bytes()),
+            "nonce": nonce,
+            "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }, separators=(",", ":")))
+        return 0
+    print(f"Pair a phone with {config.label}: in Henchline, Settings, Computers, Pair a computer.\n"
+          f"  Address:      {config.base_url}\n"
+          f"  Fingerprint:  {fingerprint(signer.public_bytes())}   (the phone shows it too: they must match)\n"
+          f"  Code:         {nonce[:5]}-{nonce[5:]}   (one use, until {expires.astimezone().strftime('%H:%M')})")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -27,7 +27,9 @@ object HostKeys {
 
     fun alias(kind: String, id: String): String = "henchline-$kind-${id.lowercase()}"
 
-    /** That host's (or directory's) key: made on first use. */
+    /** That host's (or directory's) key: made on first use. Synchronized: two threads asking at once must not
+     *  both generate the alias (the second would replace the key the first just paired with). */
+    @Synchronized
     fun forAuthority(kind: String, id: String): RequestKey {
         val alias = alias(kind, id)
         val store = KeyStore.getInstance(STORE).apply { load(null) }
@@ -64,10 +66,13 @@ class P256Key(private val private: PrivateKey, publicDer: ByteArray) : RequestKe
 object HostDescriptor {
     private val ED25519_SPKI = byteArrayOf(0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00)
 
+    /** The platform's provider: "Ed25519" on most, "EdDSA" on some (SelfTest checks whichever this phone has). */
+    private fun <T> eitherName(get: (String) -> T): T = try { get("Ed25519") } catch (e: java.security.GeneralSecurityException) { get("EdDSA") }
+
     fun ed25519Verify(publicKey: ByteArray, signature: ByteArray, message: ByteArray): Boolean = try {
         require(publicKey.size == 32)
-        val key = KeyFactory.getInstance("Ed25519").generatePublic(X509EncodedKeySpec(ED25519_SPKI + publicKey))
-        Signature.getInstance("Ed25519").run { initVerify(key); update(message); verify(signature) }
+        val key = eitherName { KeyFactory.getInstance(it) }.generatePublic(X509EncodedKeySpec(ED25519_SPKI + publicKey))
+        eitherName { Signature.getInstance(it) }.run { initVerify(key); update(message); verify(signature) }
     } catch (e: Exception) {
         false
     }

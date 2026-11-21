@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Paint
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -2753,6 +2754,26 @@ class MainActivity : Activity() {
             text = "How the next call starts. The call menu changes the call you're on."
             textSize = 13f; setTextColor(getColor(R.color.muted)); setPadding(dp(20), 0, dp(20), dp(10))
         })
+        // More than one computer: a preview, on Android 13+ whose Ed25519 passed the self-test; hidden otherwise
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && MultiHost.available()) {
+            val multiValue = TextView(this)
+            val computers = line("Computers", TextView(this).apply { text = "Pair, remove" }) { HostsSheet(this).show() }
+            fun showMulti() {
+                val on = MultiHost.enabled(this)
+                multiValue.text = if (on) "On" else "Off"
+                computers.visibility = if (on) View.VISIBLE else View.GONE
+            }
+            list.addView(UsageDraw(this).label("COMPUTERS (PREVIEW)").apply { setPadding(dp(20), dp(24), dp(20), dp(6)) })
+            list.addView(line("More than one computer", multiValue) {
+                prefs().edit().putBoolean(MultiHost.PREF, !MultiHost.enabled(this)).apply(); showMulti()
+            })
+            list.addView(computers)
+            list.addView(TextView(this).apply {
+                text = "Pair this phone with other computers running Henchline. Your laptop's chats are unchanged."
+                textSize = 13f; setTextColor(getColor(R.color.muted)); setPadding(dp(20), 0, dp(20), dp(10))
+            })
+            showMulti()
+        }
         val version = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "" } catch (_: Exception) { "" }
         list.addView(UsageDraw(this).label("ABOUT").apply { setPadding(dp(20), dp(24), dp(20), dp(6)) })
         list.addView(line("Henchline", TextView(this).apply { text = version; textSize = 14f; setTextColor(getColor(R.color.muted)) }) {

@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from call.canonical import b64url
+from call.canonical import b64url, crockford
 from call.sqlite_backup import backup  # noqa: F401  (voice-call backup)
 
 
@@ -128,8 +128,10 @@ class HostStore:
         return hashlib.sha256(("henchline-pair-v1\0" + nonce).encode()).digest()
 
     def new_pairing(self, now: float | None = None) -> str:
+        """A one-time code short enough to type: 10 Crockford base32 characters (50 bits). Guessing is bounded by
+        the unauthenticated rate limit and the five-minute life: about 300 tries at 2^50 each."""
         now = time.time() if now is None else now
-        nonce = b64url(secrets.token_bytes(24))
+        nonce = crockford(secrets.token_bytes(7), 10)
         with self._lock, self._db:
             self._db.execute("DELETE FROM pairing_nonces WHERE expires_at < ? OR consumed_at IS NOT NULL", (now,))
             self._db.execute(

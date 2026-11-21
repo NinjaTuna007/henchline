@@ -76,15 +76,42 @@ class Signer(unittest.TestCase):
         self.assertNotIn(str(config.database), text)
 
 
+class Codes(unittest.TestCase):
+    def test_typed_codes_are_forgiving(self):
+        self.assertEqual(canonical.pairing_code("abcde-fghjk"), "ABCDEFGHJK")
+        self.assertEqual(canonical.pairing_code(" 0o1il "), "00111")
+        for bad in ("", "AB_CD", "ŻÓŁW", "U1234"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                canonical.pairing_code(bad)
+
+    def test_fingerprint_vector(self):
+        key = hostkit.VECTORS["host_key"]
+        self.assertEqual(canonical.fingerprint(canonical.unb64url(key["public_b64url"])), key["fingerprint"])
+
+
 class Command(unittest.TestCase):
+    def test_the_human_form_shows_address_fingerprint_and_code(self):
+        folder = Path(tempfile.mkdtemp(dir=sandbox.HOME))
+        path = folder / "host.json"
+        config = host_config.initialize(path, label="Laptop", base_url="https://l.example.ts.net/",
+                                        capabilities={"chat": True})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pair.main(["--config", str(path)])
+        text = out.getvalue()
+        key = pair.HostSigner.load_or_create(config.key_file).public_bytes()
+        self.assertIn("https://l.example.ts.net/", text)
+        self.assertIn(canonical.fingerprint(key), text)
+        self.assertRegex(text, r"Code: +[0-9A-Z]{5}-[0-9A-Z]{5}")
+
     def test_the_code_is_a_live_single_use_nonce(self):
         folder = Path(tempfile.mkdtemp(dir=sandbox.HOME))
         path = folder / "host.json"
         config = host_config.initialize(path, label="Laptop", base_url="https://m.example.ts.net/",
                                         capabilities={"chat": True})
         out = io.StringIO()
-        with mock.patch("sys.argv", ["pair", "--config", str(path)]), contextlib.redirect_stdout(out):
-            self.assertEqual(pair.main(), 0)
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pair.main(["--config", str(path), "--json"]), 0)
         code = json.loads(out.getvalue())
         self.assertEqual(code["schema"], "henchline.pair/v1")
         self.assertEqual(code["host_id"], config.host_id)
@@ -94,7 +121,10 @@ class Command(unittest.TestCase):
         expires = calendar.timegm(time.strptime(code["expires_at"], "%Y-%m-%dT%H:%M:%SZ"))
         self.assertAlmostEqual(expires, time.time() + 300, delta=5)
         self.assertEqual(set(code), {"schema", "host_id", "label", "base_url", "tls_authority",
-                                     "host_signing_key", "host_key_algorithm", "nonce", "expires_at"})
+                                     "host_signing_key", "host_key_algorithm", "fingerprint", "nonce",
+                                     "expires_at"})
+        self.assertRegex(code["nonce"], r"^[0-9A-HJKMNP-TV-Z]{10}$")
+        self.assertEqual(code["fingerprint"], canonical.fingerprint(canonical.unb64url(code["host_signing_key"])))
         store = HostStore(config.database)
         self.addCleanup(store.close)
         store.claim_pairing(code["nonce"], "ed25519", b"k" * 32)

@@ -4,12 +4,14 @@
   "device_key": {
     "algorithm": "ed25519",
     "private_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-    "public_b64url": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
+    "public_b64url": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+    "fingerprint": "AS3N-N9TM-CD3M-R0M5"
   },
   "host_key": {
     "algorithm": "ed25519",
     "private_seed_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
-    "public_b64url": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc"
+    "public_b64url": "Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc",
+    "fingerprint": "4KVE-TTPB-ZR80-KG1G"
   },
   "requests": [
     {
@@ -199,6 +201,7 @@
     "canonical": "HENCHLINE-PAIR-V1\n00000000-0000-4000-8000-000000000001\nc2FtcGxlLXBhaXJpbmctbm9uY2UtMjRi\ned25519\nA6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg\n",
     "ed25519_signature": "TIfp_djwaOd91KZgs_ixGzRRctyH6s4vr-yQKWJcGGHLzzD_tIXsVvRpKIpzhLvdxVReNrIM5W6Tng95iR-DDg"
   },
+  "pairing_code_rule": "10 Crockford base32 characters (0-9 A-Z without I L O U); typed text is uppercased, spaces and dashes dropped, O read as 0, I and L as 1",
   "descriptor": {
     "unsigned": {
       "schema": "henchline.host/v1",

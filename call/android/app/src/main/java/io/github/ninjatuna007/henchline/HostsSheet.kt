@@ -1,0 +1,146 @@
+package io.github.ninjatuna007.henchline
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.os.Build
+import android.text.InputType
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.annotation.RequiresApi
+
+/** Settings › Computers (multi-host preview): the paired computers, pairing another, removing one. Network work
+ *  runs off the main thread; dialogs come back on it. Nothing here touches the single-laptop address or chats. */
+@RequiresApi(MultiHost.MIN_SDK)
+class HostsSheet(private val activity: Activity, private val onChanged: () -> Unit = {}) {
+    private val registry = HostRegistry.of(activity)
+    private val pairing = Pairing()
+    private fun dp(v: Int) = (v * activity.resources.displayMetrics.density).toInt()
+
+    fun show() {
+        val hosts = registry.all()
+        val rows = hosts.map { h ->
+            h.label + "\n" + h.baseUrl.removePrefix("https://").trimEnd('/') +
+                if (h.revocationPending) "\nRemoval pending: still paired there" else ""
+        } + "Pair a computer…"
+        AlertDialog.Builder(activity)
+            .setTitle("Computers")
+            .setItems(rows.toTypedArray()) { _, which -> if (which < hosts.size) details(hosts[which]) else askAddress() }
+            .setNegativeButton("Done", null)
+            .show()
+    }
+
+    private fun background(work: () -> Unit) = Thread {
+        try { work() } catch (e: Exception) { activity.runOnUiThread { tell("Something went wrong", e.message ?: e.javaClass.simpleName) } }
+    }.start()
+
+    private fun tell(title: String, words: String, then: () -> Unit = {}) {
+        AlertDialog.Builder(activity).setTitle(title).setMessage(words)
+            .setPositiveButton("OK") { _, _ -> then() }.setOnCancelListener { then() }.show()
+    }
+
+    private fun box(hint: String, text: String = "", code: Boolean = false) = EditText(activity).apply {
+        this.hint = hint; setText(text); setSingleLine()
+        inputType = if (code) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
+            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+    }
+
+    private fun padded(vararg views: android.view.View) = LinearLayout(activity).apply {
+        orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(8), dp(24), 0)
+        views.forEach { addView(it) }
+    }
+
+    private fun askAddress(typed: String = "") {
+        val address = box("laptop.your-tailnet.ts.net", typed)
+        AlertDialog.Builder(activity)
+            .setTitle("Pair a computer")
+            .setMessage("On the computer, run: voice-call pair\nIt shows its address, a fingerprint and a code.")
+            .setView(padded(address))
+            .setPositiveButton("Next") { _, _ ->
+                val text = address.text.toString()
+                background {
+                    val candidate = try { pairing.lookUp(pairing.origin(text)) } catch (e: PairingError) {
+                        activity.runOnUiThread { tell("Not found", e.message ?: "") { askAddress(text) } }
+                        return@background
+                    }
+                    activity.runOnUiThread { askCode(candidate) }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun askCode(candidate: Candidate) {
+        if (registry.get(candidate.hostId) != null) {
+            tell("Already paired", "${candidate.label} is already paired with this phone.")
+            return
+        }
+        val code = box("ABCDE-FGHJK", code = true)
+        val fingerprint = TextView(activity).apply {
+            text = candidate.fingerprint; textSize = 20f; typeface = android.graphics.Typeface.MONOSPACE
+            setTextColor(activity.getColor(R.color.text)); setPadding(0, dp(8), 0, dp(12))
+        }
+        AlertDialog.Builder(activity)
+            .setTitle(candidate.label)
+            .setMessage("Check that the computer shows this same fingerprint. If it doesn't, cancel: something else is answering at that address.")
+            .setView(padded(fingerprint, code))
+            .setPositiveButton("It matches: pair") { _, _ ->
+                val typed = code.text.toString()
+                background {
+                    val key = HostKeys.forAuthority("host", candidate.hostId)
+                    val host = try { pairing.claim(candidate, typed, key, Build.MODEL ?: "Phone") } catch (e: PairingError) {
+                        activity.runOnUiThread { tell("Not paired", e.message ?: "") }
+                        return@background
+                    }
+                    registry.put(host)
+                    activity.runOnUiThread {
+                        onChanged()
+                        tell("Paired", "${host.label} is paired. Its chats come in a later update of this preview.") { show() }
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun details(host: Host) {
+        val words = "${host.baseUrl}\nFingerprint ${host.fingerprint}\nThis phone there: ${host.deviceId.take(8)}" +
+            if (host.revocationPending) "\n\nRemoval is pending: the computer couldn't be reached, so this phone is still " +
+                "authorized there. On the computer: voice-call devices revoke ${host.deviceId}" else ""
+        AlertDialog.Builder(activity).setTitle(host.label).setMessage(words)
+            .setPositiveButton(if (host.revocationPending) "Try again" else "Remove") { _, _ -> remove(host) }
+            .apply { if (host.revocationPending) setNeutralButton("Forget anyway") { _, _ -> forgetAnyway(host) } }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    /** Revoke first, then forget: the key is deleted only once the computer no longer trusts it. */
+    private fun remove(host: Host) = background {
+        val revoked = HostClient(host, HostKeys.forAuthority("host", host.hostId)).revokeSelf()
+        if (revoked) {
+            HostKeys.delete("host", host.hostId)
+            registry.remove(host.hostId)
+        } else {
+            registry.put(host.copy(revocationPending = true))
+        }
+        activity.runOnUiThread {
+            onChanged()
+            if (revoked) tell("Removed", "${host.label} no longer trusts this phone.") { show() }
+            else tell("Couldn't reach ${host.label}", "It is still paired there. Henchline will ask again when you tap Try again, " +
+                "or on the computer: voice-call devices revoke ${host.deviceId}") { show() }
+        }
+    }
+
+    private fun forgetAnyway(host: Host) {
+        AlertDialog.Builder(activity).setTitle("Forget without revoking?")
+            .setMessage("${host.label} will still accept this phone's key until you run, on it:\nvoice-call devices revoke ${host.deviceId}")
+            .setPositiveButton("Forget anyway") { _, _ ->
+                HostKeys.delete("host", host.hostId)
+                registry.remove(host.hostId)
+                onChanged()
+                show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+}
