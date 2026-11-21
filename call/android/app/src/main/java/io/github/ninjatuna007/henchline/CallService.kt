@@ -126,13 +126,18 @@ class CallService : Service() {
     private val audioLock = Any()  // starting the audio and switching its sound take turns
     private val attributes get() = if (clear) MEDIA else VOICE
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null  // Wi-Fi kept out of power save for the call
+    @Volatile private var lastDrop = ""  // why the line last dropped: told to the laptop once it's back
     @Volatile private var running = false
     @Volatile private var link = 0  // which connection is the call's now: a dropped one's late words are ignored
     @Volatile private var lostAt = 0L  // when the connection dropped mid-call: reconnecting, for RECONNECT_FOR
     private var server = ""
     // One for the call and its reconnects. Pings every 5 s: a dropped connection is noticed in seconds, not half a
     // minute (the stall was heard as garbled catching-up, 2026-11-16)
-    private val client by lazy { OkHttpClient.Builder().pingInterval(5, TimeUnit.SECONDS).build() }
+    // OkHttp hangs up when one ping goes unanswered for a whole interval. At 5 s a phone locked for a while (Wi-Fi
+    // power save, the VPN app throttled) lost the line every 10-60 s, and talkback with it (2026-11-21 19:12-19:18:
+    // 13 drops). 15 s rides out those stalls; a line that is really dead still goes within 15-30 s and is redialled.
+    private val client by lazy { OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS).build() }
     @Volatile private var ended = false  // the screen was already told why the call ended
     private var reply: String? = null  // an answered ring's report-back address: told if the call can't connect
     @Volatile private var startedAt = 0L  // when the laptop answered: the call's length, for the history
@@ -168,6 +173,13 @@ class CallService : Service() {
         Bus.service = this
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "henchline:call").apply { acquire() }
+        // A locked phone's Wi-Fi drops into power save and the call's socket stalls; low latency keeps it awake
+        // (on newer Android only while the screen is on, so the longer ping tolerance carries the rest)
+        wifiLock = try {
+            getSystemService(android.net.wifi.WifiManager::class.java)
+                .createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "henchline:call")
+                .apply { setReferenceCounted(false); acquire() }
+        } catch (e: Exception) { null }
         applySound()
         connect(server)
         if (Build.VERSION.SDK_INT >= 31) {
@@ -270,6 +282,8 @@ class CallService : Service() {
             audio.mode = AudioManager.MODE_NORMAL
         }
         wakeLock?.let { if (it.isHeld) it.release() }
+        wifiLock?.let { try { if (it.isHeld) it.release() } catch (e: Exception) {} }
+        wifiLock = null
         nearEar(false)
         Bus.connected = false
         if (startedAt > 0) logCall()
@@ -438,7 +452,7 @@ class CallService : Service() {
         val now = System.currentTimeMillis()
         if (lostAt == 0L) {
             lostAt = now
-            android.util.Log.i("Henchline", "call: connection dropped, reconnecting")
+            android.util.Log.i("Henchline", "call: connection dropped (${lastDrop.ifEmpty { "no cause seen" }}), reconnecting")
             Bus.listener?.invoke("""{"reconnecting": true}""")
         }
         if (now - lostAt > RECONNECT_FOR) {
@@ -466,6 +480,10 @@ class CallService : Service() {
                     lostAt = 0
                     android.util.Log.i("Henchline", "call: reconnected")
                     webSocket.send(soundNote())
+                    if (lastDrop.isNotEmpty()) {  // the laptop's log then says why the line went, not only that it did
+                        webSocket.send(org.json.JSONObject().put("note", "dropped: $lastDrop").toString())
+                        lastDrop = ""
+                    }
                     if (talking) webSocket.send(org.json.JSONObject().put("push", true).toString())  // the laptop forgot
                     Bus.listener?.invoke("""{"reconnecting": false}""")
                     return
@@ -529,6 +547,8 @@ class CallService : Service() {
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                android.util.Log.i("Henchline", "call: closing, code $code${if (reason.isNotEmpty()) " ($reason)" else ""}")
+                if (me == link && running && !ended) lastDrop = "closed by the laptop, code $code${if (reason.isNotEmpty()) ": $reason" else ""}"
                 webSocket.close(1000, null)
                 if (me != link) return  // the dropped connection, closed by the laptop as the new one took over
                 if (lostAt > 0 && running && !ended) { reconnect(); return }  // "busy": the old one not gone yet
@@ -536,7 +556,10 @@ class CallService : Service() {
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                android.util.Log.i("Henchline", "call: socket failed: ${t.javaClass.simpleName}: ${t.message}" +
+                    (response?.let { " (HTTP ${it.code})" } ?: ""))
                 if (me != link) return
+                lastDrop = "${t.javaClass.simpleName}: ${t.message ?: "no message"}"
                 if (Bus.connected && running && !ended) { reconnect(); return }  // mid-call: try again
                 // A self-signed certificate (call/server.py --host tailscale) fails here: the app trusts only
                 // real ones, so it needs the `tailscale serve` address
@@ -550,6 +573,7 @@ class CallService : Service() {
         // The server logs each sound, so turns can be compared by it (transcription, turn taking)
         socket?.send(soundNote())
         recorder = Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)  // not slowed when locked
             try {
                 val size = maxOf(AudioRecord.getMinBufferSize(MIC_RATE, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT), FRAME * 2 * 4)
@@ -605,6 +629,7 @@ class CallService : Service() {
             }
         }.apply { name = "mic"; start() }
         player = Thread {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)  // not slowed when locked
             try {
                 val track = AudioTrack.Builder()
                     .setAudioAttributes(attributes)
@@ -772,7 +797,9 @@ class CallService : Service() {
             .addAction(Notification.Action.Builder(null, if (talking) "Send" else "Talk", talk).build())
             .addAction(Notification.Action.Builder(null, "Hang up", hangUp).build())
             .build()
-        startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        // Microphone for the mic; media playback for the agents' voices (clear sound plays as media)
+        startForeground(1, notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
     }
 
     companion object {

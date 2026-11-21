@@ -372,6 +372,10 @@ async def ring_endpoint(request: web.Request) -> web.Response:
 
 async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None) -> str:
     """The talk button held or let go, a switch, or a typed chat message; a note for the page, if any."""
+    if str(message.get("note") or "").startswith("dropped:"):  # why the phone's line last dropped (CallService)
+        note = " ".join(str(message["note"]).split())[:200]  # one line per event, whatever the exception said
+        log(HANDSFREE_LOG, f"call: the phone says its line {note}")
+        return ""
     if message.get("note") == "mic silent":  # the phone's own dead-mic check (CallService)
         if silent is not None and silent.phone_says(message):  # said alongside, the call's messages keep flowing
             asyncio.get_running_loop().run_in_executor(None, tell_mic_silent)
