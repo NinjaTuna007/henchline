@@ -169,10 +169,17 @@ class CodexAccount(unittest.TestCase):
         _rollout(self.root, "21", "b", [("2026-11-21T18:25:00Z", NO_CREDITS)])
         now = datetime.fromisoformat("2026-11-21T20:25:00+00:00").timestamp()
         card = usage.codex_account(self.root, now=now)
-        self.assertEqual([(l["label"], l["percent"]) for l in card["limits"]],
-                         [("Out of credits", 100.0), ("5-hour session", 12.0), ("Week", 37.0)])
+        # out of credits: only that row; the old windows are one quiet line, never bars that look current
+        self.assertEqual([(l["label"], l["percent"]) for l in card["limits"]], [("Out of credits", 100.0)])
         self.assertEqual(card["notes"][0], usage.OUT_OF_CREDITS)
-        self.assertIn("Limits as last reported, 34 h ago", card["notes"])
+        self.assertIn("Weekly was 37% used (last reported 34 h ago)", card["notes"])
+        self.assertFalse(any("Limits as last reported" in n for n in card["notes"]))
+
+    def test_out_of_credits_without_any_windows(self):
+        _rollout(self.root, "21", "b", [("2026-11-21T18:25:00Z", NO_CREDITS)])
+        card = usage.codex_account(self.root)
+        self.assertEqual([l["label"] for l in card["limits"]], ["Out of credits"])
+        self.assertEqual(card["notes"], [usage.OUT_OF_CREDITS])
 
     def test_normal_account(self):
         _rollout(self.root, "21", "b", [("2026-11-21T18:25:00Z", WINDOWS)])

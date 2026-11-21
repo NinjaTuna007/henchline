@@ -157,8 +157,8 @@ def codex(session: str, root: Path = CODEX_SESSIONS) -> dict:
         context = {"percent": round(100 * used / size, 1), "size": size, "used": used, "parts": []}
     plan = limits.get("plan_type")
     notes = [f"Plan: {plan}"] if isinstance(plan, str) and plan else []
-    if _no_credits(limits):
-        found.insert(0, {"label": "Out of credits", "percent": 100.0, "resets": 0})
+    if _no_credits(limits):  # as on the account card: no stale plan windows next to "out of credits"
+        found = [{"label": "Out of credits", "percent": 100.0, "resets": 0}]
         notes.insert(0, OUT_OF_CREDITS)
     return {"model": "", "limits": found, "context": context, "notes": notes}
 
@@ -251,11 +251,17 @@ def codex_account(root: Path = CODEX_SESSIONS, now: float | None = None) -> dict
         return {}
     limits, notes = [], []
     if _no_credits(newest["limits"]):
+        # Out of credits: Codex can't run, so the plan's windows mean nothing now. Not drawn as bars (the user read a
+        # stale "Week 37%" as current, 2026-11-22); at most one quiet line of what they were before.
         limits.append({"label": "Out of credits", "percent": 100.0, "resets": 0})
         notes.append(OUT_OF_CREDITS)
-    limits += windows
-    if windows and windows_at and newest["at"] and windows_at < newest["at"] - 60:
-        notes.append(f"Limits as last reported, {_ago(now - windows_at)} ago")
+        week = next((w for w in windows if w["label"].startswith("Week")), None)
+        if week and windows_at:
+            notes.append(f"Weekly was {week['percent']:.0f}% used (last reported {_ago(now - windows_at)} ago)")
+    else:
+        limits += windows
+        if windows and windows_at and newest["at"] and windows_at < newest["at"] - 60:
+            notes.append(f"Limits as last reported, {_ago(now - windows_at)} ago")
     plan = newest["limits"].get("plan_type")
     if isinstance(plan, str) and plan:
         notes.append(f"Plan: {plan}")
