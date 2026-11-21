@@ -2,6 +2,13 @@
 """A phone call with the agents: a web page that streams the phone's mic in and talkback out.
 
     call/server.py [--port 8790] [--host serve|tailscale|ADDRESS] [--cert PEM --key PEM]
+    call/server.py --behind-tailscale-serve [--listen 127.0.0.1:8790]
+    call/server.py backup --output FILE
+
+With --behind-tailscale-serve it listens on loopback in plain http and never runs
+`tailscale`: whoever installed the https name in front of it owns that route.
+`backup` copies the host database (the multi-host identity's device keys and
+request ledger) to FILE, consistently, without stopping anything.
 
 It listens on this machine's Tailscale address, so your own devices (and
 programs on this machine) reach it and nothing else does. In front of it,
@@ -2736,7 +2743,43 @@ async def reminders_cancel(request: web.Request) -> web.Response:
     return web.json_response({"ok": reminders.cancel(rid)})
 
 
+LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+
+
+def listen_address(text: str) -> tuple[str, int]:
+    """ADDRESS:PORT (an IPv6 address in brackets, [::1]:8790) → (address, port)."""
+    host, sep, port = text.rpartition(":")
+    if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise argparse.ArgumentTypeError(f"expected ADDRESS:PORT, got {text!r}")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    elif ":" in host:
+        raise argparse.ArgumentTypeError("put an IPv6 address in brackets: [::1]:8790")
+    return host, int(port)
+
+
+def backup_main(argv: list[str]) -> int:
+    """`voice-call backup --output FILE`: a consistent private copy of the host database, as the multi-host
+    preflight takes before changing anything. Prints a JSON line: path, sha256, bytes."""
+    from call.host_config import DEFAULT_CONFIG, DEFAULT_DATABASE, HostConfig
+    from call.host_store import backup
+    parser = argparse.ArgumentParser(prog="voice-call backup")
+    parser.add_argument("--output", type=Path, required=True, help="where the copy goes (must not exist yet)")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                        help="host.json, for its database path (without it, the default database)")
+    args = parser.parse_args(argv)
+    database = HostConfig.load(args.config).database if args.config.exists() else DEFAULT_DATABASE
+    try:
+        print(json.dumps(backup(database, args.output)))
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"backup failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["backup"]:
+        return backup_main(sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=CALL_PORT)
     parser.add_argument("--cert", type=Path, help="serve https with this certificate (and --key): a self-signed one\n"
@@ -2747,7 +2790,20 @@ def main() -> int:
                              "with a real certificate, falling back to `tailscale` when this user may not configure "
                              "Tailscale; tailscale: this machine's Tailscale address, with its own certificate. "
                              "Either way the socket is on the Tailscale address: your devices reach it")
+    parser.add_argument("--listen", type=listen_address, metavar="ADDRESS:PORT",
+                        help="listen exactly here (instead of --host/--port); no `tailscale` lookup")
+    parser.add_argument("--behind-tailscale-serve", action="store_true",
+                        help="plain http on loopback (default 127.0.0.1:%d) behind an https name someone else "
+                             "set up: never runs `tailscale`, never adds or removes its route" % CALL_PORT)
     args = parser.parse_args()
+    if args.behind_tailscale_serve:
+        if args.cert or args.key:
+            parser.error("--behind-tailscale-serve serves plain http: https is the proxy's job")
+        args.listen = args.listen or ("127.0.0.1", CALL_PORT)
+        if args.listen[0] not in LOOPBACK:  # plain http reachable off this machine would bypass the proxy's TLS
+            parser.error("--behind-tailscale-serve listens on loopback only (127.0.0.1 or [::1])")
+    if args.listen:
+        args.host, args.port = args.listen
     if in_call():  # another server has a call up: starting would repoint the proxy away from it
         print("a call is up on another call server; not starting", file=sys.stderr)
         return 1
@@ -2804,8 +2860,8 @@ def main() -> int:
     app.on_cleanup.append(stop_reminders)
     app.router.add_post("/crew/model", crew_model)
     app.router.add_get("/files/{secret}/{name}", sent_file)
-    proxied = False
-    if args.host in ("serve", "tailscale"):
+    proxied = args.behind_tailscale_serve
+    if args.listen is None and args.host in ("serve", "tailscale"):
         try:
             found = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True).stdout.split()
         except OSError:

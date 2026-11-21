@@ -1,2 +1,4 @@
 # The phone call page: a small web server with WebSockets
 aiohttp==3.11.18
+# The versioned host API: Ed25519 host descriptors and the phone's signed requests (call/auth.py, call/pair.py)
+cryptography==50.0.2
