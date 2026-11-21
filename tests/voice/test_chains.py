@@ -61,6 +61,32 @@ class Chains(unittest.TestCase):
         self.assertEqual((teams["kid"], teams["kid2"]), ("crew", "crew"))
         self.assertNotIn("stranger", teams)
 
+    def test_teams_name_each_crew_chats_boss_for_the_nested_list(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="kid", pane="%1", pid=1, depth=2)
+        chains.append(chain, "launch", parent="boss", session="kid2", pane="%2", pid=2, depth=2)
+        bosses: dict[str, str] = {}
+        chains.teams(alive=None, bosses=bosses)
+        self.assertEqual(bosses, {"kid": "boss", "kid2": "boss"})  # the boss itself isn't nested under anyone
+        chains.append(chain, "ended", session="kid", pane="%1", pid=1)
+        bosses = {}
+        chains.teams(alive=None, bosses=bosses)
+        self.assertEqual(bosses, {"kid2": "boss"})  # an ended child is no longer nested
+        RENAMED.write_text('{"boss": "claude-boss", "kid2": "claude-kid2"}')
+        bosses = {}
+        chains.teams(alive=None, bosses=bosses)
+        self.assertEqual(bosses, {"claude-kid2": "claude-boss"})  # current keys on both sides
+
+    def test_a_child_that_deploys_again_nests_its_helper_under_the_one_boss(self):
+        top = chains.open("top")
+        chains.append(top, "launch", parent="top", session="mid", pane="%1", pid=1, depth=2)
+        self.assertEqual(chains.open("mid"), top)  # a child gets its boss's job back: one crew, one manager
+        chains.append(top, "launch", parent="mid", session="leaf", pane="%2", pid=2, depth=2)
+        bosses: dict[str, str] = {}
+        teams = chains.teams(alive=None, bosses=bosses)
+        self.assertEqual((teams["top"], teams["mid"], teams["leaf"]), ("manager", "crew", "crew"))
+        self.assertEqual(bosses, {"mid": "top", "leaf": "top"})
+
     def test_an_ended_child_loses_its_hat_and_the_last_one_takes_the_bosss(self):
         chain = chains.open("boss")
         chains.append(chain, "launch", parent="boss", session="kid", pane="%1", pid=1, depth=2)

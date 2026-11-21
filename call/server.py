@@ -440,10 +440,11 @@ def agents() -> dict:
     current, locked = last_speaker(), desktop().locked()
     started = spawned()
     try:
-        teams = chains.teams()  # the avatar's hard hat: a manager with live crew, or crew; solo chats aren't listed
+        bosses: dict[str, str] = {}  # each crew chat's manager: the phone nests it under that row
+        teams = chains.teams(bosses=bosses)  # the avatar's hard hat: a manager with live crew, or crew
     except Exception as e:  # never let a bad chain record empty the phone's chat list
         print(f"teams: {e}", file=sys.stderr)
-        teams = {}
+        teams, bosses = {}, {}
     try:
         over = chains.ended()  # helpers whose work is over: the phone keeps them off its list (still searchable)
     except Exception as e:
@@ -453,6 +454,7 @@ def agents() -> dict:
                "name": s.spoken() + chat_named(s) + (" (laptop locked)" if s.in_editor and locked else ""),
                "spawned": s.tab.owner == tmux.OWNER and s.tab.address in started,
                "team": teams.get(s.session, ""),
+               "boss": bosses.get(s.session, ""),
                # a workflow running in it: shown in place of the chat's last line on the phone's list
                "workflow": workflows.live(s.session) if s.agent == "claude" else None}
               for s in recent_speakers() if routing.reachable(s)]

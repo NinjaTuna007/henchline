@@ -837,13 +837,22 @@ class MainActivity : Activity() {
                 else -> if (rest.isEmpty()) emptyList() else listOf("" to rest)
             })
         }
+        // A crew chat goes under its manager's row when that row is in the list; otherwise it keeps its own place
+        val shown = if (query.isEmpty()) groups.flatMap { g -> g.second.map { it.session } }.toSet() else emptySet()
         for ((heading, members) in groups) {
-            if (heading.isNotEmpty()) crew.addView(TextView(this).apply {
+            if (heading.isNotEmpty() && members.any { nestedUnder(it.session, shown) == null }) crew.addView(TextView(this).apply {
                 text = heading.replace("_", " ").uppercase()
                 setTextColor(getColor(R.color.muted)); textSize = 12f; typeface = android.graphics.Typeface.DEFAULT_BOLD
                 setPadding(dp(20), dp(16), dp(20), dp(4))
             })
-            for (chat in members) crew.addView(chatRow(chat.session, chat.agent, chat.project, chat.last, chat.found))
+            for (chat in members) {
+                if (nestedUnder(chat.session, shown) != null) continue  // drawn under its manager, wherever that is
+                crew.addView(chatRow(chat.session, chat.agent, chat.project, chat.last, chat.found))
+                // Its crew right under it, indented (the user's pick, 2026-11-21: the hard-hat mock-up's nested list),
+                // even a helper working in another project. Not in a search: results stay flat.
+                if (query.isEmpty()) for (helper in byRecent.filter { bosses[it.session] == chat.session && it.session !in pins })
+                    crew.addView(chatRow(helper.session, helper.agent, helper.project, helper.last, helper.found, nested = true))
+            }
         }
         crew.addView(TextView(this).apply {
             text = "Settings"
@@ -2172,7 +2181,14 @@ class MainActivity : Activity() {
     private fun subtitle(status: String): String {
         val name = names[current] ?: prefs().getString("current_name", "") ?: ""
         val project = name.substringAfter(", in ", "").substringBefore(" · ").replace("_", " ")
-        return listOf(project, status).filter { it.isNotEmpty() }.joinToString(" · ")
+        // Its place in a crew (the hard-hat mock-up): "manager of 2", or "crew of Claude"
+        val crewCount = bosses.count { it.value == current }
+        val place = when {
+            teams[current] == "manager" && crewCount > 0 -> "manager of $crewCount"
+            teams[current] == "crew" -> bosses[current]?.let { b -> "crew of " + (names[b]?.substringBefore(",") ?: b.substringBefore("-").replaceFirstChar { it.uppercase() }) } ?: ""
+            else -> ""
+        }
+        return listOf(project, place, status).filter { it.isNotEmpty() }.joinToString(" · ")
     }
 
     /** A call in the chat as a messaging app shows one (the user's example, 2026-11-16): a message bubble on the side of
@@ -2399,13 +2415,19 @@ class MainActivity : Activity() {
         prefs().edit().putStringSet("pinned", next).apply()
     }
 
-    /** A chat in the list: henchman, project, the agent's name and the last line (or the line a search found). */
-    private fun chatRow(session: String, agent: String, project: String, last: JSONObject?, found: String): View {
+    /** The manager a crew chat is drawn under in the list, when that manager's row is shown (and the crew isn't pinned:
+     *  a pinned chat stays in Pinned). Null: the chat keeps its own place. */
+    private fun nestedUnder(session: String, shown: Set<String>): String? =
+        bosses[session]?.takeIf { it in shown && it != session && session !in pins() }
+
+    /** A chat in the list: henchman, project, the agent's name and the last line (or the line a search found). A crew
+     *  chat under its manager is indented, and says whose crew it is. */
+    private fun chatRow(session: String, agent: String, project: String, last: JSONObject?, found: String, nested: Boolean = false): View {
         val unread = unread(session, last)
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(20), dp(12), dp(20), dp(12))
+            setPadding(dp(if (nested) 44 else 20), dp(12), dp(20), dp(12))
             background = getDrawable(if (session == current) R.drawable.row_current else android.R.color.transparent)
             setOnClickListener { open(session) }
             setOnLongClickListener { chatMenu(session, project, agent); true }
@@ -2432,7 +2454,8 @@ class MainActivity : Activity() {
                     "${f.optInt("done")}/${f.optInt("total")} done" }
                     ?: last?.let { (if (it.optBoolean("mine")) "You: " else "") + it.optString("text").ifEmpty { "📎 file" } } ?: ""
             }
-            text = listOf(agent, line.replace("\n", " ")).filter { it.isNotEmpty() }.joinToString(" · ")
+            val crewOf = if (nested) bosses[session]?.let { b -> "Crew of " + (names[b]?.substringBefore(",") ?: b.substringBefore("-").replaceFirstChar { it.uppercase() }) } else null
+            text = listOf(crewOf ?: agent, line.replace("\n", " ")).filter { !it.isNullOrEmpty() }.joinToString(" · ")
             setTextColor(getColor(when { found.isNotEmpty() || flow != null -> R.color.cyan; unread > 0 -> R.color.text; else -> R.color.muted }))
             textSize = 14f; maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -3067,6 +3090,8 @@ class MainActivity : Activity() {
         names = (0 until found.length()).associate { found.getJSONObject(it).getString("session") to found.getJSONObject(it).getString("name") }
         teams = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
             a.optString("team").takeIf { it.isNotEmpty() }?.let { a.getString("session") to it } } }.toMap()
+        bosses = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
+            a.optString("boss").takeIf { it.isNotEmpty() }?.let { a.getString("session") to it } } }.toMap()
         takeEnded(answer)
         flows = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
             a.optJSONObject("workflow")?.let { a.getString("session") to it } } }.toMap()
@@ -3075,6 +3100,7 @@ class MainActivity : Activity() {
 
     private var flows: Map<String, JSONObject> = emptyMap()  // a workflow running in a chat, by session: its list line
     private var teams: Map<String, String> = emptyMap()  // a chat's crew role, by session: its hard hat ("manager", "crew")
+    private var bosses: Map<String, String> = emptyMap()  // a crew chat's manager, by session: nested under that row
     private var ended: Set<String> = emptySet()  // helpers whose work is over (the laptop says): off the list, still searchable
 
     /** The laptop's list of chats whose work is over (a helper ended, or reaped when its terminal went): kept only when

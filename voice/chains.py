@@ -564,11 +564,12 @@ def view(session: str, alive=_LOOK) -> dict:
         }
 
 
-def teams(alive=_LOOK) -> dict[str, str]:
+def teams(alive=_LOOK, bosses: dict[str, str] | None = None) -> dict[str, str]:
     """Each chat's place in a crew, for its avatar's hard hat: "manager" (its job is open and a child still runs),
     "crew" (a child that hasn't ended); a chat in neither works solo and isn't listed. A child whose pane is gone
     (it crashed, or typed /exit) is reaped first, so it doesn't keep the hats on. Keyed by each chat's current key
-    only: an old folder placeholder is not a chat, and a new chat started in that folder must not inherit a hat."""
+    only: an old folder placeholder is not a chat, and a new chat started in that folder must not inherit a hat.
+    `bosses`, when given, is filled with each crew chat's manager (its current key), for the phone's nested list."""
     out: dict[str, str] = {}
     panes = _panes(alive)
     with _locked():
@@ -591,11 +592,17 @@ def teams(alive=_LOOK) -> dict[str, str]:
             live.append(child)  # an unbound child still makes its boss a manager; it has no chat yet
         if not live:
             continue
-        out[_canonical(chain.boss)] = "manager"
+        boss = _canonical(chain.boss)
+        out[boss] = "manager"
         for child in live:
             key = _canonical(child) if child else ""
             if key and out.get(key) != "manager":  # a manager stays one, whatever else it is
                 out[key] = "crew"
+                if bosses is not None:
+                    bosses[key] = boss
+    if bosses is not None:  # a chat that is also a manager is listed as one, not nested under another
+        for key in [k for k in bosses if out.get(k) != "crew"]:
+            del bosses[key]
     return out
 
 
