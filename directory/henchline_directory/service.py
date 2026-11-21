@@ -88,7 +88,7 @@ def authenticate(directory: Directory, kind: str, method: str, raw_path: str, he
     if signer is None:
         raise ApiError(401, "bad_signature", f"unknown {kind}")
     if signer.revoked:
-        raise ApiError(403, "device_revoked", "device has been revoked")
+        raise ApiError(403, "device_revoked", f"this {kind} has been revoked by the directory's owner")
     stamp = _header(headers, "X-Henchline-Timestamp")
     if not TIMESTAMP.fullmatch(stamp) or abs(clock - int(stamp)) > WINDOW:
         raise ApiError(401, "timestamp_out_of_window", "request timestamp is outside the allowed window",
@@ -253,6 +253,7 @@ def route(directory: Directory, method: str, raw_path: str, headers, body: bytes
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 15  # seconds a client may take to send its request: a stalled one cannot hold a thread for ever
     server_version = "henchline-directory"
     sys_version = ""
     directory: Directory  # set on the subclass made by serve()
@@ -263,8 +264,11 @@ class Handler(BaseHTTPRequestHandler):
     def _answer(self, method: str) -> None:
         body = b""
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            if length < 0 or length > MAX_BODY:
+            text = self.headers.get("Content-Length") or "0"
+            if not text.isdigit():
+                raise ApiError(400, "invalid_request", "Content-Length must be a number")
+            length = int(text)
+            if length > MAX_BODY:
                 raise ApiError(413 if length > 0 else 400, "invalid_request", "body too large")
             body = self.rfile.read(length) if length else b""
             status, value, extra = route(self.directory, method, self.path, self.headers, body)

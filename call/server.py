@@ -1713,7 +1713,7 @@ def model_in_use(target: Speaker) -> str:
     lines = tmux.out("capture-pane", "-p", "-t", target.tab.address).splitlines()
     if target.agent == "cursor":
         return cursor_model(lines)
-    if target.agent == "codex":  # "gpt-5.6-sol xhigh · ~/pc_diagnostics"
+    if target.agent == "codex":  # "gpt-5.6-sol xhigh · ~/project"
         found = [m.group(1) for line in lines if (m := re.match(r"\s*(\S+(?: \S+)?) · [~/]", line))]
         return found[-1] if found else ""
     return ""

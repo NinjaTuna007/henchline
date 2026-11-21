@@ -274,14 +274,23 @@ class HostStore:
         """(descriptor_seq, updated_at) for descriptor content with this digest. Same content: what was published
         before. New content (capabilities, URL, label, key...): the next sequence, never below host.json's,
         stamped now, so a phone or directory never sees two descriptors under one sequence."""
-        with self._lock, self._db:
-            row = self._db.execute("SELECT * FROM published_descriptor").fetchone()
-            if row is not None and row["content_sha256"] == content_sha256 and row["seq"] >= floor_seq:
-                return int(row["seq"]), row["updated_at"]
-            seq = max(floor_seq, int(row["seq"]) + 1 if row is not None else floor_seq)
-            self._db.execute("INSERT OR REPLACE INTO published_descriptor VALUES (1,?,?,?)",
-                             (seq, content_sha256, now_utc))
-            return seq, now_utc
+        with self._lock:
+            # The write lock before the read: the server and `voice-call directory` may publish at once, and a
+            # read-then-upgrade in WAL mode would fail with a busy snapshot instead of waiting its turn.
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._db.execute("SELECT * FROM published_descriptor").fetchone()
+                if row is not None and row["content_sha256"] == content_sha256 and row["seq"] >= floor_seq:
+                    self._db.commit()
+                    return int(row["seq"]), row["updated_at"]
+                seq = max(floor_seq, int(row["seq"]) + 1 if row is not None else floor_seq)
+                self._db.execute("INSERT OR REPLACE INTO published_descriptor VALUES (1,?,?,?)",
+                                 (seq, content_sha256, now_utc))
+                self._db.commit()
+                return seq, now_utc
+            except Exception:
+                self._db.rollback()
+                raise
 
     def append_event(self, session_id: str, kind: str, body: bytes, now: float | None = None) -> str:
         event_id = str(uuid.uuid4())

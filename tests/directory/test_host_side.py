@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests import sandbox
 from tests.directory.test_directory import BASE, Live
@@ -130,6 +131,61 @@ class HostSide(Live):
         asyncio.run(run(0.1))
         self.assertEqual(logged[1], f"directory heartbeats reach {BASE}")
         self.assertEqual(len(logged), 2)
+
+
+class Redirects(unittest.TestCase):
+    def test_a_redirect_is_an_error_not_followed(self):
+        """The opener's redirect handler, given a 307 to elsewhere, refuses it."""
+        import urllib.error
+        import urllib.request
+        handler = directory_client.NoRedirects()
+        request = urllib.request.Request("https://directory.example/v1/hosts/heartbeat", data=b"{}", method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            handler.redirect_request(request, io.BytesIO(b""), 307, "Temporary Redirect", {},
+                                     "https://elsewhere.example/v1/hosts/heartbeat")
+        self.assertEqual(caught.exception.code, 307)
+        self.assertTrue(any(isinstance(h, directory_client.NoRedirects) for h in directory_client.OPENER.handlers))
+
+    def test_the_https_transport_reports_a_redirect_as_its_status(self):
+        import urllib.error
+        error = urllib.error.HTTPError("https://d.example/v1/info", 302, "redirect refused", {}, io.BytesIO(b""))
+        with mock.patch.object(directory_client.OPENER, "open", side_effect=error):
+            self.assertEqual(directory_client.https("GET", "https://d.example/v1/info", b"", {}), (302, {}))
+
+
+class Publishing(unittest.TestCase):
+    def test_processes_publishing_at_once_never_share_a_sequence(self):
+        """The server and `voice-call directory` publish into one database. Read-then-write without the write
+        lock let two of them give the same next sequence to different content (measured: dozens of times in
+        this test); under BEGIN IMMEDIATE, never."""
+        import multiprocessing
+        from call.host_store import HostStore
+        path = Path(tempfile.mkdtemp(dir=sandbox.HOME)) / "host.sqlite3"
+        HostStore(path).close()
+        with multiprocessing.get_context("fork").Pool(6) as pool:
+            runs = pool.map(_publish_many, [(str(path), c) for c in "abcdef"])
+        claims: dict[int, set[str]] = {}
+        for run in runs:
+            self.assertIsInstance(run, list, run)  # a string is the exception a process hit
+            for seq, content in run:
+                claims.setdefault(seq, set()).add(content)
+        self.assertEqual([seq for seq, contents in claims.items() if len(contents) > 1], [])
+
+
+def _publish_many(args):
+    from call.host_store import HostStore
+    path, mine = args
+    store = HostStore(Path(path))
+    try:
+        seen = []
+        for i in range(40):  # alternate with a shared content, so every process keeps changing it
+            content = mine * 64 if i % 2 else "z" * 64
+            seen.append((store.publish(content, 1, "2026-11-21T12:00:00Z")[0], content))
+        return seen
+    except Exception as exc:
+        return repr(exc)
+    finally:
+        store.close()
 
 
 class ServerFlag(unittest.TestCase):

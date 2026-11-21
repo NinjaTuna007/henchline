@@ -5,6 +5,11 @@
     voice-call directory heartbeat              one heartbeat now (the server sends them with --directory-heartbeat)
     voice-call directory withdraw               stop being listed until the next heartbeat
 
+A running server keeps the descriptor it published at startup. `voice-call directory heartbeat` publishes the
+current one, so after a change of content (host.json, a new capability) the server's own heartbeats send the
+older, lower descriptor and are refused as stale until the server is restarted: restart it after such a change.
+Restoring host.sqlite3 from an old backup needs host.json's descriptor_seq raised (see HostSigner.published).
+
 The directory never carries traffic: it lists this host's own signed descriptor for paired phones. The
 enrolment pins the directory's key from the code and checks the directory's signed descriptor against it,
 so a heartbeat only ever goes to the directory the user enrolled with. Stored in
@@ -38,13 +43,23 @@ API_VERSION = "1.0"
 Transport = Callable[[str, str, bytes, dict[str, str]], tuple[int, dict]]
 
 
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A signed request goes to exactly the URL it was signed for: a 30x is an error, never followed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect to {newurl} refused", headers, fp)
+
+
+OPENER = urllib.request.build_opener(NoRedirects)
+
+
 def https(method: str, url: str, body: bytes, headers: dict[str, str]) -> tuple[int, dict]:
     if urlsplit(url).scheme != "https":
         raise ValueError("the directory is only reached over https")
     request = urllib.request.Request(url, data=body if method != "GET" else None, method=method,
                                      headers={"Content-Type": "application/json", **headers})
     try:
-        with urllib.request.urlopen(request, timeout=15) as answer:
+        with OPENER.open(request, timeout=15) as answer:
             return answer.status, json.loads(answer.read() or b"{}")
     except urllib.error.HTTPError as error:
         try:

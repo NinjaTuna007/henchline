@@ -4,7 +4,8 @@
     henchline-directory --version
     henchline-directory pair-phone  --config FILE                 a five-minute code for a phone
     henchline-directory enroll-host --config FILE                 a five-minute code for a host
-    henchline-directory devices list|revoke DEVICE_ID --config FILE
+    henchline-directory devices list|revoke DEVICE_ID --config FILE   (--config before or after)
+    henchline-directory hosts list|revoke|forget HOST_ID --config FILE  revoke: refused until forgotten
     henchline-directory backup --config FILE --output FILE
 """
 
@@ -111,6 +112,25 @@ def devices(args: argparse.Namespace) -> int:
         store.close()
 
 
+def hosts(args: argparse.Namespace) -> int:
+    config = DirectoryConfig.load(args.config)
+    store = DirectoryStore(config.database)
+    try:
+        if args.action == "list":
+            for host in store.host_rows():
+                state = "revoked" if host["revoked_at"] else "withdrawn" if host["withdrawn_at"] else "listed"
+                print(f"{host['host_id']}  {state:9}  seq {host['descriptor_seq']}")
+            return 0
+        done = (store.revoke_host if args.action == "revoke" else store.forget_host)(args.host_id.lower())
+        if not done:
+            print(f"no host {args.host_id}", file=sys.stderr)
+            return 1
+        print(f"{'revoked' if args.action == 'revoke' else 'forgot'} {args.host_id}")
+        return 0
+    finally:
+        store.close()
+
+
 def backup(args: argparse.Namespace) -> int:
     try:
         config = DirectoryConfig.load(args.config)
@@ -126,22 +146,32 @@ def main(argv: list[str] | None = None) -> int:
     if argv[:1] == ["--version"]:
         print(f"henchline-directory {__version__} ({BUILD_ID})")
         return 0
-    commands = {"pair-phone", "enroll-host", "devices", "backup"}
+    commands = {"pair-phone", "enroll-host", "devices", "hosts", "backup"}
     if argv[:1] and argv[0] in commands:
         parser = argparse.ArgumentParser(prog=f"henchline-directory {argv[0]}")
-        parser.add_argument("--config", type=Path, required=True)
-        if argv[0] == "devices":
+        parser.add_argument("--config", type=Path)
+        if argv[0] in ("devices", "hosts"):
             sub = parser.add_subparsers(dest="action", required=True)
-            sub.add_parser("list")
-            sub.add_parser("revoke").add_argument("device_id")
+            # --config may also follow the action (`devices revoke ID --config FILE`)
+            config = argparse.ArgumentParser(add_help=False)
+            config.add_argument("--config", type=Path, default=argparse.SUPPRESS)
+            sub.add_parser("list", parents=[config])
+            what = "device_id" if argv[0] == "devices" else "host_id"
+            sub.add_parser("revoke", parents=[config]).add_argument(what)
+            if argv[0] == "hosts":
+                sub.add_parser("forget", parents=[config]).add_argument(what)
         if argv[0] == "backup":
             parser.add_argument("--output", type=Path, required=True)
         args = parser.parse_args(argv[1:])
+        if args.config is None:
+            parser.error("--config is required")
         try:
             if argv[0] == "backup":
                 return backup(args)
             if argv[0] == "devices":
                 return devices(args)
+            if argv[0] == "hosts":
+                return hosts(args)
             return code(args, "phone" if argv[0] == "pair-phone" else "host")
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"henchline-directory {argv[0]}: {exc}", file=sys.stderr)

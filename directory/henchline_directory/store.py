@@ -83,7 +83,8 @@ class DirectoryStore:
                     descriptor BLOB NOT NULL,
                     descriptor_seq INTEGER NOT NULL,
                     observed_at REAL NOT NULL,
-                    withdrawn_at REAL
+                    withdrawn_at REAL,
+                    revoked_at REAL
                 );
                 CREATE TABLE IF NOT EXISTS replay_nonces(
                     signer TEXT NOT NULL,
@@ -92,6 +93,9 @@ class DirectoryStore:
                     PRIMARY KEY(signer, nonce)
                 );
             """)
+            columns = {r["name"] for r in self._db.execute("PRAGMA table_info(hosts)")}
+            if "revoked_at" not in columns:  # a database from the first build of this schema
+                self._db.execute("ALTER TABLE hosts ADD COLUMN revoked_at REAL")
             row = self._db.execute("SELECT * FROM meta").fetchone()
             if row is None:
                 self._db.execute("INSERT INTO meta VALUES (?,?,?)", (SCHEMA_VERSION, str(uuid.uuid4()), time.time()))
@@ -153,14 +157,15 @@ class DirectoryStore:
 
     def enroll_host(self, nonce: str, host_id: str, public_key: bytes, descriptor: bytes, seq: int,
                     now: float | None = None) -> None:
-        """Pin (host_id, key) once. A host already pinned is refused: re-pinning is a manual removal first."""
+        """Pin (host_id, key) once. A host already pinned is refused (the owner's `hosts forget` first). The
+        code is checked first: without a live code nobody learns which host IDs are enrolled."""
         now = time.time() if now is None else now
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                self._consume("host", nonce, now)  # rolled back below if the host turns out to be pinned
                 if self._db.execute("SELECT 1 FROM hosts WHERE host_id=?", (host_id,)).fetchone():
                     raise FileExistsError("host_already_enrolled")
-                self._consume("host", nonce, now)
                 self._db.execute("INSERT INTO hosts(host_id,public_key,enrolled_at,descriptor,descriptor_seq,"
                                  "observed_at) VALUES (?,?,?,?,?,?)",
                                  (host_id, public_key, now, descriptor, seq, now))
@@ -178,7 +183,8 @@ class DirectoryStore:
                 return row and Signer("phone", signer_id, row["algorithm"], bytes(row["public_key"]),
                                       row["revoked_at"] is not None)
             row = self._db.execute("SELECT * FROM hosts WHERE host_id=?", (signer_id,)).fetchone()
-            return row and Signer("host", signer_id, "ed25519", bytes(row["public_key"]), False)
+            return row and Signer("host", signer_id, "ed25519", bytes(row["public_key"]),
+                                  row["revoked_at"] is not None)
 
     def use_nonce(self, signer: str, nonce: str, now: float | None = None) -> bool:
         now = time.time() if now is None else now
@@ -217,6 +223,24 @@ class DirectoryStore:
                              "WHERE host_id=?", (descriptor, seq, now, host_id))
             return "stored" if seq > row["descriptor_seq"] else "seen"
 
+    def revoke_host(self, host_id: str, now: float | None = None) -> bool:
+        """The owner's revocation: the host's key stops working here and it is not listed. Unlike a host's own
+        withdrawal, no heartbeat undoes it; only `hosts forget` and a fresh enrolment do."""
+        with self._lock, self._db:
+            return bool(self._db.execute("UPDATE hosts SET revoked_at=COALESCE(revoked_at, ?) WHERE host_id=?",
+                                         (time.time() if now is None else now, host_id)).rowcount)
+
+    def forget_host(self, host_id: str) -> bool:
+        """The owner's removal of a pin, so the host can enrol again (with a new key, say)."""
+        with self._lock, self._db:
+            return bool(self._db.execute("DELETE FROM hosts WHERE host_id=?", (host_id,)).rowcount)
+
+    def host_rows(self) -> list[dict]:
+        with self._lock:
+            return [dict(row) for row in self._db.execute(
+                "SELECT host_id, enrolled_at, descriptor_seq, observed_at, withdrawn_at, revoked_at FROM hosts "
+                "ORDER BY enrolled_at")]
+
     def withdraw(self, host_id: str, now: float | None = None) -> bool:
         with self._lock, self._db:
             return bool(self._db.execute("UPDATE hosts SET withdrawn_at=? WHERE host_id=?",
@@ -226,7 +250,8 @@ class DirectoryStore:
         now = time.time() if now is None else now
         with self._lock:
             rows = list(self._db.execute(
-                "SELECT * FROM hosts WHERE withdrawn_at IS NULL ORDER BY enrolled_at, host_id LIMIT ? OFFSET ?",
+                "SELECT * FROM hosts WHERE withdrawn_at IS NULL AND revoked_at IS NULL "
+                "ORDER BY enrolled_at, host_id LIMIT ? OFFSET ?",
                 (limit + 1, offset)))
         listed = [{"host_id": row["host_id"], "descriptor": json.loads(row["descriptor"]),
                    "observed_at": utc(row["observed_at"]), "stale": now - row["observed_at"] > STALE_AFTER}

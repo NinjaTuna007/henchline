@@ -49,7 +49,11 @@ class HostSigner:
 
     def published(self, config: HostConfig, store: HostStore, capabilities: dict[str, bool] | None = None) -> dict:
         """The descriptor this host advertises: content-addressed in its store, so any change of content gets a
-        higher descriptor_seq and a fresh updated_at by itself (host.json's sequence is the floor)."""
+        higher descriptor_seq and a fresh updated_at by itself (host.json's sequence is the floor).
+
+        Restoring host.sqlite3 from an older backup rewinds the published sequence: raise descriptor_seq in
+        host.json above the highest one phones and the directory have seen first, or they refuse the next
+        descriptor as stale."""
         draft = self.descriptor(config, capabilities)
         content = {k: v for k, v in draft.items() if k not in ("descriptor_seq", "updated_at", "signature")}
         digest = hashlib.sha256(canonical_json(content)).hexdigest()

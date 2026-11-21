@@ -140,6 +140,23 @@ class Unsigned(Live):
         self.assertEqual(self.http("GET", "/")[0], 404)
         self.assertEqual(self.http("POST", "/v1/pairing/claim", b"x" * (65 * 1024))[0], 413)
 
+    def test_a_non_numeric_length_is_refused(self):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        for length in ("abc", "-1", "+5"):
+            with self.subTest(length=length):
+                connection.putrequest("POST", "/v1/pairing/claim")
+                connection.putheader("Content-Length", length)
+                connection.endheaders()
+                answer = connection.getresponse()
+                body = json.loads(answer.read())
+                self.assertEqual((answer.status, body["error"]["code"]), (400, "invalid_request"))
+        connection.close()
+
+    def test_a_stalled_client_is_dropped(self):
+        from henchline_directory.service import Handler
+        self.assertEqual(Handler.timeout, 15)
+
     def test_the_identity_is_private_and_kept(self):
         self.assertEqual(self.config.signing_key.stat().st_mode & 0o777, 0o600)
         self.assertEqual(Identity.load(self.config, self.store.directory_id).public_key, self.identity.public_key)
@@ -252,6 +269,35 @@ class Hosts(Live):
                                  {"nonce": self.store.new_code("host"), "descriptor": descriptor})
         self.assertEqual((status, body["error"]["code"]), (409, "state_conflict"))
 
+    def test_a_dead_code_does_not_reveal_whether_a_host_is_enrolled(self):
+        signer, config = self.host()
+        self.enroll(signer, config)
+        status, body = self.http("POST", "/v1/hosts/enroll/claim",
+                                 {"nonce": "made-up", "descriptor": signer.descriptor(config)})
+        self.assertEqual((status, body["error"]["code"]), (410, "pairing_expired"))
+        nonce = self.store.new_code("host")  # a live code refused for a pinned host stays usable
+        self.assertEqual(self.http("POST", "/v1/hosts/enroll/claim",
+                                   {"nonce": nonce, "descriptor": signer.descriptor(config)})[0], 409)
+        other, other_config = self.host(host_id=hostkit.OTHER_HOST_ID)
+        self.assertEqual(self.http("POST", "/v1/hosts/enroll/claim",
+                                   {"nonce": nonce, "descriptor": other.descriptor(other_config)})[0], 201)
+
+    def test_the_owners_revocation_outlasts_heartbeats_until_forgotten(self):
+        key, device = self.pair_phone()
+        signer, config = self.host()
+        self.enroll(signer, config)
+        self.assertTrue(self.store.revoke_host(config.host_id))
+        status, body = self.heartbeat(signer, config)
+        self.assertEqual((status, body["error"]["code"]), (403, "device_revoked"))
+        self.assertEqual(self.signed(signer.key, "host", config.host_id, "DELETE",
+                                     f"/v1/hosts/{config.host_id}")[0], 403)
+        self.assertEqual(self.signed(key, "phone", device, "GET", "/v1/hosts")[1]["hosts"], [])
+        self.assertEqual(self.http("POST", "/v1/hosts/enroll/claim", {
+            "nonce": self.store.new_code("host"), "descriptor": signer.descriptor(config)})[0], 409)
+        self.assertTrue(self.store.forget_host(config.host_id))
+        self.enroll(signer, config)
+        self.assertEqual(self.heartbeat(signer, config)[0], 200)
+
     def test_a_withdrawn_host_is_not_listed_until_it_heartbeats(self):
         key, device = self.pair_phone()
         signer, config = self.host()
@@ -334,7 +380,7 @@ class Commands(unittest.TestCase):
         store = DirectoryStore(self.folder / "state/directory.sqlite3")
         device = store.claim_phone(store.new_code("phone"), "ed25519", b"k" * 32, "Test phone")
         store.close()
-        self.assertEqual(self.run_cli("devices", "--config", str(self.config), "revoke", device)[0], 0)
+        self.assertEqual(self.run_cli("devices", "revoke", device, "--config", str(self.config))[0], 0)
         self.assertIn(f"{device}  revoked", self.run_cli("devices", "--config", str(self.config), "list")[1])
         output = self.folder / "backup/application/directory.sqlite3"
         code, out, _ = self.run_cli("backup", "--config", str(self.config), "--output", str(output))
@@ -342,6 +388,32 @@ class Commands(unittest.TestCase):
         copy = sqlite3.connect(output)
         self.assertEqual(copy.execute("SELECT COUNT(*) FROM phones").fetchone()[0], 1)
         copy.close()
+
+    def test_hosts_list_revoke_forget(self):
+        store = DirectoryStore(self.folder / "state/directory.sqlite3")
+        store.enroll_host(store.new_code("host"), hostkit.HOST_ID, b"k" * 32, b"{}", 1)
+        store.close()
+        self.assertIn(f"{hostkit.HOST_ID}  listed", self.run_cli("hosts", "list", "--config", str(self.config))[1])
+        self.assertEqual(self.run_cli("hosts", "revoke", hostkit.HOST_ID, "--config", str(self.config))[0], 0)
+        self.assertIn("revoked", self.run_cli("hosts", "--config", str(self.config), "list")[1])
+        self.assertEqual(self.run_cli("hosts", "forget", hostkit.HOST_ID, "--config", str(self.config))[0], 0)
+        self.assertEqual(self.run_cli("hosts", "list", "--config", str(self.config))[1], "")
+        self.assertEqual(self.run_cli("hosts", "revoke", hostkit.HOST_ID, "--config", str(self.config))[0], 1)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            cli.main(["hosts", "list"])  # no config anywhere
+
+    def test_a_first_build_database_gains_the_revocation_column(self):
+        path = self.folder / "old.sqlite3"
+        db = sqlite3.connect(path)
+        db.executescript("""CREATE TABLE hosts(host_id TEXT PRIMARY KEY, public_key BLOB NOT NULL,
+            enrolled_at REAL NOT NULL, descriptor BLOB NOT NULL, descriptor_seq INTEGER NOT NULL,
+            observed_at REAL NOT NULL, withdrawn_at REAL);
+            INSERT INTO hosts VALUES ('h', x'00', 1, x'7b7d', 1, 1, NULL);""")
+        db.close()
+        store = DirectoryStore(path)
+        self.addCleanup(store.close)
+        self.assertEqual(store.host_rows()[0]["revoked_at"], None)
+        self.assertTrue(store.revoke_host("h"))
 
     def test_refusals(self):
         for changes, words in (({"rotate_identity": True}, "rotate_identity"),
