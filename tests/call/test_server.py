@@ -129,5 +129,56 @@ class Owns(unittest.TestCase):
             self.assertFalse(server.owns("%1", 12))
 
 
+class SilentMicTest(unittest.TestCase):
+    """The phone's mic arriving as exact zeros (a silenced capture): told once per spell, after MIC_SILENT_AFTER."""
+
+    ZERO, SOUND = bytes(640), b"\x00\x01" * 320
+
+    def test_told_once_after_the_threshold(self):
+        silent = server.SilentMic()
+        self.assertFalse(silent.feed(self.ZERO, 100.0))
+        self.assertFalse(silent.feed(self.ZERO, 100.0 + server.MIC_SILENT_AFTER - 0.1))
+        self.assertTrue(silent.feed(self.ZERO, 100.0 + server.MIC_SILENT_AFTER))
+        self.assertFalse(silent.feed(self.ZERO, 200.0))  # not again in the same spell
+
+    def test_real_sound_ends_the_spell(self):
+        silent = server.SilentMic()
+        silent.feed(self.ZERO, 0.0)
+        self.assertTrue(silent.feed(self.ZERO, 5.0))
+        self.assertFalse(silent.feed(self.SOUND, 6.0))
+        self.assertFalse(silent.feed(self.ZERO, 7.0))
+        self.assertTrue(silent.feed(self.ZERO, 7.0 + server.MIC_SILENT_AFTER))  # a new spell is told again
+
+    def test_quiet_sound_is_not_silence(self):
+        silent = server.SilentMic()
+        for t in range(10):
+            self.assertFalse(silent.feed(self.SOUND, float(t)))
+
+    def test_the_phones_note_tells_once(self):
+        silent = server.SilentMic()
+        self.assertTrue(silent.phone_says({"note": "mic silent"}))
+        self.assertFalse(silent.phone_says({"note": "mic silent", "restarted": True}))
+        self.assertFalse(silent.feed(self.ZERO, 1e9))  # already told in this spell
+
+    def test_from_page_says_it_once(self):
+        import asyncio
+        silent = server.SilentMic()
+        with mock.patch.object(server, "tell_mic_silent") as tell:
+            async def go():
+                await server.from_page({"note": "mic silent"}, server.Ear(), silent)
+                await server.from_page({"note": "mic silent", "restarted": True}, server.Ear(), silent)
+                await asyncio.sleep(0.05)
+            asyncio.run(go())
+        tell.assert_called_once_with()
+
+
+class ClosedHow(unittest.TestCase):
+    def test_says_who_closed_and_why(self):
+        ws = mock.Mock(close_code=1006, exception=lambda: ConnectionResetError("reset by peer"))
+        self.assertEqual(server.closed_how(ws, False), "close code 1006, error ConnectionResetError: reset by peer")
+        ws = mock.Mock(close_code=1000, exception=lambda: None)
+        self.assertEqual(server.closed_how(ws, True), "closed by the laptop")
+
+
 if __name__ == "__main__":
     unittest.main()

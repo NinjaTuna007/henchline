@@ -207,6 +207,60 @@ class Ear:
                 f"{self.while_speaking} 2-s spans while talkback played")
 
 
+MIC_SILENT_AFTER = 4.0  # seconds of exact zeros from the phone's mic before the user is told
+MIC_SILENT_WORDS = "I can't hear you, your mic is silent."
+
+
+class SilentMic:
+    """The phone's mic still arriving, but as exact zeros: Android went on feeding a capture it had silenced
+    after the earbuds went in their case and came out (2026-11-21, a 4-minute turn lost). Speech, noise and a
+    quiet room are never all zeros; this is. Said once per spell, until real sound comes back."""
+
+    def __init__(self) -> None:
+        self.zero_since: float | None = None  # when this spell of exact zeros began (None: sound is arriving)
+        self.told = False  # the user was told in this spell
+
+    def feed(self, data: bytes, now: float) -> bool:
+        """One chunk of the phone's mic. True when the user should be told now."""
+        if data.strip(b"\x00"):
+            if self.zero_since is not None and self.told:
+                log(HANDSFREE_LOG, f"call: the phone's mic is back ({now - self.zero_since:.0f} s silent)")
+            self.zero_since, self.told = None, False
+            return False
+        if self.zero_since is None:
+            self.zero_since = now
+        return self.due(now)
+
+    def due(self, now: float) -> bool:
+        if self.told or self.zero_since is None or now - self.zero_since < MIC_SILENT_AFTER:
+            return False
+        self.told = True
+        log(HANDSFREE_LOG, f"call: the phone's mic sends only silence ({now - self.zero_since:.0f} s): "
+                           "telling the user")
+        return True
+
+    def phone_says(self, note: dict) -> bool:
+        """The phone noticed it first ({"note": "mic silent", "restarted": …}). True when the user should be told."""
+        log(HANDSFREE_LOG, "call: the phone says its mic is silent"
+                           + (", even after restarting it" if note.get("restarted") else ", restarting it"))
+        if self.told:
+            return False
+        self.told = True
+        if self.zero_since is None:
+            self.zero_since = time.monotonic()
+        return True
+
+
+def tell_mic_silent() -> None:
+    """Said by Henchline itself over the call: the phone's speaker still works when its mic doesn't."""
+    try:
+        subprocess.run([str(routing.SAY), "--agent", BY_HANDSFREE, "--session", BY_HANDSFREE,
+                        "--voice", DEFAULT_VOICE, MIC_SILENT_WORDS],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(HANDSFREE_LOG, f"call: couldn't say the mic is silent: {exc}")
+
+
 async def keep_unmuted() -> None:
     """The laptop's mute key mutes every output, the call's two sinks too: the phone then hears nothing and
     hands-free hears nothing from the phone (2026-11-15). They are the call's own plumbing, not speakers,
@@ -295,9 +349,12 @@ async def ring_endpoint(request: web.Request) -> web.Response:
     return web.json_response({"ok": keep_ring_endpoint(address)})
 
 
-async def from_page(message: dict, ear: Ear) -> str:
+async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None) -> str:
     """The talk button held or let go, a switch, or a typed chat message; a note for the page, if any."""
-    if "answering" in message:  # this call answers a ring: to the agent that rang
+    if message.get("note") == "mic silent":  # the phone's own dead-mic check (CallService)
+        if silent is not None and silent.phone_says(message):  # said alongside, the call's messages keep flowing
+            asyncio.get_running_loop().run_in_executor(None, tell_mic_silent)
+    elif "answering" in message:  # this call answers a ring: to the agent that rang
         await asyncio.get_running_loop().run_in_executor(None, route_to_ringer, str(message["answering"]))
     elif "ring_endpoint" in message:  # where `handsfree ring` reaches the app: kept private, never logged
         keep_ring_endpoint(str(message["ring_endpoint"]))
@@ -2297,6 +2354,15 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                     return
                 await ws.send_bytes(data)
 
+        async def watch_proc(name: str, proc) -> None:
+            """The call's mic (pacat) or speaker (parec) gone mid-call: the phone then hears nothing, or hands-free
+            hears nothing from it (2026-11-21: parec timed out on PipeWire and the phone got 0 chunks, unlogged)."""
+            code = await proc.wait()
+            if not ws.closed:
+                log(HANDSFREE_LOG, f"call: the call's {name} exited early (code {code}): "
+                                   + ("talkback no longer reaches the phone" if name == "speaker"
+                                      else "the phone's mic no longer reaches hands-free"))
+
         def held(clip: Path) -> bool:  # waiting for the user's answer: it won't play now, so it isn't waited for
             return spool.is_held(str(read_json(clip).get("session", "")))
 
@@ -2416,20 +2482,24 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                     CALL_SILENT.unlink(missing_ok=True)
 
         sender = asyncio.create_task(to_phone())
+        watchers = [asyncio.create_task(watch_proc("mic", mic)), asyncio.create_task(watch_proc("speaker", speaker))]
         liner = asyncio.create_task(watch_line())
         shower = asyncio.create_task(show_status())
         unmuter = asyncio.create_task(keep_unmuted())
         nudger = asyncio.create_task(nudge())
         heard = 0  # bytes of the phone's mic, for the log
         ear = Ear()
+        silent = SilentMic()
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
                     last_audio[0] = time.monotonic()
                     heard += len(msg.data)
+                    if silent.feed(msg.data, last_audio[0]):
+                        asyncio.get_running_loop().run_in_executor(None, tell_mic_silent)
                     mic.stdin.write(msg.data)
                     await mic.stdin.drain()
-                elif msg.type == WSMsgType.TEXT and (note := await from_page(msg.json(), ear)):
+                elif msg.type == WSMsgType.TEXT and (note := await from_page(msg.json(), ear, silent)):
                     await ws.send_str(note)  # only a refused typed line has one
                 elif msg.type == WSMsgType.ERROR:
                     break
@@ -2446,6 +2516,8 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             shower.cancel()
             unmuter.cancel()
             nudger.cancel()
+            for watcher in watchers:
+                watcher.cancel()
             CALL.unlink(missing_ok=True)  # hands-free and talkback go back to the laptop first
             for target in call_back if hung_up_here else []:  # hung up for quiet (by us, not them): once
                 CALL_RANG_BACK.touch()
@@ -2462,8 +2534,18 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                         pass
                 await proc.wait()
             log(HANDSFREE_LOG, f"phone call ended ({heard / 2 / MIC_RATE:.0f} s of the phone's mic arrived; "
-                               f"{ear.summary()})")
+                               f"{ear.summary()}; {closed_how(ws, bool(hung_up_here))})")
     return ws
+
+
+def closed_how(ws, here: bool) -> str:
+    """Why a call connection ended, for the log: who closed it, the close code, an error if there was one
+    (2026-11-21: 13 drops in one call, and nothing said whether the phone or the laptop let go)."""
+    parts = ["closed by the laptop" if here else f"close code {ws.close_code}"]
+    error = ws.exception()
+    if error is not None:
+        parts.append(f"error {type(error).__name__}: {str(error)[:120]}")
+    return ", ".join(parts)
 
 
 def serve(address: str, port: int) -> bool:

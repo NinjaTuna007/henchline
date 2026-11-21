@@ -8,11 +8,13 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
+import android.media.AudioRecordingConfiguration
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
@@ -171,6 +173,9 @@ class CallService : Service() {
             audio.addOnCommunicationDeviceChangedListener(mainExecutor, earbudsWatch)
             watching = true
         }
+        devicesListed = false  // a reused service lists its devices again on registering
+        audio.registerAudioDeviceCallback(devicesWatch, devicesHandler)
+        audio.registerAudioRecordingCallback(recordingWatch, devicesHandler)
         try {
             listenToButtons()
         } catch (e: Exception) {  // the call goes on without the earbud button
@@ -247,6 +252,9 @@ class CallService : Service() {
         running = false
         if (watching && Build.VERSION.SDK_INT >= 31) audio.removeOnCommunicationDeviceChangedListener(earbudsWatch)
         watching = false
+        audio.unregisterAudioDeviceCallback(devicesWatch)
+        audio.unregisterAudioRecordingCallback(recordingWatch)
+        devicesHandler.removeCallbacksAndMessages(null)
         buttons?.release()
         buttons = null
         beeper?.release()
@@ -275,6 +283,110 @@ class CallService : Service() {
 
     fun send(json: String) {
         socket?.send(json)
+    }
+
+    // --- the mic kept alive: headsets coming and going, a silenced capture, a mic sending only zeros ----------
+    // 2026-11-21: the earbuds went in their case and came out mid-call; the one AudioRecord made at the start went on
+    // "recording" exact zeros, and every word after (push-to-talk too) reached the laptop as silence, for minutes.
+
+    private val devicesHandler by lazy { android.os.Handler(mainLooper) }
+    @Volatile private var micSession = 0  // the running recorder's audio session: its own recording config is found by it
+    private var devicesListed = false  // the first onAudioDevicesAdded lists what is already there, not a change
+    private val restartLock = Any()
+    private var restartedAt = 0L  // when the audio was last started again this way
+    private var restartGap = 0L  // how soon it may be again: 5 s, doubling while restarts keep coming, up to a minute
+    private var restartStreak = 0
+    @Volatile private var silentSpell = 0  // this spell of a silent mic: 0 none, 1 restarted, 2 told it didn't help
+    private val afterDevices = Runnable { restartAudio("a headset came or went") }
+    private val afterSilenced = Runnable { restartAudio("Android silenced the mic") }
+
+    private val devicesWatch = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) {
+            if (!devicesListed) { devicesListed = true; return }
+            headsetsChanged(added)
+        }
+
+        override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) = headsetsChanged(removed)
+    }
+
+    /** A burst of device changes (a headset brings its call and media devices, one by one) starts the audio again
+     *  once, after it settles. */
+    private fun headsetsChanged(devices: Array<out AudioDeviceInfo>) {
+        if (!running || devices.none { it.type in HEADSETS || it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES }) return
+        devicesHandler.removeCallbacks(afterDevices)
+        devicesHandler.postDelayed(afterDevices, DEVICES_SETTLE)
+    }
+
+    private val recordingWatch = object : AudioManager.AudioRecordingCallback() {
+        override fun onRecordingConfigChanged(configs: List<AudioRecordingConfiguration>) {
+            val ours = configs.firstOrNull { micSession != 0 && it.clientAudioSessionId == micSession } ?: return
+            if (!running || !ours.isClientSilenced) return
+            android.util.Log.i("Henchline", "call: Android silenced the call's mic")
+            devicesHandler.removeCallbacks(afterSilenced)
+            devicesHandler.postDelayed(afterSilenced, 500)
+        }
+    }
+
+    /** The mic and speaker started again in the same sound, as a sound switch does; the connection stays. Never in
+     *  a tight loop: at most every 5 s, the gap doubling while restarts keep coming (a mic another app holds). */
+    private fun restartAudio(why: String): Boolean {
+        if (!running || ended) return false
+        val now = System.currentTimeMillis()
+        synchronized(restartLock) {
+            if (now - restartedAt < restartGap) {
+                android.util.Log.i("Henchline", "call: not restarting the audio yet ($why)")
+                return false
+            }
+            // The streak resets only after a quiet minute beyond the current gap, so a trigger that keeps firing
+            // stays at the one-minute gap instead of cycling back to 5 s.
+            restartStreak = if (now - restartedAt < restartGap + 60_000L) restartStreak + 1 else 0
+            restartGap = minOf(60_000L, 5_000L shl minOf(restartStreak, 4))
+            restartedAt = now
+        }
+        if (!switching.compareAndSet(false, true)) return false  // a sound switch is starting it again anyway
+        android.util.Log.i("Henchline", "call: starting the audio again ($why)")
+        Thread {
+            try {
+                synchronized(audioLock) {
+                    val (mic, track) = recorder to player
+                    generation.incrementAndGet()
+                    mic?.join(1000)
+                    track?.join(1000)
+                    if (running) {
+                        applySound()
+                        startAudio()
+                    }
+                }
+            } finally {
+                switching.set(false)
+            }
+        }.start()
+        return true
+    }
+
+    /** About MIC_DEAD_MS of exact zeros from the mic (called on the mic's thread): started again once; if that
+     *  didn't help, said once; after that only as often as restartAudio allows. The laptop is told each step. */
+    private fun micDead() {
+        val spell = silentSpell
+        socket?.send(org.json.JSONObject().put("note", "mic silent").put("restarted", spell > 0).toString())
+        when (spell) {
+            0 -> {
+                silentSpell = 1
+                Bus.listener?.invoke(org.json.JSONObject().put("note", "Your mic went silent: restarting it").toString())
+                restartAudio("the mic sends only silence")
+            }
+            1 -> {
+                silentSpell = 2
+                Bus.listener?.invoke(org.json.JSONObject().put("note",
+                    "Your mic is still silent. Try switching sound, or taking the earbuds out and back in.").toString())
+                restartAudio("the mic still sends only silence")
+            }
+            // After that, zeros alone no longer restart: each restart also cuts the agent mid-sentence, and a phone
+            // that gates a quiet room to exact zeros would be cut every few seconds. Device changes, Android's
+            // silenced report and the user's sound switch still restart it; real sound ends the spell.
+            else -> {}
+        }
     }
 
     /** Clear or call sound, mid-call: the audio starts again in the other mode, the connection stays. */
@@ -452,11 +564,26 @@ class CallService : Service() {
                     "Clear voice: phone echo canceller ${if (effects.any { it is AcousticEchoCanceler }) "on" else "not available"}").toString())
                 try {
                     mic.startRecording()
+                    micSession = mic.audioSessionId
+                    var zeroMs = 0L  // exact zeros in a row: a silenced capture, never a real room
                     while (running && generation.get() == round) {
                         val got = mic.read(buffer, 0, buffer.size)
                         if (got < 0) {
                             fail("The microphone stopped working (error $got).")
                             break
+                        }
+                        if (got > 0) {
+                            if ((0 until got).all { buffer[it] == 0.toByte() }) {
+                                zeroMs += got / 2 * 1000L / MIC_RATE
+                            } else {
+                                if (silentSpell > 0) android.util.Log.i("Henchline", "call: the mic is back")
+                                zeroMs = 0
+                                silentSpell = 0
+                            }
+                            if (zeroMs >= MIC_DEAD_MS && lostAt == 0L) {
+                                zeroMs = 0  // counted afresh: the next step only after another MIC_DEAD_MS
+                                micDead()
+                            }
                         }
                         // Not while reconnecting: queued, it all arrived at once and was taken down late as the user's
                         if (got > 0 && lostAt == 0L) socket?.send(buffer.toByteString(0, got))
@@ -626,6 +753,8 @@ class CallService : Service() {
             AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET)
         const val STOP = "stop"
         const val RECONNECT_FOR = 30_000L  // ms a dropped call keeps trying to come back
+        const val DEVICES_SETTLE = 1_500L  // ms after the last headset change before the audio starts again
+        const val MIC_DEAD_MS = 3_000L  // ms of exact zeros before the mic is taken as silenced
         const val TALK = "talk"
         val TALK_KEYS = setOf(android.view.KeyEvent.KEYCODE_HEADSETHOOK, android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
             android.view.KeyEvent.KEYCODE_MEDIA_PLAY, android.view.KeyEvent.KEYCODE_MEDIA_PAUSE)
