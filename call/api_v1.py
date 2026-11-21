@@ -74,7 +74,7 @@ def effective_capabilities(config: HostConfig) -> dict[str, bool]:
 
 def setup(app: web.Application, config: HostConfig, store: HostStore, host: LocalHost, signer: Any) -> Api:
     capabilities = effective_capabilities(config)
-    descriptor = signer.descriptor(config, capabilities=capabilities)
+    descriptor = signer.published(config, store, capabilities)
     api = Api(config, store, host, signer, capabilities, descriptor, [], set())
     app[API_KEY] = api
     r = app.router

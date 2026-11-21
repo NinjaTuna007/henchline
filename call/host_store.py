@@ -110,6 +110,12 @@ class HostStore:
                 );
                 CREATE INDEX IF NOT EXISTS host_events_session_time
                     ON host_events(session_id, created_at, event_id);
+                CREATE TABLE IF NOT EXISTS published_descriptor(
+                    one INTEGER PRIMARY KEY CHECK(one = 1),
+                    seq INTEGER NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
             """)
             row = self._db.execute("SELECT version FROM schema_meta").fetchone()
             if row is None:
@@ -263,6 +269,19 @@ class HostStore:
                 (time.time() if now is None else now, device_id, request_id),
             ).rowcount
         return bool(changed)
+
+    def publish(self, content_sha256: str, floor_seq: int, now_utc: str) -> tuple[int, str]:
+        """(descriptor_seq, updated_at) for descriptor content with this digest. Same content: what was published
+        before. New content (capabilities, URL, label, key...): the next sequence, never below host.json's,
+        stamped now, so a phone or directory never sees two descriptors under one sequence."""
+        with self._lock, self._db:
+            row = self._db.execute("SELECT * FROM published_descriptor").fetchone()
+            if row is not None and row["content_sha256"] == content_sha256 and row["seq"] >= floor_seq:
+                return int(row["seq"]), row["updated_at"]
+            seq = max(floor_seq, int(row["seq"]) + 1 if row is not None else floor_seq)
+            self._db.execute("INSERT OR REPLACE INTO published_descriptor VALUES (1,?,?,?)",
+                             (seq, content_sha256, now_utc))
+            return seq, now_utc
 
     def append_event(self, session_id: str, kind: str, body: bytes, now: float | None = None) -> str:
         event_id = str(uuid.uuid4())

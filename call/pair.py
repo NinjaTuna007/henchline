@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import sys
@@ -46,7 +47,18 @@ class HostSigner:
     def sign(self, data: bytes) -> bytes:
         return self.key.sign(data)
 
-    def descriptor(self, config: HostConfig, capabilities: dict[str, bool] | None = None) -> dict:
+    def published(self, config: HostConfig, store: HostStore, capabilities: dict[str, bool] | None = None) -> dict:
+        """The descriptor this host advertises: content-addressed in its store, so any change of content gets a
+        higher descriptor_seq and a fresh updated_at by itself (host.json's sequence is the floor)."""
+        draft = self.descriptor(config, capabilities)
+        content = {k: v for k, v in draft.items() if k not in ("descriptor_seq", "updated_at", "signature")}
+        digest = hashlib.sha256(canonical_json(content)).hexdigest()
+        now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        seq, updated_at = store.publish(digest, config.descriptor_seq, now)
+        return self.descriptor(config, capabilities, seq=seq, updated_at=updated_at)
+
+    def descriptor(self, config: HostConfig, capabilities: dict[str, bool] | None = None, *,
+                   seq: int | None = None, updated_at: str | None = None) -> dict:
         """The signed descriptor; capabilities narrows what config enables to what is actually served."""
         descriptor = {
             "schema": "henchline.host/v1",
@@ -55,8 +67,8 @@ class HostSigner:
             "base_url": config.base_url,
             "tls_authority": config.tls_authority,
             "api_version": config.api_version,
-            "descriptor_seq": config.descriptor_seq,
-            "updated_at": config.updated_at,
+            "descriptor_seq": config.descriptor_seq if seq is None else seq,
+            "updated_at": config.updated_at if updated_at is None else updated_at,
             "host_signing_key": b64url(self.public_bytes()),
             "host_key_algorithm": "ed25519",
             "min_app_version": config.min_app_version,
@@ -72,8 +84,10 @@ def devices_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="voice-call devices")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     sub = parser.add_subparsers(dest="action", required=True)
-    sub.add_parser("list", help="every phone ever paired, revoked ones too")
-    revoke = sub.add_parser("revoke", help="that phone's key stops working at once")
+    config = argparse.ArgumentParser(add_help=False)  # --config may also follow the action
+    config.add_argument("--config", type=Path, default=argparse.SUPPRESS)
+    sub.add_parser("list", parents=[config], help="every phone ever paired, revoked ones too")
+    revoke = sub.add_parser("revoke", parents=[config], help="that phone's key stops working at once")
     revoke.add_argument("device_id")
     args = parser.parse_args(argv)
     store = HostStore(HostConfig.load(args.config).database)

@@ -6,6 +6,7 @@
     call/server.py [...] --api-v1
     call/server.py backup --output FILE
     call/server.py pair | devices list | devices revoke DEVICE_ID
+    call/server.py directory enroll | status | heartbeat | withdraw   (and --directory-heartbeat)
 
 With --behind-tailscale-serve it listens on loopback in plain http and never runs
 `tailscale`: whoever installed the https name in front of it owns that route.
@@ -2806,8 +2807,9 @@ class LocalHost:
                        capture_output=True, timeout=30)
 
 
-def mount_api_v1(app: web.Application) -> str:
-    """--api-v1: the signed host API beside the legacy routes, from ~/.config/henchline/host.json. "" or why not."""
+def mount_api_v1(app: web.Application, heartbeats: bool = False) -> str:
+    """--api-v1: the signed host API beside the legacy routes, from ~/.config/henchline/host.json. "" or why not.
+    heartbeats (--directory-heartbeat): also keep this host listed in the directory it was enrolled with."""
     from call import api_v1
     from call.host_config import HostConfig
     from call.host_store import HostStore
@@ -2819,13 +2821,27 @@ def mount_api_v1(app: web.Application) -> str:
         store = HostStore(config.database)
     except (OSError, ValueError, RuntimeError) as exc:
         return str(exc)
-    api_v1.setup(app, config, store, LocalHost(), signer)
+    api = api_v1.setup(app, config, store, LocalHost(), signer)
+    if heartbeats:
+        from call import directory_client
+
+        async def start(app: web.Application) -> None:
+            app["directory_heartbeats"] = asyncio.create_task(directory_client.keep_listed(
+                api.descriptor, signer, lambda words: log(HANDSFREE_LOG, words)))
+
+        async def stop(app: web.Application) -> None:
+            app["directory_heartbeats"].cancel()
+        app.on_startup.append(start)
+        app.on_cleanup.append(stop)
     return ""
 
 
 def main() -> int:
     if sys.argv[1:2] == ["backup"]:
         return backup_main(sys.argv[2:])
+    if sys.argv[1:2] == ["directory"]:
+        from call import directory_client
+        return directory_client.main(sys.argv[2:])
     if sys.argv[1:2] in (["pair"], ["devices"]):
         from call import pair
         return (pair.main if sys.argv[1] == "pair" else pair.devices_main)(sys.argv[2:])
@@ -2846,7 +2862,12 @@ def main() -> int:
                              "set up: never runs `tailscale`, never adds or removes its route" % CALL_PORT)
     parser.add_argument("--api-v1", action="store_true",
                         help="also serve the signed host API (/api/v1) for paired phones; needs host.json")
+    parser.add_argument("--directory-heartbeat", action="store_true",
+                        help="with --api-v1: a signed heartbeat a minute to the directory this host was enrolled "
+                             "with (voice-call directory enroll); nothing when not enrolled")
     args = parser.parse_args()
+    if args.directory_heartbeat and not args.api_v1:
+        parser.error("--directory-heartbeat needs --api-v1 (it advertises that API's descriptor)")
     if args.behind_tailscale_serve:
         if args.cert or args.key:
             parser.error("--behind-tailscale-serve serves plain http: https is the proxy's job")
@@ -2911,7 +2932,7 @@ def main() -> int:
     app.on_cleanup.append(stop_reminders)
     app.router.add_post("/crew/model", crew_model)
     app.router.add_get("/files/{secret}/{name}", sent_file)
-    if args.api_v1 and (why := mount_api_v1(app)):
+    if args.api_v1 and (why := mount_api_v1(app, args.directory_heartbeat)):
         print(f"--api-v1: {why}", file=sys.stderr)
         return 1
     proxied = args.behind_tailscale_serve

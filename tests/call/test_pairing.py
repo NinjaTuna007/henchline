@@ -55,6 +55,19 @@ class Signer(unittest.TestCase):
         self.assertEqual(descriptor["schema"], "henchline.host/v1")
         self.assertFalse(descriptor["capabilities"]["calls"])
 
+    def test_published_descriptors_move_forward_only_when_their_content_changes(self):
+        config = hostkit.config(self.folder)
+        signer = pair.HostSigner.load_or_create(config.key_file)
+        store = HostStore(config.database)
+        self.addCleanup(store.close)
+        first = signer.published(config, store)
+        self.assertEqual(first["descriptor_seq"], 3)  # host.json's
+        self.assertEqual(signer.published(config, store), first)  # same content: same bytes
+        narrowed = signer.published(config, store, {**config.capabilities, "chat": False})
+        self.assertEqual(narrowed["descriptor_seq"], 4)
+        self.assertNotEqual(narrowed["updated_at"], "2026-11-21T12:00:00Z")
+        self.assertEqual(signer.published(config, store)["descriptor_seq"], 5)  # back again is a change too
+
     def test_the_descriptor_holds_no_secret(self):
         config = hostkit.config(self.folder)
         signer = pair.HostSigner.load_or_create(config.key_file)

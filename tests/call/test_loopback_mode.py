@@ -114,7 +114,7 @@ class Commands(unittest.TestCase):
         device = store.claim_pairing(store.new_pairing(), "ed25519", b"k" * 32, "Test phone").device_id
         store.close()
         out = io.StringIO()
-        with mock.patch("sys.argv", ["voice-call", "devices", "--config", str(config), "revoke", device]), \
+        with mock.patch("sys.argv", ["voice-call", "devices", "revoke", device, "--config", str(config)]), \
                 contextlib.redirect_stdout(out):
             self.assertEqual(server.main(), 0)
         with mock.patch("sys.argv", ["voice-call", "devices", "--config", str(config), "list"]), \
