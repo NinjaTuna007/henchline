@@ -433,6 +433,10 @@ def place(speaker: Speaker) -> str:
     folder = resume.folder_of(speaker.agent, chat)
     if folder is None:
         return "That chat isn't running, and I don't know which folder to start it in."
+    from voice.permissions import resume_refusal
+    refused = resume_refusal(speaker.agent, chat)
+    if refused:
+        return refused  # reopened, it would run with more than it had
     note, token = _claim(chat)
     if note:
         held = _reserved_tab(chat)

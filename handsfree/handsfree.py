@@ -43,8 +43,8 @@
     handsfree report WORDS             the caller is a child: WORDS go to the boss
                                        that started it, with corrections since the
                                        last report first. Exit 1 when it has no boss
-    handsfree end SESSION              end that one agent, when it was started from
-                                       here. Siblings are left running
+    handsfree end SESSION              end that one agent: only its boss, or the
+                                       agent itself, may. Siblings are left running
     handsfree send FILE [FILE ...] [WORDS]
                                        show the user files on their phone: in the call's chat while a call
                                        is up, else a Henchline notification (an ntfy one if Henchline can't
@@ -627,7 +627,7 @@ def main() -> int:
         return report(args, caller)
     if command == "end":
         from voice.minions import end
-        return end(args)
+        return end(args, caller)
     if command == "send":
         return send(args)
     if command == "show":

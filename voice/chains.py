@@ -29,6 +29,7 @@ DEFAULT_SLOTS = 8
 REPORT = "[henchline · report]"  # an internal report, not a correction from the user
 _LOCK = CHAINS.parent / "chains.lock"
 PHONE_VIEWS = CHAINS.parent / "chain-views.json"
+REAP_AFTER = 30.0  # seconds: a launch this young is never taken for gone
 _DROP = {"topic", "token", "secret", "password", "folder", "path"}
 
 
@@ -368,16 +369,47 @@ def append(chain: str, kind: str, **fields) -> None:
         _write(chain, {"at": time.time(), "kind": kind, **clean})
 
 
-def allow(chain: str, caller_session: str, depth: int) -> str:
+def _gone(launch: dict, alive: dict[str, int]) -> bool:
+    """That launch's process is no longer in its pane: the pane is gone, or holds another process now."""
+    pane = str(launch.get("pane") or "")
+    pid = int(launch.get("pid") or 0)
+    if not pane:
+        return False  # nothing to look at: not known gone
+    if pane not in alive:
+        return True
+    return bool(pid) and alive[pane] != pid
+
+
+def _reap(found: _Chain, alive: dict[str, int] | None) -> None:
+    """An ended line for each open launch whose process is gone (a child that exited by itself, or crashed, never
+    wrote one), so it stops holding a slot. ``alive`` is every tmux pane with its first process; None when tmux
+    couldn't be asked, and then nothing is known gone."""
+    if alive is None:
+        return
+    settled = time.time() - REAP_AFTER  # a launch newer than the pane list may not be in it yet
+    for index, event in enumerate(list(found.events)):
+        if event.get("kind") != "launch" or float(event.get("at") or 0) > settled:
+            continue
+        if not _launch_open(found.events, index) or not _gone(event, alive):
+            continue
+        line = {"at": time.time(), "kind": "ended", "session": str(event.get("session") or ""),
+                "pane": str(event.get("pane") or ""), "pid": int(event.get("pid") or 0), "reason": "gone"}
+        _write(found.id, line)
+        found.events.append(line)
+
+
+def allow(chain: str, caller_session: str, depth: int, alive: dict[str, int] | None = None) -> str:
     """``""`` when ``caller_session``, working at ``depth``, may start a child. Otherwise a short reason.
 
     The boss is depth 1. A child is depth 2. With max_depth 2 there is no room
-    under a child, and a child is not the boss, so it may not deploy.
+    under a child, and a child is not the boss, so it may not deploy. ``alive`` (tmux panes and their first
+    process) frees the slots of children that are gone before they are counted.
     """
     with _locked():
         found = _one(chain)
         if found is None:
             return "no such chain"
+        _reap(found, alive)
         if found.closed:
             return "that chain has ended"
         if found.boss not in _renamed_as(caller_session):

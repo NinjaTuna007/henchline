@@ -18,6 +18,7 @@ from voice.desktop import Tab
 from voice.state import HANDSFREE_LOG, SPEAKERS, Speaker, log, recent_speakers
 
 AGENTS = ("claude", "cursor", "codex")
+ASK_MARK = "[henchline · deploy]"
 ASK_PREFIX = '[henchline · deploy] You were started by another agent. Report back with `handsfree report "…"`.\n\n'
 
 
@@ -91,7 +92,9 @@ def deploy(args: list[str], caller) -> int:
     chains.bind(boss.session, _pane(boss), int(boss.pid or 0))
     depth = 2 if chains.parent_of(boss.session) else 1
     chain = chains.open(boss.session)
-    refused = chains.allow(chain, boss.session, depth)
+    from voice.desktop import tmux
+    # A child that exited by itself (/exit, a crash) has no ended line: its pane is gone, so its slot is freed here
+    refused = chains.allow(chain, boss.session, depth, alive=tmux.pane_pids())
     if refused:
         print(refused)
         return 1
@@ -101,9 +104,16 @@ def deploy(args: list[str], caller) -> int:
     if match is None:
         print(f"not a folder this laptop can start an agent in: {folder}")
         return 1
+    from voice import permissions, resume
     from voice.desktop import current as desktop
-    from voice.desktop import tmux
-    tab = tmux.start(agent, match)
+    # No more than the boss may do itself, from the boss's own record; ask mode when that can't be read
+    boss_level = permissions.level(boss.agent, resume.chat_id(boss.session), bool(boss.in_editor))
+    flags = permissions.child_flags(agent, boss_level)
+    if flags is None:
+        print(f"not started: Cursor's settings run every command without asking, and this agent asks first, so a "
+              f"{agent} helper would get more than you have. Deploy claude or codex instead.")
+        return 1
+    tab = tmux.start(agent, match, flags=flags)
     if not tab:
         print(f"{agent} didn't start")
         return 1
@@ -121,7 +131,11 @@ def deploy(args: list[str], caller) -> int:
         print(f"{agent} started in {match.name} (tmux {tab.address}), but it is still asking about that folder, "
               "so the ask was not typed")
         return 1
-    typed = desktop().terminals.type_line(tab, ASK_PREFIX + ask)
+    # The box must be drawn first, and the ask must actually leave it: a multi-line paste can keep its Enter
+    if agent == "claude":  # the layout read here is Claude's; the others would only wait out the timeout
+        tmux.composer_ready(tab)
+    typed = desktop().terminals.type_line(tab, ASK_PREFIX + ask) and (
+        agent != "claude" or tmux.submit_pending(tab, ASK_MARK))
     if not typed:
         tmux.end(tab)
         print(f"{agent} started in {match.name} (tmux {tab.address}), but the ask was not typed")
@@ -130,8 +144,8 @@ def deploy(args: list[str], caller) -> int:
     server.spawned(lambda alive: [*alive[-49:], {"pane": tab.address, "pid": pid}])
     # Folder name only: the notice goes to the phone, and the chain file keeps the pane, not the path
     server.notice(f"{agent.capitalize()} started in {match.name}",
-                  "From a deploy, in " + match.name + ". It runs commands without asking; "
-                  "`tmux attach -t henchline` to watch.")
+                  f"From a deploy, in {match.name}. {permissions.child_runs(agent, boss_level)} "
+                  "`tmux attach -t henchline` to watch or answer.")
     chains.append(chain, "launch", parent=boss.session, pane=tab.address, pid=pid, depth=depth + 1,
                   agent=agent, where=match.name, ask=ask)
     log(HANDSFREE_LOG, f"deployed {agent} in {match.name} (tmux {tab.address})")
@@ -307,9 +321,37 @@ def end_session(session: str, *, force: bool = False) -> int:
     return 0
 
 
-def end(args: list[str]) -> int:
-    """Command-line wrapper for ending one delegated session."""
+def may_end(caller_session: str, target: str) -> bool:
+    """Only the boss that started that child, or the child itself, may end it from the command line. The phone's
+    End is the user's own choice and does not come through here. The caller is known from its own environment
+    (handsfree.caller), which an agent could fake: this guards against mistakes (a wrong id, a sibling), it is
+    not a security boundary."""
+    if not caller_session or not target:
+        return False
+    mine = chains.aliases(caller_session)
+    if chains.canonical(target) in mine or target in mine:
+        return True
+    if not chains.parent_of(target):
+        # A launch is stored by its pane and pid; the child's session is bound to it later. Bound here from the
+        # child's own record, the same way a report binds it, so its boss is known
+        known = _speaker(chains.canonical(target))
+        if known and known.tab and known.pid:
+            chains.bind(known.session, known.tab.address, int(known.pid))
+    boss = chains.parent_of(target)
+    return bool(boss) and boss in mine
+
+
+def end(args: list[str], caller=None) -> int:
+    """Command-line wrapper for ending one delegated session: the caller must be its boss, or the child itself."""
     if len(args) != 1 or not args[0].strip():
         print("usage: handsfree end SESSION")
         return 1
-    return end_session(args[0].strip())
+    target = args[0].strip()
+    me = caller() if caller else None
+    if me is None or not me.session:
+        print("couldn't tell which agent is ending it")
+        return 1
+    if not may_end(me.session, target):
+        print("only the agent that started it, or the agent itself, may end it")
+        return 1
+    return end_session(target)

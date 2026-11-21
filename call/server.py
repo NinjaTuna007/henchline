@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -633,11 +634,25 @@ async def crew(request: web.Request) -> web.Response:
 SPAWNED_LOCK = threading.Lock()  # SPAWNED is read, changed and written from the loop and executor threads
 
 
+@contextlib.contextmanager
+def spawned_locked():
+    """SPAWNED for one read-change-write: this process's threads (SPAWNED_LOCK) and other processes (a lock file:
+    `handsfree deploy` writes the same list from the command line while the server does)."""
+    with SPAWNED_LOCK:
+        SPAWNED.parent.mkdir(parents=True, exist_ok=True)
+        with open(SPAWNED.with_name(SPAWNED.name + ".lock"), "a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def spawned(change=None) -> list[str]:
     """The tmux panes of agents started from the phone that are still those panes: each kept with its process id,
     since tmux numbers panes from 0 again after a restart, and a reused id may be one the user started. `change`
     edits the list under the same lock (a new pane, an ended one)."""
-    with SPAWNED_LOCK:
+    with spawned_locked():
         kept = [e for e in read_json(SPAWNED).get("panes", []) if isinstance(e, dict) and e.get("pid")]
         panes = tmux.pane_pids()  # one tmux call; None: tmux didn't answer, so nothing is taken as gone
         alive = kept if panes is None else [e for e in kept if panes.get(str(e.get("pane"))) == e["pid"]]
@@ -661,7 +676,7 @@ def owns(pane: str, pid: int = 0) -> bool:
         pid = 0
     if not pid:
         return False
-    with SPAWNED_LOCK:
+    with spawned_locked():
         kept = [e for e in read_json(SPAWNED).get("panes", []) if isinstance(e, dict) and e.get("pid")]
         panes = tmux.pane_pids()
         if panes is None:

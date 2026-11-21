@@ -199,19 +199,91 @@ def _window(folder: Path, name: str, argv: list[str]) -> Tab:
     return Tab(OWNER, pane) if pane.startswith("%") else Tab()
 
 
-def start(agent: str, folder: Path, model: str = "", params: dict | None = None) -> Tab:
-    """A new agent in its own tmux window in that folder; its tab, or an empty one when it couldn't start."""
-    command = COMMANDS.get(agent, [""])
+def start(agent: str, folder: Path, model: str = "", params: dict | None = None,
+          flags: list[str] | None = None) -> Tab:
+    """A new agent in its own tmux window in that folder; its tab, or an empty one when it couldn't start.
+    flags: its permission flags instead of the new-chat ones (a deployed child gets no more than its boss)."""
+    command = COMMANDS.get(agent, [""]) if flags is None else [COMMANDS.get(agent, [""])[0], *flags]
     chosen = model_args(agent, model, params or {}) if model else []  # checked by the caller
     return _window(folder, f"{agent}:{folder.name}", [*command, *chosen])
 
 
 def resume(agent: str, folder: Path, chat: str) -> Tab:
-    """That chat id, continued, in its own tmux window. Empty when this agent has no resume, or it didn't start."""
-    argv = {"claude": ["claude", "--permission-mode", "auto", "--resume", chat],
-            "cursor": ["cursor-agent", "--force", "--resume", chat],
-            "codex": ["codex", "resume", chat]}.get(agent)
+    """That chat id, continued, in its own tmux window. Empty when this agent has no resume, or it didn't start.
+    It comes back in the permission mode its own record says it last had, ask mode when that can't be read: a
+    message to a chat the user closed must not reopen it running commands without asking."""
+    from voice.permissions import resume_flags, resume_refusal
+    if resume_refusal(agent, chat):
+        return Tab()  # it would come back with more than it had: place() says why
+    flags = resume_flags(agent, chat)
+    argv = {"claude": ["claude", *flags, "--resume", chat],
+            "cursor": ["cursor-agent", *flags, "--resume", chat],
+            "codex": ["codex", "resume", *flags, chat]}.get(agent)
     return _window(folder, f"{agent}:{chat[:8]}", argv) if argv else Tab()
+
+
+def _composer(lines: list[str]) -> list[str] | None:
+    """Claude's prompt box: the lines between the last two rules drawn across the pane, the last rule near the
+    bottom (only its footer below). None when the pane doesn't look like that, so the box can't be told apart
+    from the transcript."""
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    rules = [i for i, line in enumerate(lines) if len(line.strip()) >= 20 and set(line.strip()) <= set("─━")]
+    if len(rules) < 2 or len(lines) - 1 - rules[-1] > 3:
+        return None
+    return lines[rules[-2] + 1:rules[-1]]
+
+
+DIALOG = re.compile(r"❯\s*\d+\.|do you want", re.I)  # a numbered choice: Enter would pick an answer
+
+
+def _dialog(lines: list[str]) -> bool:
+    """A question waiting for an answer below the transcript: after the last rule, or anywhere on a screen that
+    isn't the usual box (a dialog replaces it). The transcript above, the user's own echoed words, doesn't count."""
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    if _composer(lines) is not None:
+        rules = [i for i, line in enumerate(lines) if len(line.strip()) >= 20 and set(line.strip()) <= set("─━")]
+        lines = lines[rules[-1] + 1:]  # the footer: Claude's own questions are drawn there, not in the transcript
+    return any(DIALOG.search(line) for line in lines)
+
+
+def _pending(box: list[str], marker: str) -> bool:
+    """The words are still in the box: its first line is the prompt mark and the marker, or a paste placeholder."""
+    first = next((line.strip() for line in box if line.strip()), "")
+    if first.startswith("❯") and first.removeprefix("❯").lstrip().startswith(marker):
+        return True
+    return any("[Pasted text" in line for line in box)
+
+
+def composer_ready(tab: Tab, wait: float = 15.0) -> bool:
+    """True once the agent has drawn its prompt box: text pasted while it is still starting can sit there unsent."""
+    until = time.monotonic() + wait
+    while time.monotonic() < until:
+        box = _composer(out("capture-pane", "-p", "-t", tab.address).splitlines())
+        if box is not None and any(line.lstrip().startswith(("❯", ">", "›")) for line in box):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def submit_pending(tab: Tab, marker: str, tries: int = 3, pause: float = 1.0) -> bool:
+    """After typing, the words must have left the prompt box. A multi-line paste can swallow the Enter that
+    follows it (a deploy's ask sat unsent, 2026-11-21), so Enter is pressed again while the box still holds the
+    marker. Claude's layout only. True when the box no longer holds it, or the box can't be found (nothing to
+    check against). Also True, with no press, when a question is waiting below the transcript: Enter would answer
+    it, and what happened to the ask is unknown, so the pane is left for the user rather than ended."""
+    for attempt in range(tries + 1):
+        time.sleep(pause)
+        lines = out("capture-pane", "-p", "-t", tab.address).splitlines()
+        if _dialog(lines):
+            return True
+        box = _composer(lines)
+        if box is None or not _pending(box, marker):
+            return True
+        if attempt < tries:
+            tmux("send-keys", "-t", tab.address, "Enter")
+    return False
 
 
 def pane_pid(tab: Tab) -> int:
@@ -248,7 +320,11 @@ def pane_pids() -> dict[str, int] | None:
     if done is None:
         return None
     if done.returncode != 0:
-        return {} if "no server running" in done.stderr or "error connecting" in done.stderr else None
+        # No panes only when there is no server at all: none running, or its socket isn't there. Any other failure
+        # (permission denied on the socket, say) is unknown, and then nothing may be taken as gone
+        err = done.stderr.lower()
+        no_socket = "error connecting" in err and "no such file or directory" in err
+        return {} if "no server running" in err or no_socket else None
     pairs = (line.split(" ", 1) for line in done.stdout.splitlines() if " " in line)
     return {pane: int(pid) for pane, pid in pairs if pid.isdigit()}
 

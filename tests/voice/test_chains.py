@@ -14,6 +14,10 @@ from voice.state import CALL_PINNED, LAST, RENAMED, SPEAKERS, Speaker
 assert sandbox.HOME
 
 
+def BOSS():
+    return Speaker("boss", "claude")
+
+
 class Chains(unittest.TestCase):
     def setUp(self):
         if chains.CHAINS.is_dir():
@@ -112,8 +116,8 @@ class Chains(unittest.TestCase):
         with mock.patch("voice.desktop.tmux.end", return_value=True) as ended, \
                 mock.patch("voice.desktop.tmux.resume") as resume, \
                 mock.patch("voice.minions._server", return_value=server):
-            self.assertEqual(end(["child-a"]), 0)
-            self.assertEqual(end(["nobody"]), 1)
+            self.assertEqual(end(["child-a"], BOSS), 0)
+            self.assertEqual(end(["nobody"], BOSS), 1)
         self.assertTrue(any(e["kind"] == "ended" and e["session"] == "child-a" for e in chains.history(chain)))
         self.assertFalse(any(e.get("kind") == "ended" and e.get("session") == "child-b" for e in chains.history(chain)))
         self.assertEqual(chains.parent_of("child-b"), "boss")
@@ -170,7 +174,9 @@ class Chains(unittest.TestCase):
         server.typed_folder.side_effect = typed
         server.spawned.side_effect = spawned
         boss = Speaker("boss", "claude", "job", Tab("tmux", "%3"))
-        with mock.patch("voice.desktop.tmux.start", return_value=Tab("tmux", "%7")) as start, \
+        with mock.patch("voice.desktop.tmux.composer_ready", return_value=True), \
+                mock.patch("voice.desktop.tmux.submit_pending", return_value=True), \
+                mock.patch("voice.desktop.tmux.start", return_value=Tab("tmux", "%7")) as start, \
                 mock.patch("voice.desktop.tmux.resume") as resume, \
                 mock.patch("voice.desktop.tmux.pane_pid", return_value=42), \
                 mock.patch("voice.desktop.tmux.accept_trust", return_value=True), \
@@ -181,6 +187,8 @@ class Chains(unittest.TestCase):
         start.assert_called_once()
         self.assertEqual(start.call_args.args[0], "claude")
         self.assertEqual(start.call_args.args[1], folder)
+        # The boss's own mode can't be read (no session log): the child asks before acting
+        self.assertEqual(start.call_args.kwargs["flags"], ["--permission-mode", "default"])
         resume.assert_not_called()
         typed_text = terms.type_line.call_args.args[1]
         self.assertIn("handsfree report", typed_text)
@@ -230,7 +238,7 @@ class Chains(unittest.TestCase):
         with mock.patch("voice.desktop.tmux.end", return_value=True), \
                 mock.patch("voice.minions._server", return_value=server), \
                 mock.patch("voice.minions._hand_up"):
-            self.assertEqual(end([session]), 0)
+            self.assertEqual(end([session], BOSS), 0)
         self.assertEqual(chains.allow(chain, "boss", 1), "")
         self.assertTrue(any(e["kind"] == "ended" and e["pane"] == "%0" for e in chains.history(chain)))
 
@@ -368,7 +376,7 @@ class Chains(unittest.TestCase):
         server.owns.return_value = True
         with mock.patch("voice.desktop.tmux.end") as ended, \
                 mock.patch("voice.minions._server", return_value=server):
-            self.assertEqual(end(["child"]), 0)
+            self.assertEqual(end(["child"], BOSS), 0)
         ended.assert_not_called()
         self.assertFalse(any(e.get("kind") == "ended" for e in chains.history(chain)))
         self.assertTrue(chains.pending_end("child"))
@@ -508,7 +516,9 @@ class Chains(unittest.TestCase):
         server.trusted_folders.return_value = []
         server.typed_folder.return_value = folder
         boss = Speaker("boss", "claude", "job", Tab("tmux", "%3"))
-        with mock.patch("voice.desktop.tmux.start", return_value=Tab("tmux", "%7")), \
+        with mock.patch("voice.desktop.tmux.composer_ready", return_value=True), \
+                mock.patch("voice.desktop.tmux.submit_pending", return_value=True), \
+                mock.patch("voice.desktop.tmux.start", return_value=Tab("tmux", "%7")), \
                 mock.patch("voice.desktop.tmux.end", return_value=True) as ended, \
                 mock.patch("voice.desktop.tmux.accept_trust", return_value=False), \
                 mock.patch("voice.minions._server", return_value=server):
@@ -525,3 +535,184 @@ class Chains(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SafetyHoles(unittest.TestCase):
+    """The 2026-11-21 review: end only your own, and a child that exits by itself gives its slot back."""
+
+    def setUp(self):
+        Chains.setUp(self)
+
+    def test_end_refuses_a_caller_that_is_not_the_boss(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="child-a", pane="%1", pid=1, depth=2)
+        chains.append(chain, "launch", parent="boss", session="child-b", pane="%2", pid=2, depth=2)
+        Speaker("stranger", "claude", "x", Tab("tmux", "%8"), pid=8).save(SPEAKERS / "stranger.json")
+        with mock.patch("voice.minions.end_session", return_value=0) as ending:
+            self.assertEqual(end(["child-a"], lambda: Speaker("stranger", "claude")), 1)
+            self.assertEqual(end(["child-a"], lambda: Speaker("child-b", "claude")), 1)  # a sibling
+            self.assertEqual(end(["boss"], lambda: Speaker("child-a", "claude")), 1)  # its own boss
+            self.assertEqual(end(["child-a"], None), 1)  # no caller known
+            ending.assert_not_called()
+            self.assertEqual(end(["child-a"], lambda: Speaker("child-a", "claude")), 0)  # itself
+            self.assertEqual(end(["child-b"], BOSS), 0)
+        self.assertEqual([c.args[0] for c in ending.call_args_list], ["child-a", "child-b"])
+
+    def test_the_boss_may_end_a_child_whose_session_was_never_bound(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", pane="%4", pid=44, depth=2)
+        session = "claude-22222222-2222-2222-2222-222222222222"
+        Speaker(session, "claude", "job", Tab("tmux", "%4"), pid=44).save(SPEAKERS / f"{session}.json")
+        with mock.patch("voice.minions.end_session", return_value=0) as ending:
+            self.assertEqual(end([session], lambda: Speaker("stranger", "claude")), 1)
+            self.assertEqual(end([session], BOSS), 0)
+        ending.assert_called_once_with(session)
+
+    def test_a_child_that_exited_by_itself_frees_its_slot(self):
+        chain = chains.open("boss")
+        old = __import__("time").time() - 120
+        for i in range(8):
+            chains.append(chain, "launch", parent="boss", session=f"c{i}", pane=f"%{i}", pid=i + 1, depth=2)
+        # Written as old launches: a young one may simply not be in the pane list yet
+        path = chains.CHAINS / f"{chain}.jsonl"
+        lines = [__import__("json").loads(line) for line in path.read_text().splitlines()]
+        for line in lines:
+            if line.get("kind") == "launch":
+                line["at"] = old
+        path.write_text("".join(__import__("json").dumps(line) + "\n" for line in lines))
+        alive = {f"%{i}": i + 1 for i in range(8)}
+        self.assertEqual(chains.allow(chain, "boss", 1, alive=alive), "no slots left")
+        self.assertEqual(chains.allow(chain, "boss", 1, alive=None), "no slots left")  # tmux unanswered: nothing gone
+        del alive["%3"]  # c3 typed /exit: its pane closed
+        alive["%5"] = 999  # the pane id was reused by another process
+        self.assertEqual(chains.allow(chain, "boss", 1, alive=alive), "")
+        ended = [e for e in chains.history(chain) if e.get("kind") == "ended"]
+        self.assertEqual(sorted(e["session"] for e in ended), ["c3", "c5"])
+        self.assertTrue(all(e["reason"] == "gone" for e in ended))
+        self.assertEqual(chains.allow(chain, "boss", 1, alive=alive), "")  # not written twice
+        self.assertEqual(len([e for e in chains.history(chain) if e.get("kind") == "ended"]), 2)
+
+    def test_a_young_launch_is_never_taken_for_gone(self):
+        chain = chains.open("boss")
+        for i in range(8):
+            chains.append(chain, "launch", parent="boss", session=f"c{i}", pane=f"%{i}", pid=i + 1, depth=2)
+        self.assertEqual(chains.allow(chain, "boss", 1, alive={}), "no slots left")
+        self.assertFalse(any(e.get("kind") == "ended" for e in chains.history(chain)))
+
+
+class AskSubmitted(unittest.TestCase):
+    """A deploy's multi-line ask sat in Claude's prompt box unsent (2026-11-21): Enter is pressed until it leaves."""
+    RULE = "─" * 40
+    STUCK = ["● earlier", RULE, '❯ [henchline · deploy] You were started by another agent.', "", "  Read the brief.",
+             RULE, "  ⏵⏵ auto mode on"]
+    SENT = ['❯ [henchline · deploy] You were started by another agent.', "✻ Thinking…", RULE, "❯ ", RULE,
+            "  ⏵⏵ auto mode on"]
+
+    def test_enter_is_pressed_again_while_the_ask_is_still_in_the_box(self):
+        from voice.desktop import tmux
+        screens = iter(["\n".join(self.STUCK), "\n".join(self.STUCK), "\n".join(self.SENT)])
+        with mock.patch.object(tmux, "out", side_effect=lambda *a: next(screens)), \
+                mock.patch.object(tmux, "tmux") as keys:
+            self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
+        self.assertEqual(keys.call_count, 2)
+        self.assertEqual(keys.call_args.args, ("send-keys", "-t", "%7", "Enter"))
+
+    def test_a_box_that_never_empties_is_a_failure(self):
+        from voice.desktop import tmux
+        with mock.patch.object(tmux, "out", return_value="\n".join(self.STUCK)), mock.patch.object(tmux, "tmux"):
+            self.assertFalse(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", tries=2, pause=0))
+
+    def test_the_echo_above_the_box_is_not_the_box(self):
+        from voice.desktop import tmux
+        with mock.patch.object(tmux, "out", return_value="\n".join(self.SENT)), \
+                mock.patch.object(tmux, "tmux") as keys:
+            self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
+        keys.assert_not_called()
+
+    def test_a_paste_placeholder_is_still_pending(self):
+        from voice.desktop import tmux
+        pasted = ["● earlier", self.RULE, "❯ [Pasted text #1 +3 lines]", self.RULE, "  ⏵⏵ auto mode on"]
+        screens = iter(["\n".join(pasted), "\n".join(self.SENT)])
+        with mock.patch.object(tmux, "out", side_effect=lambda *a: next(screens)), \
+                mock.patch.object(tmux, "tmux") as keys:
+            self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
+        keys.assert_called_once()
+
+    def test_a_dialog_on_screen_gets_no_enter(self):
+        from voice.desktop import tmux
+        dialog = [*self.STUCK[:-1], "Do you want to proceed?", "❯ 1. Yes", "  2. No", self.RULE]
+        with mock.patch.object(tmux, "out", return_value="\n".join(dialog)), \
+                mock.patch.object(tmux, "tmux") as keys:
+            # Unknown, not failed: the pane is left for the user instead of being ended
+            self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
+        keys.assert_not_called()
+
+    def test_an_ask_that_says_do_you_want_is_still_submitted(self):
+        from voice.desktop import tmux
+        stuck = ["● earlier", self.RULE, "❯ [henchline · deploy] You were started by another agent.", "",
+                 "  Do you want to check the logs? Report what you find.", self.RULE, "  ⏵⏵ auto mode on"]
+        sent = ["❯ [henchline · deploy] You were started by another agent.",
+                "  Do you want to check the logs? Report what you find.", "✻ Thinking…", self.RULE, "❯ ",
+                self.RULE, "  ⏵⏵ auto mode on"]
+        screens = iter(["\n".join(stuck), "\n".join(sent)])
+        with mock.patch.object(tmux, "out", side_effect=lambda *a: next(screens)), \
+                mock.patch.object(tmux, "tmux") as keys:
+            self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
+        keys.assert_called_once()
+
+    def test_a_box_far_from_the_bottom_is_not_the_box(self):
+        from voice.desktop import tmux
+        far = [*self.STUCK, "one", "two", "three", "four"]
+        with mock.patch.object(tmux, "out", return_value="\n".join(far)), \
+                mock.patch.object(tmux, "tmux") as keys:
+            self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
+        keys.assert_not_called()
+
+    def test_a_cursor_or_codex_child_gets_no_extra_enter(self):
+        folder = Path.home() / "workproj"
+        folder.mkdir(exist_ok=True)
+        terms = mock.Mock()
+        terms.type_line.return_value = True
+        server = mock.Mock()
+        server.trusted_folders.return_value = [str(folder)]
+        server.spawned.return_value = ["%7"]
+        boss = Speaker("boss", "claude", "job", Tab("tmux", "%3"))
+        for agent in ("cursor", "codex"):
+            Chains.setUp(self)
+            with mock.patch("voice.desktop.tmux.submit_pending") as pending, \
+                    mock.patch("voice.desktop.tmux.composer_ready") as ready, \
+                    mock.patch("voice.permissions.cursor_runs_everything", return_value=False), \
+                    mock.patch("voice.desktop.tmux.start", return_value=Tab("tmux", "%7")) as start, \
+                    mock.patch("voice.desktop.tmux.pane_pid", return_value=42), \
+                    mock.patch("voice.desktop.tmux.accept_trust", return_value=True), \
+                    mock.patch("voice.desktop.current", return_value=mock.Mock(terminals=terms)), \
+                    mock.patch("voice.minions._server", return_value=server):
+                code = deploy(["--agent", agent, "--folder", str(folder), "--ask", "look"], lambda: boss)
+            self.assertEqual(code, 0, agent)
+            pending.assert_not_called()
+            ready.assert_not_called()
+            if agent == "codex":
+                self.assertIn('approvals_reviewer="user"', start.call_args.kwargs["flags"])
+            else:
+                self.assertEqual(start.call_args.kwargs["flags"], [])
+
+    def test_a_cursor_child_is_refused_under_a_boss_that_asks(self):
+        folder = Path.home() / "workproj"
+        folder.mkdir(exist_ok=True)
+        server = mock.Mock()
+        server.trusted_folders.return_value = [str(folder)]
+        Chains.setUp(self)
+        with mock.patch("voice.permissions.cursor_runs_everything", return_value=True), \
+                mock.patch("voice.desktop.tmux.start") as start, \
+                mock.patch("voice.minions._server", return_value=server):
+            code = deploy(["--agent", "cursor", "--folder", str(folder), "--ask", "look"],
+                          lambda: Speaker("boss", "claude", "job", Tab("tmux", "%3")))
+        self.assertEqual(code, 1)
+        start.assert_not_called()
+
+    def test_ready_once_the_box_is_drawn(self):
+        from voice.desktop import tmux
+        screens = iter(["Starting…", "\n".join(self.SENT)])
+        with mock.patch.object(tmux, "out", side_effect=lambda *a: next(screens)), \
+                mock.patch.object(tmux.time, "sleep"):
+            self.assertTrue(tmux.composer_ready(Tab("tmux", "%7"), wait=5))

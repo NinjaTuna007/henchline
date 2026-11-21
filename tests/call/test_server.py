@@ -100,6 +100,7 @@ class ToAgent(unittest.TestCase):
         target = mock.Mock(session="claude-1", spoken=lambda: "Claude")
         with mock.patch.object(server, "recent_speakers", return_value=[target]), \
                 mock.patch.object(server.routing, "reachable", return_value=True), \
+                mock.patch.object(server.routing, "place", return_value=""), \
                 mock.patch.object(server.routing, "switch_to") as switch, \
                 mock.patch.object(server.routing, "deliver", return_value=True) as deliver:
             self.assertEqual(server.to_agent("hi", "claude-1", server.Heard.TEXTED, False), ("Claude", ""))
