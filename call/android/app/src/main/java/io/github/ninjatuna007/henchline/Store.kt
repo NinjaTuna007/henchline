@@ -69,6 +69,19 @@ class Store(context: Context, name: String = NAME) : SQLiteOpenHelper(context, n
         buildList { while (c.moveToNext()) add(Queued(hostId, c.getLong(0), c.getString(1), c.getString(2), c.getString(3), c.getString(4))) }
     }
 
+    /** That chat's messages sent from this phone over v1, oldest first, whatever became of them (the screen shows
+     *  waiting, sent, failed and "may not have gone" alike). */
+    fun rows(hostId: String, sessionId: String): List<QueuedRow> = readableDatabase.rawQuery(
+        "SELECT request_id, client_message_id, body, state, note FROM queued WHERE host_id=? AND session_id=? ORDER BY position",
+        arrayOf(hostId, sessionId)).use { c ->
+        buildList {
+            while (c.moveToNext()) {
+                val text = try { org.json.JSONObject(c.getString(2)).getJSONObject("content").getString("text") } catch (e: Exception) { "" }
+                add(QueuedRow(c.getString(0), c.getString(1), text, c.getString(3), c.getString(4)))
+            }
+        }
+    }
+
     override fun settle(requestId: String, state: String, note: String) {
         writableDatabase.execSQL("UPDATE queued SET state=?, note=? WHERE request_id=? AND state='waiting'",
             arrayOf(state, note, requestId))

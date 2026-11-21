@@ -63,6 +63,19 @@ class StoreTest {
         assertEquals(1, store.waiting(b).size)
     }
 
+    @Test fun aChatShowsEveryOutcome() {
+        val h = "00000000-0000-4000-8000-00000000000a"
+        listOf("w" to "waiting", "s" to "sent", "f" to "failed", "m" to "maybe").forEach { (id, _) ->
+            store.enqueue(h, "r-$id", "c-$id", "chat", HostChat.body(h, "chat", "c-$id", "text $id"))
+        }
+        store.enqueue(h, "r-other", "c-other", "other chat", "{}")
+        store.settle("r-s", "sent"); store.settle("r-f", "failed", "not reachable"); store.settle("r-m", "maybe", "stopped")
+        val rows = store.rows(h, "chat")
+        assertEquals(listOf("waiting", "sent", "failed", "maybe"), rows.map { it.state })
+        assertEquals(listOf("text w", "text s", "text f", "text m"), rows.map { it.text })
+        assertEquals("not reachable", rows[2].note)
+    }
+
     @Test fun aVersionOneStoreGainsItsQueues() {
         val old = "henchline-v2-old-${UUID.randomUUID()}.db"
         try {

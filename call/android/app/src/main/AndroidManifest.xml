@@ -40,6 +40,20 @@
         </activity>
 
         <!-- An agent is calling: over the lock screen -->
+        <!-- A paired computer's chats (multi-host preview). The link only says which chat to open: the computer must
+             be one this phone paired. Opening it may send sooner what is already queued for that computer (the
+             screen flushes on open); it never sends anything new. Closes at once when the preview is off. -->
+        <activity
+            android:name=".HostChatActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="henchline" android:host="chat" />
+            </intent-filter>
+        </activity>
         <activity
             android:name=".IncomingActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"

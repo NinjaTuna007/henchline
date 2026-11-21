@@ -81,7 +81,7 @@ class HostOutboxTest {
         var busy = true
         val computer = Computer(a) { if (busy) HttpAnswer(429, """{"error":{"code":"rate_limited","retryable":true}}""") else delivered(true) }
         val item = HostOutbox.enqueue(store, host(a), "claude-1", "hello")
-        assertEquals("rate_limited", HostOutbox.flush(store, listOf(host(a)), chatFor(mapOf(a to computer))).getValue(a).stoppedBy)
+        assertEquals("rate_limited", HostOutbox.flush(store, listOf(host(a)), chatFor(mapOf(a to computer))).getValue(a)!!.stoppedBy)
         assertEquals("waiting", store.state(item.requestId))
         busy = false
         HostOutbox.flush(store, listOf(host(a)), chatFor(mapOf(a to computer)))
@@ -96,7 +96,7 @@ class HostOutboxTest {
         HostOutbox.enqueue(store, host(a), "claude-1", "to a")
         HostOutbox.enqueue(store, host(b), "claude-1", "to b")
         val results = HostOutbox.flush(store, listOf(host(a), host(b)), chatFor(mapOf(a to down, b to up)))
-        assertEquals(1, results.getValue(a).left)
+        assertEquals(1, results.getValue(a)!!.left)
         assertEquals(HostOutbox.Result(1, 0, null), results.getValue(b))
     }
 
@@ -118,7 +118,7 @@ class HostOutboxTest {
         val store = Memory()
         val computer = Computer(a) { HttpAnswer(403, """{"error":{"code":"device_revoked"}}""") }
         val item = HostOutbox.enqueue(store, host(a), "c", "hi")
-        assertTrue(HostOutbox.flush(store, listOf(host(a)), chatFor(mapOf(a to computer))).getValue(a).stoppedBy!!.contains("not authorized"))
+        assertTrue(HostOutbox.flush(store, listOf(host(a)), chatFor(mapOf(a to computer))).getValue(a)!!.stoppedBy!!.contains("not authorized"))
         assertEquals("waiting", store.state(item.requestId))
     }
 
@@ -126,10 +126,10 @@ class HostOutboxTest {
         val store = Memory()
         val skewed = Computer(a) { HttpAnswer(401, """{"error":{"code":"timestamp_out_of_window","server_time":1}}""") }
         HostOutbox.enqueue(store, host(a), "c", "hi")
-        assertTrue(HostOutbox.flush(store, listOf(host(a)), chatFor(mapOf(a to skewed))).getValue(a).stoppedBy!!.contains("clock"))
+        assertTrue(HostOutbox.flush(store, listOf(host(a)), chatFor(mapOf(a to skewed))).getValue(a)!!.stoppedBy!!.contains("clock"))
         val noChat = Computer(b) { delivered() }
         HostOutbox.enqueue(store, host(b), "c", "hi")
-        val result = HostOutbox.flush(store, listOf(host(b, chat = false)), chatFor(mapOf(b to noChat))).getValue(b)
+        val result = HostOutbox.flush(store, listOf(host(b, chat = false)), chatFor(mapOf(b to noChat))).getValue(b)!!
         assertEquals(1, result.left)
         assertTrue(noChat.messages.isEmpty())
     }
@@ -138,8 +138,59 @@ class HostOutboxTest {
         val store = Memory()
         val computer = Computer(a) { delivered() }
         HostOutbox.enqueue(store, host(a), "c", "hi")
-        assertEquals("removal pending", HostOutbox.flush(store, listOf(host(a, pending = true)), chatFor(mapOf(a to computer))).getValue(a).stoppedBy)
+        assertEquals("removal pending", HostOutbox.flush(store, listOf(host(a, pending = true)), chatFor(mapOf(a to computer))).getValue(a)!!.stoppedBy)
         assertTrue(computer.messages.isEmpty())
+    }
+
+    @Test fun oneSenderPerComputerAndNothingSentTwice() {
+        val store = object : OutboxStore {  // the real queue is called from several threads: this one is synchronized too
+            val inner = Memory()
+            @Synchronized override fun enqueue(hostId: String, requestId: String, clientMessageId: String, sessionId: String, body: String) =
+                inner.enqueue(hostId, requestId, clientMessageId, sessionId, body)
+            @Synchronized override fun waiting(hostId: String) = inner.waiting(hostId)
+            @Synchronized override fun settle(requestId: String, state: String, note: String) = inner.settle(requestId, state, note)
+        }
+        val inside = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val computer = Computer(a) { text -> if (text == "first") { inside.countDown(); release.await() }; delivered() }
+        HostOutbox.enqueue(store, host(a), "c", "first")
+        var firstResult: HostOutbox.Result? = null
+        val sender = Thread { firstResult = HostOutbox.flushHost(store, host(a), chatFor(mapOf(a to computer))) }.apply { start() }
+        inside.await()
+        HostOutbox.enqueue(store, host(a), "c", "second")  // written while the first is being sent
+        assertNull("a second sender stands aside", HostOutbox.flushHost(store, host(a), chatFor(mapOf(a to computer))))
+        release.countDown()
+        sender.join(5000)
+        assertEquals(listOf("first", "second"), computer.messages.map { JSONObject(it.second).getJSONObject("content").getString("text") })
+        assertEquals(2, firstResult!!.sent)  // the one sender went round again for the message added meanwhile
+        assertTrue(store.inner.rows.all { it.second == "sent" })
+    }
+
+    @Test fun aMessageQueuedInTheLastGapIsStillSent() {
+        val store = object : OutboxStore {
+            val inner = Memory()
+            @Synchronized override fun enqueue(hostId: String, requestId: String, clientMessageId: String, sessionId: String, body: String) =
+                inner.enqueue(hostId, requestId, clientMessageId, sessionId, body)
+            @Synchronized override fun waiting(hostId: String) = inner.waiting(hostId)
+            @Synchronized override fun settle(requestId: String, state: String, note: String) = inner.settle(requestId, state, note)
+        }
+        val computer = Computer(a) { delivered() }
+        val chats = chatFor(mapOf(a to computer))
+        HostOutbox.enqueue(store, host(a), "c", "first")
+        var late: HostOutbox.Result? = HostOutbox.Result(-1, -1, "not run")
+        HostOutbox.afterPass = {
+            HostOutbox.afterPass = null  // once: B arrives after A's last look, before A lets go
+            HostOutbox.enqueue(store, host(a), "c", "late")
+            Thread { late = HostOutbox.flushHost(store, host(a), chats) }.apply { start(); join(5000) }
+        }
+        try {
+            val result = HostOutbox.flushHost(store, host(a), chats)
+            assertNull("B found A busy and left it to A", late)
+            assertEquals(2, result!!.sent)
+            assertEquals(listOf("first", "late"), computer.messages.map { JSONObject(it.second).getJSONObject("content").getString("text") })
+        } finally {
+            HostOutbox.afterPass = null
+        }
     }
 
     @Test fun anAnswerForAnotherMessageIsNotTakenAsDelivery() {

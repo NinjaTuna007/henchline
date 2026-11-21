@@ -103,6 +103,9 @@ class HostChat(private val client: HostClient, private val hostId: String) {
 }
 
 /** Where the queues live (Store on the phone; a list in tests). */
+/** A message as the chat screen shows it: its words, and what became of it. */
+data class QueuedRow(val requestId: String, val clientMessageId: String, val text: String, val state: String, val note: String)
+
 interface OutboxStore {
     fun enqueue(hostId: String, requestId: String, clientMessageId: String, sessionId: String, body: String): Queued
     fun waiting(hostId: String): List<Queued>
@@ -120,12 +123,46 @@ object HostOutbox {
             HostChat.body(host.hostId, sessionId, clientMessageId, text))
     }
 
-    /** chatFor: that computer's HostChat. A host whose removal is pending sends nothing. */
-    fun flush(store: OutboxStore, hosts: List<Host>, chatFor: (Host) -> HostChat): Map<String, Result> =
+    /** chatFor: that computer's HostChat. A host whose removal is pending sends nothing. A host whose queue is being
+     *  sent already (another thread) is left to it: null for that host, and its sender goes round once more. */
+    fun flush(store: OutboxStore, hosts: List<Host>, chatFor: (Host) -> HostChat): Map<String, Result?> =
         hosts.associate { host ->
             host.hostId to if (host.revocationPending) Result(0, store.waiting(host.hostId).size, "removal pending")
-            else flushOne(store, host, chatFor)
+            else flushHost(store, host, chatFor)
         }
+
+    private val running = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
+    private val again = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
+
+    /** Tests only: runs after a sender's last pass, before it lets go (the gap a late message can fall into). */
+    @androidx.annotation.VisibleForTesting
+    var afterPass: (() -> Unit)? = null
+
+    /** One sender per computer at a time: a message is never sent by two threads at once. A caller that finds the
+     *  sender busy sets "again" and leaves; the sender checks it after every pass and again after letting go, so a
+     *  message queued in that last gap is never left waiting for the next trigger. */
+    fun flushHost(store: OutboxStore, host: Host, chatFor: (Host) -> HostChat): Result? {
+        val busy = running.getOrPut(host.hostId) { java.util.concurrent.atomic.AtomicBoolean() }
+        val more = again.getOrPut(host.hostId) { java.util.concurrent.atomic.AtomicBoolean() }
+        var total = 0
+        var last: Result? = null
+        while (true) {
+            if (!busy.compareAndSet(false, true)) { more.set(true); return last?.copy(sent = total) }
+            try {
+                do {
+                    more.set(false)
+                    val result = flushOne(store, host, chatFor)
+                    total += result.sent
+                    last = result
+                } while (result.stoppedBy == null && more.get())
+                afterPass?.invoke()
+            } finally {
+                busy.set(false)
+            }
+            // Stopped (offline, paused): the next trigger tries again. Otherwise, one more look for the late arrival
+            if (last!!.stoppedBy != null || !more.get()) return last.copy(sent = total)
+        }
+    }
 
     private fun flushOne(store: OutboxStore, host: Host, chatFor: (Host) -> HostChat): Result {
         val chat = try { chatFor(host) } catch (e: Exception) { return Result(0, store.waiting(host.hostId).size, e.message) }

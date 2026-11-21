@@ -30,7 +30,7 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
             .show()
     }
 
-    private fun background(work: () -> Unit) = Thread {
+    private fun background(work: () -> Unit): Unit = Thread {
         try { work() } catch (e: Exception) {
             val title = if (e is ClockSkew) "Check the phone's clock" else "Something went wrong"
             activity.runOnUiThread { tell(title, e.message ?: e.javaClass.simpleName) }
@@ -113,17 +113,23 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
     }
 
     private fun details(host: Host) {
-        val words = "${host.baseUrl}\nFingerprint ${host.fingerprint}\nThis phone there: ${host.deviceId.take(8)}" +
-            if (host.revocationPending) "\n\nRemoval is pending: the computer couldn't be reached, so this phone is still " +
-                "authorized there. On the computer: voice-call devices revoke ${host.deviceId}" else ""
-        AlertDialog.Builder(activity).setTitle(host.label).setMessage(words + "\n\n" + offers(host))
-            .setPositiveButton(if (host.revocationPending) "Try again" else "Remove") { _, _ -> remove(host) }
-            .apply {
-                if (host.revocationPending) setNeutralButton("Forget anyway") { _, _ -> forgetAnyway(host) }
-                else if (isTheLaptop(host) && Store(activity).use { it.migratedTo() } == null)
-                    setNeutralButton("Copy chats") { _, _ -> offerImport(host) }
-                else setNeutralButton("Check now") { _, _ -> check(host) }
+        val info = "${host.baseUrl}\nFingerprint ${host.fingerprint}\nThis phone there: ${host.deviceId.take(8)}" +
+            (if (host.revocationPending) "\n\nRemoval is pending: the computer couldn't be reached, so this phone is still " +
+                "authorized there. On the computer: voice-call devices revoke ${host.deviceId}" else "") + "\n\n" + offers(host)
+        val actions = buildList<Pair<String, () -> Unit>> {
+            if (!host.revocationPending) {
+                add("Chats" to { activity.startActivity(HostChatActivity.openHost(activity, host.hostId)) })
+                add("Check now" to { check(host) })
+                if (isTheLaptop(host) && Store(activity).use { it.migratedTo() } == null) add("Copy chats from this phone" to { offerImport(host) })
+                add("Remove" to { removeHost(host) })
+            } else {
+                add("Try removing again" to { removeHost(host) })
+                add("Forget anyway" to { forgetAnyway(host) })
             }
+            add("About this computer" to { tell(host.label, info) { details(host) } })
+        }
+        AlertDialog.Builder(activity).setTitle(host.label)
+            .setItems(actions.map { it.first }.toTypedArray()) { _, which -> actions[which].second() }
             .setNegativeButton("Close", null)
             .show()
     }
@@ -169,7 +175,7 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
     }
 
     /** A signed round trip: reachable, the clock agrees, and the latest signed description saved. */
-    private fun check(host: Host) = background {
+    private fun check(host: Host): Unit = background {
         val words = try {
             val fresh = HostClient(host, HostKeys.forAuthority("host", host.hostId)).refresh()
             registry.put(fresh)
@@ -185,7 +191,7 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
     }
 
     /** Revoke first, then forget: the key is deleted only once the computer no longer trusts it. */
-    private fun remove(host: Host) = background {
+    private fun removeHost(host: Host): Unit = background {
         val revoked = HostClient(host, HostKeys.forAuthority("host", host.hostId)).revokeSelf()
         if (revoked) {
             HostKeys.delete("host", host.hostId)
