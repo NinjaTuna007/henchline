@@ -102,7 +102,9 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
                     registry.put(host)
                     activity.runOnUiThread {
                         onChanged()
-                        tell("Paired", "${host.label} is paired. Its chats come in a later update of this preview.") { show() }
+                        tell("Paired", "${host.label} is paired. Its chats come in a later update of this preview.") {
+                            if (isTheLaptop(host)) offerImport(host) else show()
+                        }
                     }
                 }
             }
@@ -118,9 +120,43 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
             .setPositiveButton(if (host.revocationPending) "Try again" else "Remove") { _, _ -> remove(host) }
             .apply {
                 if (host.revocationPending) setNeutralButton("Forget anyway") { _, _ -> forgetAnyway(host) }
+                else if (isTheLaptop(host) && Store(activity).use { it.migratedTo() } == null)
+                    setNeutralButton("Copy chats") { _, _ -> offerImport(host) }
                 else setNeutralButton("Check now") { _, _ -> check(host) }
             }
             .setNegativeButton("Close", null)
+            .show()
+    }
+
+    /** The computer the single-laptop app talks to: its address is the old "server" setting. */
+    private fun isTheLaptop(host: Host): Boolean {
+        val server = activity.getSharedPreferences("call", android.content.Context.MODE_PRIVATE).getString("server", "") ?: ""
+        return server.isNotEmpty() && runCatching { pairing.origin(server).toString() }.getOrNull() == host.baseUrl
+    }
+
+    /** Once, for the laptop: copy this phone's chats with it into the multi-host store, keyed by its host id. The old
+     *  files are only read; the app keeps using them until the switch. Final once done. */
+    private fun offerImport(host: Host) {
+        Store(activity).use { store -> if (store.migratedTo() != null) { show(); return } }
+        AlertDialog.Builder(activity)
+            .setTitle("Bring your chats along?")
+            .setMessage("${host.label} is the laptop this phone already talks to. Copy its chats, calls and unsent messages " +
+                "on this phone into the new store for ${host.label}? Nothing is deleted or changed; the app keeps working as now.")
+            .setPositiveButton("Copy") { _, _ -> background {
+                val prefs = activity.getSharedPreferences("call", android.content.Context.MODE_PRIVATE).all
+                val plan = LegacyImport.plan(activity.filesDir, prefs, host.hostId)
+                val words = try {
+                    Store(activity).use { it.apply(plan) }
+                    val c = plan.counts
+                    "Copied ${c["chats"]} chats (${c["lines"]} lines), ${c["calls"]} calls and ${c["outbox"]} unsent messages, " +
+                        "and checked them." + if (plan.chats.any { it.session == null })
+                        "\n\n${plan.chats.count { it.session == null }} chats couldn't be matched to their agent and keep their file name." else ""
+                } catch (e: Store.MigrationRefused) {
+                    "Not copied: ${e.message}."
+                }
+                activity.runOnUiThread { tell("Your chats", words) { show() } }
+            } }
+            .setNegativeButton("Not now") { _, _ -> show() }
             .show()
     }
 

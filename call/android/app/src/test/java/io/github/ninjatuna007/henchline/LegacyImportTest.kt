@@ -62,6 +62,30 @@ class LegacyImportTest {
         assertEquals("a/b", outbox[0].session)
     }
 
+    @Test fun outboxItemsKeepTheirOwnText() {
+        val dir = fixture()
+        val text = File(dir, "outbox.json").readText()
+        val outbox = LegacyImport.plan(dir, prefs(), hostId).outbox
+        outbox.forEach { assertTrue(it.raw, text.contains(it.raw)) }
+        assertEquals("""{"id":"m-3","session":"a/b","words":"Which one am I?","at":1795000300000}""", outbox[0].raw)
+    }
+
+    @Test fun arrayElementsAreSplitExactly() {
+        assertEquals(listOf("""{"a":"x,]}\"y"}""", "[1, 2]", "\"s,\"", "3"),
+            LegacyImport.elements("""[ {"a":"x,]}\"y"} , [1, 2],"s,", 3 ]"""))
+        assertEquals(emptyList<String>(), LegacyImport.elements("[]"))
+        assertEquals(null, LegacyImport.elements("{\"a\":1}"))
+        assertEquals(null, LegacyImport.elements("[1,"))
+    }
+
+    @Test fun noGlobalPreferenceLooksLikeAChatOne() {
+        // Every "call" preference name the app writes (from its sources): only per-chat ones carry these prefixes
+        val global = setOf("server", "dance", "my_name", "clear", "clear_back", "crew", "current", "current_name", "pinned",
+            "sort", "sound", "speaker", "stay_default", "cut_default", "thoughts", "away", "away_card", "asked_full",
+            "asked_dnd", "helpers_hint_shown", "ring_endpoint", "multihost")
+        assertFalse(global.any { g -> listOf("seen_", "helpers_seen_", "model_").any { g.startsWith(it) } })
+    }
+
     @Test fun onlyChatPreferencesMove() {
         val prefs = LegacyImport.plan(fixture(), prefs(), hostId).prefs
         val names = prefs.map { "${it.chat ?: "-"}/${it.name}" }.toSet()

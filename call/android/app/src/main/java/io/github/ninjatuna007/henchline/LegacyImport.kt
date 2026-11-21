@@ -102,8 +102,9 @@ object LegacyImport {
         }
 
         val outbox = ArrayList<Outboxed>()
-        outboxItems?.let { for (i in 0 until it.length()) it.optJSONObject(i)?.let { item ->
-            outbox += Outboxed(i, item.optString("id"), item.optString("session"), item.toString())
+        outboxText?.let { text -> elements(text)?.forEachIndexed { i, raw ->  // each item's own text, not re-written
+            val item = runCatching { JSONObject(raw) }.getOrNull()
+            outbox += Outboxed(i, item?.optString("id") ?: "", item?.optString("session") ?: "", raw)
         } }
 
         val calls = read("calls.jsonl")?.split("\n")?.filter { it.isNotBlank() } ?: emptyList()
@@ -120,6 +121,30 @@ object LegacyImport {
             }
         }
         return Plan(hostId, chats, lines, outbox, calls, media, thumbs, chatPrefs, sources)
+    }
+
+    /** The text of each element of a JSON array, exactly as written; null when it isn't one. */
+    fun elements(text: String): List<String>? {
+        val t = text.trim()
+        if (!t.startsWith("[") || !t.endsWith("]") || runCatching { JSONArray(t) }.isFailure) return null
+        val out = ArrayList<String>()
+        var depth = 0; var inString = false; var escaped = false; var start = -1
+        for (i in 1 until t.length - 1) {
+            val c = t[i]
+            if (inString) {
+                if (escaped) escaped = false else if (c == '\\') escaped = true else if (c == '"') inString = false
+                continue
+            }
+            when (c) {
+                '"' -> { inString = true; if (start < 0) start = i }
+                '[', '{' -> { if (start < 0) start = i; depth++ }
+                ']', '}' -> depth--
+                ',' -> if (depth == 0) { out += t.substring(start, i).trim(); start = -1 }
+                else -> if (start < 0 && !c.isWhitespace()) start = i
+            }
+        }
+        if (start >= 0) out += t.substring(start, t.length - 1).trim()
+        return out
     }
 
     /** Same SHA-256 for every legacy file the plan read: the import changed nothing of the old app's data. */

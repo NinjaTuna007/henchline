@@ -49,6 +49,36 @@ class StoreTest {
         dir.deleteRecursively()
     }
 
+    @Test fun queuesArePerHostAndOrdered() {
+        val a = "00000000-0000-4000-8000-00000000000a"
+        val b = "00000000-0000-4000-8000-00000000000b"
+        val first = store.enqueue(a, "r1", "c1", "s", "{}")
+        store.enqueue(b, "r2", "c2", "s", "{}")
+        val third = store.enqueue(a, "r3", "c3", "s", "{\"x\":1}")
+        assertEquals(listOf(0L, 1L), store.waiting(a).map { it.position })
+        assertEquals(listOf("r1", "r3"), store.waiting(a).map { it.requestId })
+        store.settle(first.requestId, "sent")
+        store.settle(first.requestId, "failed")  // settled once: a later outcome doesn't overwrite it
+        assertEquals(listOf(third), store.waiting(a))
+        assertEquals(1, store.waiting(b).size)
+    }
+
+    @Test fun aVersionOneStoreGainsItsQueues() {
+        val old = "henchline-v2-old-${UUID.randomUUID()}.db"
+        try {
+            val v1 = object : android.database.sqlite.SQLiteOpenHelper(target, old, null, 1) {
+                override fun onCreate(db: android.database.sqlite.SQLiteDatabase) {
+                    db.execSQL("CREATE TABLE migration(host_id TEXT PRIMARY KEY, state TEXT NOT NULL, digest TEXT NOT NULL, counts TEXT NOT NULL, sources TEXT NOT NULL, at INTEGER NOT NULL)")
+                }
+                override fun onUpgrade(db: android.database.sqlite.SQLiteDatabase, o: Int, n: Int) {}
+            }
+            v1.writableDatabase.close(); v1.close()
+            Store(target, old).use { assertEquals(0, it.waiting("x").size); it.enqueue("x", "r", "c", "s", "{}") }
+        } finally {
+            target.deleteDatabase(old)
+        }
+    }
+
     @Test fun importVerifiesAndRunsOnce() {
         val host = "00000000-0000-4000-8000-000000000001"
         val plan = LegacyImport.plan(dir, prefs(), host)
@@ -58,8 +88,11 @@ class StoreTest {
         assertTrue(LegacyImport.unchanged(dir, plan))
         try { store.apply(LegacyImport.plan(dir, prefs(), "00000000-0000-4000-8000-000000000002")); fail("second host") }
         catch (expected: Store.MigrationRefused) {}
+        // The old app keeps writing its files: for the host already imported, a later plan changes nothing
         File(dir, "chats/a.jsonl").appendText("{\"text\":\"later\",\"at\":1}\n")
-        try { store.apply(LegacyImport.plan(dir, prefs(), host)); fail("changed data") } catch (expected: Store.MigrationRefused) {}
+        store.apply(LegacyImport.plan(dir, prefs(), host))
         assertEquals(host, store.migratedTo())
+        assertEquals(1, store.readableDatabase.rawQuery("SELECT lines FROM chats WHERE chat_key='a'", null)
+            .use { it.moveToFirst(); it.getInt(0) })
     }
 }

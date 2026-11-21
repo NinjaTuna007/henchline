@@ -10,7 +10,7 @@ import android.database.sqlite.SQLiteOpenHelper
  * paired computer (LegacyImport); the screens still read the old files until a later step moves them over.
  * The old files are only ever read: rollback is switching the preview off, never restoring an old copy.
  */
-class Store(context: Context, name: String = NAME) : SQLiteOpenHelper(context, name, null, VERSION) {
+class Store(context: Context, name: String = NAME) : SQLiteOpenHelper(context, name, null, VERSION), OutboxStore {
     class MigrationRefused(why: String) : Exception(why)
 
     override fun onConfigure(db: SQLiteDatabase) { db.setForeignKeyConstraintsEnabled(true) }
@@ -32,10 +32,46 @@ class Store(context: Context, name: String = NAME) : SQLiteOpenHelper(context, n
             """CREATE TABLE chat_prefs(host_id TEXT NOT NULL, chat_key TEXT NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL,
                 PRIMARY KEY(host_id, chat_key, name))""",
         ).forEach { db.execSQL(it) }
+        createQueues(db)
     }
 
+    /** Version 2: messages to computers over the v1 API, one queue per host. */
+    private fun createQueues(db: SQLiteDatabase) = db.execSQL(
+        """CREATE TABLE queued(host_id TEXT NOT NULL, position INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE,
+            client_message_id TEXT NOT NULL, session_id TEXT NOT NULL, body TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('waiting', 'sent', 'failed', 'maybe')), note TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(host_id, position))""")
+
     override fun onUpgrade(db: SQLiteDatabase, old: Int, new: Int) {
-        throw IllegalStateException("no upgrade from store version $old to $new yet")
+        if (old < 2) createQueues(db)
+        if (new > 2) throw IllegalStateException("no upgrade from store version $old to $new yet")
+    }
+
+    @Synchronized
+    override fun enqueue(hostId: String, requestId: String, clientMessageId: String, sessionId: String, body: String): Queued {
+        val db = writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            val position = db.rawQuery("SELECT COALESCE(MAX(position), -1) + 1 FROM queued WHERE host_id=?", arrayOf(hostId))
+                .use { it.moveToFirst(); it.getLong(0) }
+            insert(db, "queued", "host_id" to hostId, "position" to position, "request_id" to requestId,
+                "client_message_id" to clientMessageId, "session_id" to sessionId, "body" to body, "state" to "waiting")
+            db.setTransactionSuccessful()
+            return Queued(hostId, position, requestId, clientMessageId, sessionId, body)
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    override fun waiting(hostId: String): List<Queued> = readableDatabase.rawQuery(
+        "SELECT position, request_id, client_message_id, session_id, body FROM queued WHERE host_id=? AND state='waiting' ORDER BY position",
+        arrayOf(hostId)).use { c ->
+        buildList { while (c.moveToNext()) add(Queued(hostId, c.getLong(0), c.getString(1), c.getString(2), c.getString(3), c.getString(4))) }
+    }
+
+    override fun settle(requestId: String, state: String, note: String) {
+        writableDatabase.execSQL("UPDATE queued SET state=?, note=? WHERE request_id=? AND state='waiting'",
+            arrayOf(state, note, requestId))
     }
 
     /** The host the old data went to, if it was imported. */
@@ -43,18 +79,18 @@ class Store(context: Context, name: String = NAME) : SQLiteOpenHelper(context, n
         if (it.moveToFirst()) it.getString(0) else null
     }
 
-    /** Import the plan in one transaction, then read back what was written and compare it with the plan. Again
-     *  for the same host and the same data: nothing to do. Another host, or the same host with different data:
-     *  refused, and nothing changes. */
+    /** Import the plan in one transaction, then read back what was written and compare it with the plan (the digest
+     *  only checks this write: it is never compared with a later plan). Once recorded, the import is final for that
+     *  host: asked again, nothing happens, whatever the old files hold by then (the single-laptop app keeps writing
+     *  them). Another host: refused, and nothing changes. */
     fun apply(plan: LegacyImport.Plan) {
         val db = writableDatabase
         db.beginTransactionNonExclusive()  // IMMEDIATE: the check and the writes are one
         try {
             db.rawQuery("SELECT host_id, digest FROM migration", null).use {
                 if (it.moveToFirst()) {
-                    if (it.getString(0) == plan.hostId && it.getString(1) == plan.digest) { db.setTransactionSuccessful(); return }
-                    throw MigrationRefused(if (it.getString(0) != plan.hostId) "the old data already went to another computer"
-                                           else "the old data changed since it was imported")
+                    if (it.getString(0) == plan.hostId) { db.setTransactionSuccessful(); return }
+                    throw MigrationRefused("the old data already went to another computer")
                 }
             }
             val h = plan.hostId
@@ -111,6 +147,6 @@ class Store(context: Context, name: String = NAME) : SQLiteOpenHelper(context, n
 
     companion object {
         const val NAME = "henchline-v2.db"
-        const val VERSION = 1
+        const val VERSION = 2
     }
 }
