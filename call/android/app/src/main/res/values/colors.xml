@@ -14,4 +14,6 @@
     <color name="call_bar">#17673F</color>
     <color name="call_bar_sub">#D9F2E3</color>
     <color name="call_live">#4CD08A</color>
+    <!-- Waiting for the user (a delegated chat finished: End or Keep) -->
+    <color name="wait">#E0A93B</color>
 </resources>

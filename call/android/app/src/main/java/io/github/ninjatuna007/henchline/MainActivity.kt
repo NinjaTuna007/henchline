@@ -214,8 +214,8 @@ class MainActivity : Activity() {
             }
         }
         val pickForCall = View.OnClickListener { if (onCall()) switchCall() }
-        who.setOnClickListener(pickForCall)
-        avatar.setOnClickListener(pickForCall)
+        who.setOnClickListener(pickForCall)  // the avatar opens the chat's helpers (setUpAvatarHelpers)
+        setUpAvatarHelpers()
         findViewById<View>(R.id.serverRow).setOnClickListener { askServer { } }
         showClear(prefs().getBoolean("clear", true))
         setUpTalkButton()
@@ -1563,7 +1563,7 @@ class MainActivity : Activity() {
         val session = current
         if (session.isEmpty() || Files.origin(this) == null) return
         if (workingOf != session) {
-            workingOf = session; showWorking(null); showWorkingBubble("", ""); showMinionStrip(null, null)
+            workingOf = session; showWorking(null); showWorkingBubble("", ""); showHelpers(null, null)
         }
         // This is also the phone-open heartbeat for a delegated child. Ask independently: working status may wait
         // behind a busy agent for up to a minute, while end safety needs this refresh every few seconds.
@@ -1583,133 +1583,180 @@ class MainActivity : Activity() {
         }
     }
 
-    // --- Delegated agents: the boss's live children and their hand-offs -------------------------------------------
+    // --- Helpers: the agents this chat started (handsfree deploy) and Claude's own subagents and workflows -------
+    // Opened from the header avatar at any time, with a badge on it when there is news (the design review,
+    // 2026-11-21): no strip in the chat, and End or Keep waits in the sheet instead of popping up.
 
-    private var minionRow: View? = null
-    private var minionRows: LinearLayout? = null
-    private var minionTitle: TextView? = null
     private var minionChain: JSONObject? = null
     private var minionHelpers: JSONArray? = null  // Claude's own subagents and workflow runs: status only
+    private var minionSheet: MinionSheet? = null
     private var decidingMinion = ""
+    private var avatarBadge: TextView? = null
+    private var badgeShown = ""  // the badge drawn now ("" none), to pop it only when it changes
+    private var waitingSeen = emptySet<String>()  // children already waiting for End or Keep: a buzz for new ones
+    private var delegatedLine: TextView? = null
 
     private fun pollMinions(session: String) {
         ask("/chat/minions/view", JSONObject().put("session", session)) { answer ->
             if (session != current || chatScreen.visibility != View.VISIBLE) return@ask
-            val chain = answer.optJSONObject("chain")
-            showMinionStrip(chain, answer.optJSONArray("subagents"))
-            maybeOfferMinionEnd(chain)
+            showHelpers(answer.optJSONObject("chain"), answer.optJSONArray("subagents"))
         }
     }
 
-    /** The boss chat's compact crew card. A child row opens that chat; the card's heading opens all hand-offs.
-     *  Claude's own helpers (subagents, workflow runs) are counted in the heading while running and listed in the
-     *  sheet, status only: they run inside the chat (the user's wish, 2026-11-21). */
-    private fun showMinionStrip(chain: JSONObject?, helpers: JSONArray?) {
+    /** The avatar in the chat header opens the Helpers sheet: wrapped in a 48 dp frame with a ripple, and a 16 dp
+     *  badge on its bottom-end corner. A call is still picked from the name. */
+    private fun setUpAvatarHelpers() {
+        val holder = avatar.parent as android.view.ViewGroup
+        val at = holder.indexOfChild(avatar)
+        val params = avatar.layoutParams as LinearLayout.LayoutParams
+        holder.removeView(avatar)
+        val frame = android.widget.FrameLayout(this).apply {
+            TypedValue().also { value ->
+                if (theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, value, true)) {
+                    setBackgroundResource(value.resourceId)
+                }
+            }
+            isClickable = true; isFocusable = true
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+            contentDescription = "Helpers. Open the list"
+            setOnClickListener {
+                it.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+                showMinions()
+            }
+        }
+        frame.addView(avatar, android.widget.FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER))
+        avatarBadge = TextView(this).apply {
+            gravity = Gravity.CENTER; textSize = 10f; includeFontPadding = false
+            typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+            visibility = View.GONE; importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        // 2 dp over the avatar's edge, on the bottom-end corner
+        frame.addView(avatarBadge, android.widget.FrameLayout.LayoutParams(dp(16), dp(16), Gravity.BOTTOM or Gravity.END))
+        holder.addView(frame, at, LinearLayout.LayoutParams(dp(48), dp(48)).apply {
+            marginStart = params.marginStart - dp(2); gravity = Gravity.CENTER_VERTICAL
+        })
+        // The way back from a delegated chat: a line under the header, in the Away line's style
+        val away = findViewById<TextView>(R.id.chatAway)
+        val column = away.parent as android.view.ViewGroup
+        delegatedLine = TextView(this).apply {
+            setPadding(dp(16), 0, dp(16), dp(6)); minimumHeight = dp(32); gravity = Gravity.CENTER_VERTICAL
+            setTextColor(getColor(R.color.muted)); textSize = 13f; visibility = View.GONE
+            TypedValue().also { value ->
+                if (theme.resolveAttribute(android.R.attr.selectableItemBackground, value, true)) setBackgroundResource(value.resourceId)
+            }
+        }
+        column.addView(delegatedLine, column.indexOfChild(away) + 1,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+    }
+
+    private fun seenKey(session: String) = "helpers_seen_$session"
+
+    /** The chat's helpers as the laptop last told them: the badge, the line back to the boss, and the sheet when open. */
+    private fun showHelpers(chain: JSONObject?, helpers: JSONArray?) {
         minionChain = chain
         minionHelpers = helpers
-        val delegated = chain?.takeIf { it.optBoolean("is_boss") }?.optJSONArray("minions") ?: JSONArray()
-        val running = (0 until (helpers?.length() ?: 0)).count { helpers!!.getJSONObject(it).optString("state") == "running" }
-        val minions = delegated
-        if (minions.length() == 0 && running == 0) {
-            minionRow?.let { (it.parent as? android.view.ViewGroup)?.removeView(it) }
-            minionRow = null; minionRows = null; minionTitle = null
-            return
+        val minions = chain?.takeIf { it.optBoolean("is_boss") }?.optJSONArray("minions") ?: JSONArray()
+        val list = helpers ?: JSONArray()
+        val newest = (0 until list.length()).maxOfOrNull { (list.getJSONObject(it).optDouble("last", 0.0) * 1000).toLong() } ?: 0L
+        // "Seen" in the laptop's time (ms of the newest helper line shown): a first view of a chat starts seen
+        if (chain != null || helpers != null) {
+            if (!prefs().contains(seenKey(current))) prefs().edit().putLong(seenKey(current), newest).apply()
         }
-        if (minionRow == null) {
-            val card = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundResource(R.drawable.bubble_agent)
-                setPadding(dp(14), dp(10), dp(14), dp(12))
-            }
-            minionTitle = TextView(this).apply {
-                setTextColor(getColor(R.color.text)); textSize = 15f
-                typeface = android.graphics.Typeface.DEFAULT_BOLD
-                minimumHeight = dp(48); gravity = Gravity.CENTER_VERTICAL; isFocusable = true
-                TypedValue().also { value ->
-                    if (theme.resolveAttribute(android.R.attr.selectableItemBackground, value, true)) setBackgroundResource(value.resourceId)
+        val seen = prefs().getLong(seenKey(current), 0L)
+        // A child waiting for End or Keep: in the boss's list, or this chat itself when it is the delegated one
+        val own = if (chain != null && !chain.optBoolean("is_boss")) chain.optJSONArray("minions")?.let { all ->
+            (0 until all.length()).map { all.getJSONObject(it) }.firstOrNull { it.optString("session") == current && it.has("end_waiting") }
+        } else null
+        val waiting = (0 until minions.length()).map { minions.getJSONObject(it) }
+            .filter { it.has("end_waiting") && it.optString("session").isNotEmpty() }.map { it.optString("session") }.toSet() +
+            listOfNotNull(own?.let { current })
+        val live = (0 until minions.length()).count {
+            val item = minions.getJSONObject(it)
+            item.optString("state") == "running" && !item.has("end_waiting")
+        }
+        val items = (0 until list.length()).map { list.getJSONObject(it) }
+        val running = items.count { it.optString("state") == "running" } + live
+        fun unseen(item: JSONObject) = (item.optDouble("last", 0.0) * 1000).toLong() > seen
+        val failed = items.count { it.optString("state") == "failed" && unseen(it) }
+        val finished = items.count { it.optString("state") in setOf("done", "stopped") && unseen(it) }
+        fun count(n: Int) = if (n > 9) "9+" else n.toString()
+        val (badge, fill, ring, ink) = when {
+            waiting.isNotEmpty() -> listOf("!", getColor(R.color.cyan), 0, getColor(R.color.navy))
+            failed > 0 -> listOf(count(failed), getColor(R.color.hang), 0, android.graphics.Color.WHITE)
+            running > 0 -> listOf(count(running), getColor(R.color.surface_high), getColor(R.color.cyan), getColor(R.color.cyan))
+            finished > 0 -> listOf(count(finished), getColor(R.color.call_live), 0, getColor(R.color.navy))
+            else -> listOf("", 0, 0, 0)
+        }
+        val kind = when { waiting.isNotEmpty() -> "w"; failed > 0 -> "f"; running > 0 -> "r"; finished > 0 -> "d"; else -> "" }
+        avatarBadge?.apply {
+            if (badge == "") visibility = View.GONE else {
+                text = badge as String; setTextColor(ink as Int)
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL; setColor(fill as Int)
+                    // a navy edge sets it off the face; running is the outlined look of "in progress"
+                    if ((ring as Int) != 0) setStroke((dp(3) / 2), ring) else setStroke(dp(2), getColor(R.color.navy))
                 }
-                setOnClickListener { showMinions() }
-            }
-            minionRows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-            card.addView(minionTitle)
-            card.addView(minionRows, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
-            minionRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.START or Gravity.BOTTOM
-                setPadding(0, dp(4), 0, dp(4))
-                addView(ImageView(this@MainActivity).apply { setImageResource(avatarOf(current)) },
-                    LinearLayout.LayoutParams(dp(28), dp(28)).apply { marginEnd = dp(8) })
-                addView(card, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            }
-        }
-        minionTitle?.apply {
-            val parts = listOfNotNull(
-                if (minions.length() > 0) "${chain?.optInt("used") ?: 0}/${chain?.optInt("slots") ?: 0} slots" else null,
-                if (running > 0) "$running ${if (running == 1) "subagent" else "subagents"}" else null)
-            text = "Delegated agents · ${parts.joinToString(" · ")}  ›"
-            contentDescription = "Delegated agents, ${parts.joinToString(", ")}. Open the list"
-        }
-        minionRows?.removeAllViews()
-        for (i in 0 until minions.length()) {
-            val item = minions.getJSONObject(i)
-            val child = item.optString("session")
-            val title = listOf(item.optString("agent").replaceFirstChar { it.uppercase() },
-                item.optString("where").replace("_", " ")).filter { it.isNotEmpty() }.joinToString(" · ")
-            val detail = when {
-                item.has("end_waiting") -> "Waiting for End or Keep"
-                item.optString("state") == "ended" -> "Ended"
-                child.isEmpty() -> "Starting…"
-                else -> "Working · tap to open"
-            }
-            minionRows?.addView(LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(5), 0, dp(5)); minimumHeight = dp(48); isEnabled = child.isNotEmpty(); isFocusable = true
-                contentDescription = "$title. $detail"
-                TypedValue().also { value ->
-                    if (child.isNotEmpty() && theme.resolveAttribute(android.R.attr.selectableItemBackground, value, true)) {
-                        setBackgroundResource(value.resourceId)
-                    }
+                visibility = View.VISIBLE
+                if ("$kind$badge" != badgeShown) {
+                    scaleX = 0.6f; scaleY = 0.6f
+                    animate().scaleX(1f).scaleY(1f).setDuration(180).setInterpolator(android.view.animation.OvershootInterpolator()).start()
+                    maybeHintHelpers()
                 }
-                addView(ImageView(this@MainActivity).apply { setImageResource(avatarOf(item.optString("agent"))) },
-                    LinearLayout.LayoutParams(dp(26), dp(26)).apply { marginEnd = dp(8) })
-                addView(LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    addView(TextView(this@MainActivity).apply { text = title; setTextColor(getColor(R.color.text)); textSize = 14f })
-                    addView(TextView(this@MainActivity).apply { text = detail; setTextColor(getColor(R.color.muted)); textSize = 12f })
-                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                if (child.isNotEmpty()) setOnClickListener { open(child) }
-            })
+            }
         }
-        val row = minionRow!!
-        val anchors = listOfNotNull(flowRow, workingRow).filter { it.parent === chat }
-        val at = anchors.minOfOrNull { chat.indexOfChild(it) } ?: chat.childCount
-        if (row.parent !== chat || chat.indexOfChild(row) != at - (if (row.parent === chat && chat.indexOfChild(row) < at) 1 else 0)) {
-            (row.parent as? android.view.ViewGroup)?.removeView(row)
-            val freshAt = listOfNotNull(flowRow, workingRow).filter { it.parent === chat }
-                .minOfOrNull { chat.indexOfChild(it) } ?: chat.childCount
-            chat.addView(row, freshAt, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT))
-            chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+        badgeShown = if (badge == "") "" else "$kind$badge"
+        val who = names[current]?.substringBefore(",") ?: "the agent"
+        (avatarBadge?.parent as? View)?.contentDescription = listOfNotNull(
+            "$who's helpers",
+            if (own != null) "its boss asked to end this chat" else if (waiting.isNotEmpty()) "one is waiting for End or Keep" else null,
+            if (running > 0) "$running running" else null,
+            if (failed > 0) "$failed failed" else null,
+            if (finished > 0) "$finished finished" else null,
+        ).joinToString(", ") + ". Open the list"
+        if ((waiting - waitingSeen).isNotEmpty()) avatar.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+        waitingSeen = waiting
+        // A delegated chat: who started it, a tap away
+        val boss = chain?.optString("boss").orEmpty()
+        val bossName = names[boss]?.replace(", in ", " · ")?.replace(", ", " · ")
+            ?: boss.substringBefore("-").replaceFirstChar { it.uppercase() }
+        delegatedLine?.apply {
+            if (chain == null || chain.optBoolean("is_boss") || boss.isEmpty() || boss == current) {
+                visibility = View.GONE
+            } else {
+                text = "Delegated by $bossName  ›"
+                contentDescription = "Delegated by $bossName. Open that chat"
+                setOnClickListener { open(boss) }
+                visibility = View.VISIBLE
+            }
         }
+        minionSheet?.takeIf { it.isOpen }?.update(chain ?: JSONObject(), list)
+    }
+
+    /** The first time a badge ever shows: one line saying where the helpers are. */
+    private fun maybeHintHelpers() {
+        if (prefs().getBoolean("helpers_hint_shown", false)) return
+        prefs().edit().putBoolean("helpers_hint_shown", true).apply()
+        val who = names[current]?.substringBefore(",") ?: "the agent"
+        android.widget.Toast.makeText(this, "Tap $who's face for its helpers", android.widget.Toast.LENGTH_LONG).show()
     }
 
     private fun showMinions() {
-        val chain = minionChain ?: JSONObject()
-        panel = MinionSheet(this, chain, minionHelpers ?: JSONArray(),
-            onOpen = { session -> open(session) },
-            onDecide = { session, decision -> decideMinion(session, decision) }).also { it.show() }
-    }
-
-    private fun maybeOfferMinionEnd(chain: JSONObject?) {
-        val items = chain?.optJSONArray("minions") ?: return
-        for (i in 0 until items.length()) {
-            val item = items.getJSONObject(i)
-            val waiting = item.optJSONObject("end_waiting") ?: continue
-            val child = item.optString("session")
-            if (child.isEmpty() || waiting.optDouble("at") <= 0 || decidingMinion.isNotEmpty() || BottomPanel.top() != null) return
-            panel = MinionEndSheet(this, item) { decision -> decideMinion(child, decision) }.also { it.show() }
-            return
-        }
+        val session = current
+        if (session.isEmpty()) return
+        val boss = minionChain?.optString("boss").orEmpty()
+        val sheet = MinionSheet(this, minionChain ?: JSONObject(), minionHelpers ?: JSONArray(),
+            claudeChat = session.startsWith("claude-"),
+            session = session,
+            bossName = names[boss]?.replace(", in ", " · ")?.replace(", ", " · ")
+                ?: boss.substringBefore("-").replaceFirstChar { it.uppercase() }.ifEmpty { "its boss" },
+            onOpen = { child -> open(child) },
+            onDecide = { child, decision -> decideMinion(child, decision) },
+            // seen up to the newest helper line the sheet showed, in the laptop's time (never the phone's clock)
+            onSeen = { newest -> if (newest > prefs().getLong(seenKey(session), 0L)) prefs().edit().putLong(seenKey(session), newest).apply() })
+        minionSheet = sheet
+        panel = sheet.also { it.show() }
+        showHelpers(minionChain, minionHelpers)  // seen now: the finished and failed counts clear
+        pollMinions(session)
     }
 
     private fun decideMinion(session: String, decision: String) {

@@ -20,10 +20,10 @@ from pathlib import Path
 
 from voice import workflows
 
-RECENT = 1800  # finished helpers stay listed this long (seconds after their last line)
+RECENT = 1800  # finished helpers stay listed at least this long (seconds after their last line), even past midnight
 STALE = 1800  # an unfinished subagent with no line for this long has stopped (crashed, killed with the session)
 RESUMED = 300  # a finished subagent writing mid-work lines this recently was sent another message: running again
-MOST = 8
+MOST = 20  # the phone's Helpers sheet lists today's helpers (opened on demand from the avatar, 2026-11-21)
 TAIL = 65536  # bytes read from a transcript's end to find its last line
 HEAD = 16384  # bytes read from its start to find its first timed line
 
@@ -160,13 +160,20 @@ def _subagent(meta_path: Path, now: float) -> dict | None:
     return {**found, "state": state, "last": last}
 
 
+def _midnight(now: float) -> float:
+    """Local midnight at the start of the day `now` falls in, as epoch seconds."""
+    day = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    return day.timestamp()
+
+
 def _session_dir(session: str, root: Path) -> Path | None:
     return workflows._session_dir(session, root)  # noqa: SLF001 (same rule: one folder per Claude session)
 
 
 def helpers(session: str, root: Path | None = None, now: float | None = None) -> list[dict]:
-    """That Claude session's helpers worth showing: every running one and those that finished in the last
-    RECENT seconds, running first then newest, at most MOST ([] for any other agent)."""
+    """That Claude session's helpers worth showing: every running one and those that finished today (since local
+    midnight, or in the last RECENT seconds when that reaches further back), running first then newest, at most
+    MOST ([] for any other agent)."""
     root = root or workflows.PROJECTS
     now = time.time() if now is None else now
     sdir = _session_dir(session, root)
@@ -183,7 +190,8 @@ def helpers(session: str, root: Path | None = None, now: float | None = None) ->
         found.append({"id": run["id"], "description": run["name"], "kind": "workflow", "type": "workflow",
                       "state": state, "started": changed, "last": changed,
                       "progress": f"{run['done']}/{run['total']}" if run.get("total") else ""})
-    shown = [item for item in found if item["state"] == "running" or now - item["last"] < RECENT]
+    since = min(_midnight(now), now - RECENT)
+    shown = [item for item in found if item["state"] == "running" or item["last"] >= since]
     shown.sort(key=lambda item: (item["state"] != "running", -item["last"]))
     return shown[:MOST]
 

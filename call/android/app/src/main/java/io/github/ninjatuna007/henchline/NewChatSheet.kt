@@ -247,6 +247,13 @@ open class BottomPanel(protected val activity: Activity) {
     protected fun wide(topMargin: Int = 0, height: Int = ViewGroup.LayoutParams.WRAP_CONTENT) =
         LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, height).apply { this.topMargin = px(topMargin) }
 
+    /** A sheet's list: its own height (or `height` at most), and the one part that gives way when the sheet holds more
+     *  than the screen, so the buttons under it keep their size (the squashed Start button, 2026-11-21). A sheet is
+     *  as tall as what it holds, so the weight only ever shrinks this view. One per sheet: two would share the
+     *  shrinking and could squeeze a short one away. */
+    protected fun flexible(topMargin: Int = 0, height: Int = ViewGroup.LayoutParams.WRAP_CONTENT) =
+        wide(topMargin, height).apply { weight = 1f }
+
     /** A view popping in, a little springy: something is happening. */
     protected fun pop(view: View) {
         view.scaleX = 0.92f; view.scaleY = 0.92f
@@ -408,9 +415,10 @@ class NewChatSheet(
             })
         }
         sheet.addView(box, wide(10))
-        // The list scrolls inside the sheet, at most about half the screen
+        // The list scrolls inside the sheet, at most about a third of the screen, and gives way first when the sheet
+        // holds more than the screen: the Start button kept being squashed to its text's height, Cancel gone (2026-11-21)
         sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(cards) },
-            wide(10, minOf(px(76) * maxOf(folders.size, 1), (activity.resources.displayMetrics.heightPixels * 0.38).toInt())))
+            flexible(10, minOf(px(76) * maxOf(folders.size, 1), (activity.resources.displayMetrics.heightPixels * 0.38).toInt())))
         sheet.addView(warning, wide(12))
         val buttons = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL or Gravity.END }
         buttons.addView(quiet("Cancel") { close() })
@@ -597,7 +605,7 @@ class ModelPicker(
         })
         if (models.size > 8) sheet.addView(box, wide(14))
         sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(rows) },
-            wide(10, (activity.resources.displayMetrics.heightPixels * 0.5).toInt()))
+            flexible(10, (activity.resources.displayMetrics.heightPixels * 0.5).toInt()))
         sheet.addView(quiet("Cancel") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
         list("")
@@ -883,7 +891,7 @@ class CursorChatsSheet(
         }
         sheet.addView(box, wide(14))
         sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(rows) },
-            wide(10, (activity.resources.displayMetrics.heightPixels * 0.5).toInt()))
+            flexible(10, (activity.resources.displayMetrics.heightPixels * 0.5).toInt()))
         sheet.addView(status, wide(8))
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
@@ -1020,131 +1028,349 @@ class UsageSheet(activity: Activity, private val usage: JSONObject) : BottomPane
         }
         body.addView(View(activity), wide(10, px(1)))
         draw.notes(body, usage.optJSONArray("notes"))
-        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(body) },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(body) }, flexible())
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
     }
 }
 
-/** One delegated job: every child and its ask, reports, and user corrections in their recorded order. */
+/**
+ * Helpers (the design review, 2026-11-21): opened from the chat's avatar at any time. The chats this one started
+ * (open, End or Keep in place, a real "Starting" state), Claude's own subagents and workflow runs (running, then
+ * earlier today; status only), then every hand-off in order. Kept up to date while open, sized to what it holds.
+ */
 class MinionSheet(
     activity: Activity,
-    private val chain: JSONObject,
-    private val helpers: org.json.JSONArray,
+    private var chain: JSONObject,
+    private var helpers: org.json.JSONArray,
+    private val claudeChat: Boolean,
+    private val session: String,  // the chat it was opened from: a delegated one is asked End or Keep here too
+    private val bossName: String,
     private val onOpen: (String) -> Unit,
     private val onDecide: (String, String) -> Unit,
+    private val onSeen: (Long) -> Unit = {},  // the newest helper line shown (the laptop's time, ms): "seen" up to there
 ) : BottomPanel(activity) {
-    fun show() {
-        val minions = chain.takeIf { it.optBoolean("is_boss") }?.optJSONArray("minions")
-        val sheet = open("Delegated agents", if ((minions?.length() ?: 0) > 0)
-            "${chain.optInt("used")} of ${chain.optInt("slots")} slots in use" else "None started from this chat")
-        val rows = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        for (i in 0 until (minions?.length() ?: 0)) {
-            val item = minions!!.getJSONObject(i)
-            val session = item.optString("session")
-            val title = listOf(item.optString("agent").replaceFirstChar { it.uppercase() },
-                item.optString("where").replace("_", " ")).filter { it.isNotEmpty() }.joinToString(" · ")
-            rows.addView(actionRow(if (item.optString("state") == "ended") "✓" else "●", title,
-                if (session.isEmpty()) "Starting…" else if (item.optString("state") == "ended") "Ended" else "Open chat",
-                R.color.text) { if (session.isNotEmpty()) { close(); onOpen(session) } }, wide(if (i == 0) 12 else 18))
-            if (item.has("end_waiting") && session.isNotEmpty()) {
-                val choices = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END }
-                choices.addView(quiet("Keep") { close(); onDecide(session, "keep") })
-                choices.addView(primary("End", colour(R.color.hang), Color.WHITE).apply {
-                    setOnClickListener { close(); onDecide(session, "end") }
-                }, LinearLayout.LayoutParams(px(120), px(50)).apply { marginStart = px(8) })
-                rows.addView(choices, wide(10))
-            }
+    private lateinit var rows: LinearLayout
+    private var drawn = ""  // what the rows were drawn from: redrawn only when it changes (keeps a selection)
+    private val expanded = mutableSetOf<String>()  // starting rows and hand-off texts opened by a tap
+    private var showEnded = false
+    private val timers = mutableListOf<() -> Unit>()  // elapsed times, ticked every second
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val tick = object : Runnable {
+        override fun run() {
+            if (!isOpen) return
+            timers.forEach { it() }
+            handler.postDelayed(this, 1000)
         }
-        addHelpersTo(rows, helpers, first = (minions?.length() ?: 0) == 0)
-        val handoffs = if (minions != null) chain.optJSONArray("handoffs") else null
-        if (handoffs != null && handoffs.length() > 0) rows.addView(label("HAND-OFFS IN ORDER"), wide(20))
-        for (i in 0 until (handoffs?.length() ?: 0)) {
-            val handoff = handoffs!!.getJSONObject(i)
-            val kind = when (handoff.optString("kind")) {
-                "ask" -> "ASK"; "report" -> "REPORT"; else -> "YOUR CORRECTION"
-            }
-            val who = listOf(handoff.optString("agent").replaceFirstChar { it.uppercase() },
-                handoff.optString("where").replace("_", " ")).filter { it.isNotEmpty() }.joinToString(" · ")
-            rows.addView(label(listOf(kind, who).filter { it.isNotEmpty() }.joinToString(" · ")), wide(8))
-            rows.addView(TextView(activity).apply {
-                text = handoff.optString("text"); setTextColor(colour(R.color.text)); textSize = 14f
-                setTextIsSelectable(true); setPadding(px(12), px(8), px(12), px(10))
-                background = rounded(colour(R.color.navy), 14f)
-            }, wide(4))
-        }
-        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(rows) },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                height = minOf(px(560), (activity.resources.displayMetrics.heightPixels * 0.68).toInt()) })
-        sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
     }
 
-    /** Claude's own helpers, after the delegated chats: a row each (state dot, what it was asked, its kind and how long
-     *  it has run), not tappable, with one line saying why. Done green, failed red, running cyan, stopped grey. */
-    private fun addHelpersTo(rows: LinearLayout, helpers: org.json.JSONArray, first: Boolean) {
-        if (helpers.length() == 0) return
-        rows.addView(label("CLAUDE'S OWN HELPERS"), wide(if (first) 12 else 20))
-        val now = System.currentTimeMillis() / 1000.0
-        for (i in 0 until helpers.length()) {
-            val item = helpers.getJSONObject(i)
-            val state = item.optString("state")
-            val kind = if (item.optString("kind") == "workflow") "workflow" else "subagent"
-            val seconds = ((if (state == "running") now else item.optDouble("last", now)) - item.optDouble("started", now)).coerceAtLeast(0.0)
-            val took = when {
-                seconds < 60 -> "${seconds.toInt()} s"
-                seconds < 3600 -> "${(seconds / 60).toInt()} min"
-                else -> "${(seconds / 3600).toInt()} h ${((seconds % 3600) / 60).toInt()} min"
-            }
-            val progress = item.optString("progress").takeIf { it.isNotEmpty() }?.let { " · $it agents" }.orEmpty()
-            val detail = when (state) {
-                "running" -> "$kind · running $took$progress"
-                "done" -> "$kind · done after $took$progress"
-                "failed" -> "$kind · failed after $took"
-                else -> "$kind · stopped"
-            }
-            val dot = colour(when (state) {
-                "running" -> R.color.cyan; "done" -> R.color.call_live; "failed" -> R.color.hang; else -> R.color.muted
-            })
-            rows.addView(LinearLayout(activity).apply {
-                orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-                minimumHeight = px(48); setPadding(px(4), px(6), px(4), px(6))
-                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
-                contentDescription = "${item.optString("description")}. $detail. Status only"
-                addView(View(activity).apply { background = rounded(dot, 5f) },
-                    LinearLayout.LayoutParams(px(10), px(10)).apply { marginEnd = px(14) })
-                addView(LinearLayout(activity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    addView(TextView(activity).apply {
-                        text = item.optString("description"); setTextColor(colour(R.color.text)); textSize = 14f
-                        maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END
-                    })
-                    addView(TextView(activity).apply { text = detail; setTextColor(colour(R.color.muted)); textSize = 12f })
-                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            }, wide(2))
+    private fun minions() = chain.takeIf { it.optBoolean("is_boss") }?.optJSONArray("minions") ?: org.json.JSONArray()
+
+    /** This chat itself, when it was delegated and its boss asked to end it: the user is usually here then (the
+     *  laptop waits while the child is the chat on the phone). */
+    private fun ownPending(): JSONObject? = if (chain.optBoolean("is_boss")) null else
+        chain.optJSONArray("minions")?.let { list -> (0 until list.length()).map { list.getJSONObject(it) } }
+            ?.firstOrNull { it.optString("session") == session && it.has("end_waiting") }
+
+    private fun newest(): Long = (0 until helpers.length()).maxOfOrNull { (helpers.getJSONObject(it).optDouble("last", 0.0) * 1000).toLong() } ?: 0L
+
+    private fun items(array: org.json.JSONArray) = (0 until array.length()).map { array.getJSONObject(it) }
+
+    private fun subtitle(): String {
+        val minions = items(minions())
+        val live = minions.count { it.optString("state") != "ended" }
+        val running = items(helpers).count { it.optString("state") == "running" }
+        val earlier = helpers.length() - running
+        return listOfNotNull(
+            if (live > 0) "$live ${if (live == 1) "chat" else "chats"} · ${chain.optInt("used")} of ${chain.optInt("slots")} slots" else null,
+            if (running > 0) "$running running" else null,
+            if (earlier > 0) "$earlier earlier today" else null,
+        ).joinToString(" · ")
+    }
+
+    fun show() {
+        val sheet = open("Helpers", subtitle())
+        if (subtitleView == null) {  // made empty: kept as a line for update() to fill
+            subtitleView = TextView(activity).apply { setTextColor(colour(R.color.muted)); textSize = 14f; setPadding(0, px(4), 0, 0) }
+            sheet.addView(subtitleView)
         }
-        rows.addView(TextView(activity).apply {
+        rows = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+        // As tall as what it holds, and never pushing Close off the screen
+        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(rows) }, flexible(4))
+        sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
+        redraw(force = true)
+        handler.postDelayed(tick, 1000)
+    }
+
+    /** The laptop's newer answer, while the sheet is open: the rows again, without closing it. */
+    fun update(chain: JSONObject, helpers: org.json.JSONArray) {
+        this.chain = chain
+        this.helpers = helpers
+        if (isOpen) redraw()
+    }
+
+    private fun redraw(force: Boolean = false) {
+        val now = "${chain}|${helpers}|$showEnded|${expanded.sorted()}"
+        subtitleView?.text = subtitle()
+        subtitleView?.visibility = if (subtitle().isEmpty()) View.GONE else View.VISIBLE
+        if (!force && now == drawn) return
+        drawn = now
+        onSeen(newest())
+        rows.removeAllViews()
+        timers.clear()
+        val minions = items(minions())
+        val own = ownPending()
+        if (own != null) addOwnPending(own)
+        if (minions.isEmpty() && helpers.length() == 0) {
+            if (own != null) return
+            rows.addView(TextView(activity).apply {
+                text = if (claudeChat) "Subagents and workflows Claude starts show here." else "Agents this chat starts show here."
+                setTextColor(colour(R.color.muted)); textSize = 14f
+            }, wide(16))
+            return
+        }
+        var top = if (own != null) 20 else 12
+        if (minions.isNotEmpty()) {
+            rows.addView(label("DELEGATED CHATS"), wide(top)); top = 20
+            val (ended, live) = minions.partition { it.optString("state") == "ended" }
+            live.forEach { addChild(it) }
+            if (ended.isNotEmpty()) {
+                if (showEnded) ended.forEach { addChild(it) }
+                rows.addView(quiet(if (showEnded) "Hide ended" else "Show ${ended.size} ended") {
+                    showEnded = !showEnded; redraw()
+                }.apply { gravity = Gravity.START or Gravity.CENTER_VERTICAL; minHeight = px(48) }, wide(2))
+            }
+        }
+        val all = items(helpers)
+        val (running, earlier) = all.partition { it.optString("state") == "running" }
+        if (running.isNotEmpty()) {
+            rows.addView(label("RUNNING"), wide(top)); top = 20
+            running.forEach { addHelper(it) }
+        }
+        if (earlier.isNotEmpty()) {
+            rows.addView(label("EARLIER"), wide(top)); top = 20
+            earlier.forEach { addHelper(it) }
+        }
+        if (all.isNotEmpty()) rows.addView(TextView(activity).apply {
             text = "Status only: these run inside the chat and can't be opened."
             setTextColor(colour(R.color.muted)); textSize = 12f; setPadding(px(4), px(4), px(4), 0)
         }, wide(2))
+        val handoffs = if (minions.isNotEmpty()) chain.optJSONArray("handoffs") else null
+        if (handoffs != null && handoffs.length() > 0) {
+            rows.addView(label("HAND-OFFS"), wide(top))
+            for (i in 0 until handoffs.length()) addHandoff(handoffs.getJSONObject(i), "h$i", if (i == 0) 8 else 16)
+        }
+    }
+
+    private fun took(seconds: Double): String = when {
+        seconds < 60 -> "${seconds.toInt()} s"
+        seconds < 3600 -> "${(seconds / 60).toInt()} min"
+        else -> "${(seconds / 3600).toInt()} h ${((seconds % 3600) / 60).toInt()} min"
+    }
+
+    private fun nowSeconds() = System.currentTimeMillis() / 1000.0
+
+    private fun dot(colourId: Int) = View(activity).apply { background = rounded(colour(colourId), 5f) }
+
+    /** One chat this one started: its state as a dot (a spinner while it starts), what it is, and what to do. */
+    private fun addChild(item: JSONObject) {
+        val session = item.optString("session")
+        val title = listOf(item.optString("agent").replaceFirstChar { it.uppercase() },
+            item.optString("where").replace("_", " ")).filter { it.isNotEmpty() }.joinToString(" · ")
+        val ask = item.optJSONArray("handoffs")?.let { list ->
+            (0 until list.length()).map { list.getJSONObject(it) }.firstOrNull { it.optString("kind") == "ask" }
+        }
+        val ended = item.optString("state") == "ended"
+        val waiting = item.has("end_waiting") && session.isNotEmpty()
+        val starting = session.isEmpty() && !ended
+        val key = "start:${ask?.optDouble("at") ?: 0.0}:$title"
+        val card = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded(colour(R.color.navy), 16f)
+            setPadding(px(14), px(12), px(14), px(12))
+        }
+        val line = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; minimumHeight = px(32)
+        }
+        if (starting) line.addView(android.widget.ProgressBar(activity).apply {
+            isIndeterminate = true
+            indeterminateTintList = android.content.res.ColorStateList.valueOf(colour(R.color.muted))
+        }, LinearLayout.LayoutParams(px(16), px(16)).apply { marginEnd = px(14) })
+        else line.addView(dot(when {
+            waiting -> R.color.wait; ended -> R.color.muted; else -> R.color.cyan
+        }), LinearLayout.LayoutParams(px(10), px(10)).apply { marginStart = px(3); marginEnd = px(17) })
+        val detail = TextView(activity).apply { setTextColor(colour(R.color.muted)); textSize = 12f }
+        line.addView(LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(activity).apply {
+                text = title; setTextColor(colour(R.color.text)); textSize = 16f; typeface = Typeface.DEFAULT_BOLD
+                maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+            addView(detail)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        if (session.isNotEmpty()) line.addView(TextView(activity).apply {
+            text = "›"; setTextColor(colour(R.color.muted)); textSize = 20f; setPadding(px(8), 0, 0, 0)
+        })
+        card.addView(line)
+        when {
+            starting -> {
+                val since = ask?.optDouble("at", 0.0) ?: 0.0
+                val refresh = {
+                    val seconds = if (since > 0) (nowSeconds() - since).coerceAtLeast(0.0) else 0.0
+                    if (since > 0 && seconds >= 90) {
+                        detail.text = "Still starting · the laptop hasn't seen its chat yet"
+                        detail.setTextColor(colour(R.color.hang))
+                    } else {
+                        detail.text = if (since > 0) "Starting · ${took(seconds)}" else "Starting"
+                        detail.setTextColor(colour(R.color.muted))
+                    }
+                }
+                refresh(); timers.add(refresh)
+                if (ask != null && key in expanded) card.addView(handoffText(ask.optString("text"), full = true), wide(10))
+                card.setOnClickListener { if (key in expanded) expanded.remove(key) else expanded.add(key); redraw() }
+                card.contentDescription = "$title. Starting. Tap to read what it was asked"
+            }
+            waiting -> {
+                detail.text = "Finished · End or Keep"
+                val choices = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END }
+                choices.addView(quiet("Keep") { onDecide(session, "keep") }.apply { minHeight = px(48); minWidth = px(88) })
+                choices.addView(Button(activity).apply {
+                    text = "End"; isAllCaps = false; textSize = 16f; setTextColor(colour(R.color.hang))
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL); stateListAnimator = null
+                    background = rounded(Color.TRANSPARENT, 18f, 1, colour(R.color.hang))
+                    setOnClickListener { MinionEndSheet(activity, item) { onDecide(session, "end") }.show() }
+                }, LinearLayout.LayoutParams(px(96), px(48)).apply { marginStart = px(8) })
+                card.addView(choices, wide(8))
+                card.setOnClickListener { close(); onOpen(session) }
+                card.contentDescription = "$title. Finished: End or Keep. Tap to open its chat"
+            }
+            ended -> {
+                detail.text = "Ended"
+                if (session.isNotEmpty()) card.setOnClickListener { close(); onOpen(session) }
+                card.contentDescription = "$title. Ended"
+            }
+            else -> {
+                detail.text = "Working"
+                card.setOnClickListener { close(); onOpen(session) }
+                card.contentDescription = "$title. Working. Tap to open its chat"
+            }
+        }
+        rows.addView(card, wide(8))
+    }
+
+    /** In a delegated chat: its boss asked to end it. Keep, or End through the same question. */
+    private fun addOwnPending(item: JSONObject) {
+        val card = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded(colour(R.color.navy), 16f)
+            setPadding(px(14), px(12), px(14), px(12))
+            contentDescription = "End requested by $bossName: End or Keep this chat"
+        }
+        card.addView(LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; minimumHeight = px(32)
+            addView(dot(R.color.wait), LinearLayout.LayoutParams(px(10), px(10)).apply { marginStart = px(3); marginEnd = px(17) })
+            addView(LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(activity).apply {
+                    text = "End requested by $bossName"; setTextColor(colour(R.color.text)); textSize = 16f
+                    typeface = Typeface.DEFAULT_BOLD
+                })
+                addView(TextView(activity).apply {
+                    text = "This chat's work is done. Keep it open, or end it"; setTextColor(colour(R.color.muted)); textSize = 12f
+                })
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        })
+        val choices = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END }
+        choices.addView(quiet("Keep") { onDecide(session, "keep") }.apply { minHeight = px(48); minWidth = px(88) })
+        choices.addView(Button(activity).apply {
+            text = "End"; isAllCaps = false; textSize = 16f; setTextColor(colour(R.color.hang))
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL); stateListAnimator = null
+            background = rounded(Color.TRANSPARENT, 18f, 1, colour(R.color.hang))
+            setOnClickListener { MinionEndSheet(activity, item) { onDecide(session, "end") }.show() }
+        }, LinearLayout.LayoutParams(px(96), px(48)).apply { marginStart = px(8) })
+        card.addView(choices, wide(8))
+        rows.addView(card, wide(12))
+    }
+
+    /** One of Claude's own helpers: not tappable. */
+    private fun addHelper(item: JSONObject) {
+        val state = item.optString("state")
+        val kind = if (item.optString("kind") == "workflow") "workflow" else "subagent"
+        val progress = item.optString("progress").takeIf { it.isNotEmpty() }?.let { " · $it agents" }.orEmpty()
+        val started = item.optDouble("started", nowSeconds())
+        val detail = TextView(activity).apply { setTextColor(colour(R.color.muted)); textSize = 12f }
+        val refresh = {
+            val seconds = ((if (state == "running") nowSeconds() else item.optDouble("last", nowSeconds())) - started).coerceAtLeast(0.0)
+            detail.text = when (state) {
+                "running" -> "$kind · running ${took(seconds)}$progress"
+                "done" -> "$kind · done after ${took(seconds)}$progress"
+                "failed" -> "$kind · failed after ${took(seconds)}"
+                else -> "$kind · stopped"
+            }
+        }
+        refresh()
+        if (state == "running") timers.add(refresh)
+        rows.addView(LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = px(48); setPadding(px(4), px(6), px(4), px(6))
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+            contentDescription = "${item.optString("description")}. ${detail.text}. Status only"
+            addView(dot(when (state) {
+                "running" -> R.color.cyan; "done" -> R.color.call_live; "failed" -> R.color.hang; else -> R.color.muted
+            }), LinearLayout.LayoutParams(px(10), px(10)).apply { marginEnd = px(14) })
+            addView(LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(activity).apply {
+                    text = item.optString("description"); setTextColor(colour(R.color.text)); textSize = 14f
+                    maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END
+                })
+                addView(detail)
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }, wide(2))
+    }
+
+    /** One hand-off: its kind as a label, who in a quieter line beside it, and the words (four lines; a tap opens them). */
+    private fun addHandoff(handoff: JSONObject, key: String, topMargin: Int) {
+        val kind = when (handoff.optString("kind")) { "ask" -> "ASK"; "report" -> "REPORT"; else -> "YOUR CORRECTION" }
+        val who = listOf(handoff.optString("agent").replaceFirstChar { it.uppercase() },
+            handoff.optString("where").replace("_", " ")).filter { it.isNotEmpty() }.joinToString(" · ")
+        rows.addView(LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(label(kind))
+            if (who.isNotEmpty()) addView(TextView(activity).apply {
+                text = who; setTextColor(colour(R.color.muted)); textSize = 12f; setPadding(px(8), 0, 0, 0)
+                maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+        }, wide(topMargin))
+        val open = key in expanded
+        rows.addView(handoffText(handoff.optString("text"), full = open).apply {
+            setOnClickListener { if (key in expanded) expanded.remove(key) else expanded.add(key); redraw() }
+        }, wide(4))
+    }
+
+    private fun handoffText(words: String, full: Boolean) = TextView(activity).apply {
+        text = words; setTextColor(colour(R.color.text)); textSize = 14f
+        setPadding(px(12), px(8), px(12), px(10))
+        background = rounded(colour(R.color.navy), 14f)
+        if (!full) { maxLines = 4; ellipsize = android.text.TextUtils.TruncateAt.END }
     }
 }
 
-/** A child is still open or has fresh words: ask before its pane is closed. */
-class MinionEndSheet(activity: Activity, private val item: JSONObject, private val decide: (String) -> Unit) : BottomPanel(activity) {
+/** Asked before a delegated chat's terminal is closed (from its End button in Helpers, never on its own). */
+class MinionEndSheet(activity: Activity, private val item: JSONObject, private val end: () -> Unit) : BottomPanel(activity) {
     fun show() {
         val who = listOf(item.optString("agent").replaceFirstChar { it.uppercase() },
             item.optString("where").replace("_", " ")).filter { it.isNotEmpty() }.joinToString(" · ")
-        val sheet = open("End delegated chat?", who)
+        val sheet = open("Close $who?", "")
         sheet.addView(TextView(activity).apply {
-            text = "This chat is open or has words that have not been handed back yet. End sends those words to the boss first; Keep leaves it running."
-            setTextColor(colour(R.color.text)); textSize = 15f; setPadding(0, px(18), 0, px(12))
+            text = "Its terminal closes. Anything you typed there that it hasn't passed on goes to the boss first."
+            setTextColor(colour(R.color.text)); textSize = 15f; setPadding(0, px(14), 0, px(12))
         })
         val choices = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END }
-        choices.addView(quiet("Keep") { close(); decide("keep") })
-        choices.addView(primary("End", colour(R.color.hang), Color.WHITE).apply {
-            setOnClickListener { close(); decide("end") }
+        choices.addView(quiet("Keep open") { close() })
+        choices.addView(primary("Close", colour(R.color.hang), Color.WHITE).apply {
+            setOnClickListener { close(); end() }
         }, LinearLayout.LayoutParams(px(120), px(52)).apply { marginStart = px(8) })
         sheet.addView(choices, wide(8))
     }
@@ -1183,9 +1409,8 @@ class WorkflowSheet(
     fun show() {
         val sheet = open("⚙ " + run.optString("name"), stateText())
         rows = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(rows) },
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                height = minOf(px(520), (activity.resources.displayMetrics.heightPixels * 0.6).toInt()) })
+        // As tall as what it holds (a fixed 520 dp left a large empty sheet), and never pushing Close off
+        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(rows) }, flexible())
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
         redraw()
@@ -1287,7 +1512,7 @@ class VoicesSheet(
         val sheet = open("Voices", "How the agents sound")
         val body = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         draw(body)
-        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(body) }, wide(8))
+        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(body) }, flexible(8))
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
     }
@@ -1378,7 +1603,7 @@ class ShowSheet(
                 close(); onPick("window", window.optString("id"))
             })
         }
-        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(rows) }, wide(8))
+        sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(rows) }, flexible(8))
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
     }

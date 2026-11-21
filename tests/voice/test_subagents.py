@@ -79,8 +79,21 @@ class Helpers(unittest.TestCase):
         stale, subagents.STALE = subagents.STALE, 600
         self.addCleanup(setattr, subagents, "STALE", stale)
         self.agent("a1", "Crashed", [user(n - 1200), calls(n - 660)])
-        self.agent("a2", "Long ago", [user(n - 9000), says(n - subagents.RECENT - 60)], finished=True)
+        yesterday = subagents._midnight(n) - 60  # noqa: SLF001
+        self.agent("a2", "Long ago", [user(yesterday - 9000), says(min(yesterday, n - subagents.RECENT - 60))],
+                   finished=True)
         self.assertEqual(self.states(), {"Crashed": "stopped"})
+
+    def test_finished_today_stays_listed(self):
+        noon = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+        self.agent("a1", "This morning", [user(noon - 4 * 3600), says(noon - 3 * 3600)], finished=True)
+        self.agent("a2", "Yesterday", [user(noon - 14 * 3600), says(noon - 13 * 3600)], finished=True)
+        self.assertEqual({h["description"] for h in subagents.helpers(SESSION, self.root, noon)}, {"This morning"})
+
+    def test_just_after_midnight_the_last_half_hour_stays(self):
+        just_after = subagents._midnight(self.now) + 300  # noqa: SLF001
+        self.agent("a1", "Late", [user(just_after - 1200), says(just_after - 900)], finished=True)
+        self.assertEqual([h["description"] for h in subagents.helpers(SESSION, self.root, just_after)], ["Late"])
 
     def test_started_comes_from_the_first_timed_line(self):
         n = self.now
@@ -91,7 +104,7 @@ class Helpers(unittest.TestCase):
 
     def test_running_first_then_newest_and_capped(self):
         n = self.now
-        for i in range(10):
+        for i in range(subagents.MOST + 2):
             self.agent(f"d{i}", f"done {i}", [user(n - 1000), says(n - 100 - i)], finished=True)
         self.agent("r", "still going", [user(n - 50), calls(n - 1)])
         found = subagents.helpers(SESSION, self.root, n)
