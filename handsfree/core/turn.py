@@ -20,7 +20,7 @@ from faster_whisper.vad import get_speech_timestamps
 import routing
 from routing import Heard, Meaning
 from sensing import PER_SECOND, RATE, SPEECH, level
-from talkover import TalkOver, our_own_words
+from talkover import TalkOver, our_own_words, own_share, word_keys
 from voicegate import START_DB
 from voice.speech import nemotron, whisper
 from voice.state import (BY_HANDSFREE, CALL_HANGUP, CALL_PUSH, HANDSFREE_LOG, HANDSFREE_WAV, Phase, in_call,
@@ -38,6 +38,8 @@ NO_STOP_FRAMES = 10  # its last full stop often doesn't come: then 0.3 s more, s
 TRAILING = {"uh", "um", "er", "erm", "hmm", "and", "but", "or", "so", "because", "the", "a", "an", "to", "of",
             "with", "like", "if", "then", "that", "which", "is", "are", "my", "your", "for", "in", "on"}
 BELOW_PEAK = 25  # dB under their loudest also counts as quiet, for a noisy room
+ECHO_TURN_SECONDS = 3.0  # a turn over a clip shorter than this, of the clip's own words, is our echo
+MOSTLY_OURS = 0.6  # or, longer, when at least this share of its words is the clip's
 OVER_FRAMES = 20  # after 0.6 s of quiet, check whether the last word was "over"
 # On a call the line can carry steady hiss (Henchline's clear sound has no call-mode noise suppression) that never
 # gets quiet enough to end a turn: "Hearing you…" for 55 s (2026-11-15). There a second without speech (Silero),
@@ -65,6 +67,29 @@ def only_hint_words(text: str, hotwords: list[str]) -> bool:
     2026-11-15): a transcript of nothing but those is not the user talking."""
     words = re.findall(r"[a-z']+", text.lower())
     return bool(words) and set(words) <= set(re.findall(r"[a-z']+", " ".join(hotwords).lower()))
+
+
+def echo_turn(text: str, clip_text: str, seconds: float) -> bool:
+    """A turn that stopped a clip was only our echo: the clip's own words, and short or mostly them."""
+    return our_own_words(text, clip_text) and (seconds < ECHO_TURN_SECONDS or own_share(text, clip_text) >= MOSTLY_OURS)
+
+
+LEAD_MIN = 2  # leading words of the clip's own, at least, before they are taken off a turn over it
+
+
+def without_clip_lead(text: str, clip_text: str) -> str:
+    """A turn over a clip often starts with a few of the clip's words (our echo, before the user's): those go."""
+    said = set(word_keys(clip_text))
+    tokens = list(re.finditer(r"\S+", text))
+    lead = 0
+    for token in tokens:
+        keys = word_keys(token.group())
+        if not keys or not all(k in said for k in keys):
+            break
+        lead += 1
+    if lead < LEAD_MIN or lead == len(tokens):
+        return text
+    return text[tokens[lead].start():]
 
 
 class Turn:
@@ -99,11 +124,15 @@ class Turn:
                 set_target(False)
                 return None
             taken = self.talkover.taken
-            if heard is Heard.OVER_YOU and taken and our_own_words(text, taken.clip_text):
+            # Thrown away as our echo only when short or mostly the clip's words: a 14 s turn reduced to two of
+            # our words was thrown away whole (2026-11-21). A longer one goes out, said over the clip.
+            if heard is Heard.OVER_YOU and taken and echo_turn(text, taken.clip_text, len(frames) / PER_SECOND):
                 self.echo_slipped(f"what stopped the clip was its own words ({len(text.split())}): "
                                   "our echo; the clip plays on, nothing sent")
                 set_target(False)
                 return None
+            if heard is Heard.OVER_YOU and taken:  # sent as said over the clip, without our echo at its start
+                text, rich = without_clip_lead(text, taken.clip_text), without_clip_lead(rich, taken.clip_text)
             return self.act(text, rich, heard)
         finally:
             release_phase(BY_HANDSFREE)  # act() normally has already, before anything is sent

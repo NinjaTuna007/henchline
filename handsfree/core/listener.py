@@ -19,13 +19,14 @@ import numpy as np
 from routing import Heard
 from sensing import (FRAME, PER_SECOND, RATE, EarbudButton, EchoWatch, Output, Playback, Wake, level,
                      mic_stream, read_frame, start_canceller)
-from talkover import TalkOver, Verdict
+from talkover import CALL_SUSTAIN, CAREFUL_NEW_WORDS, NEW_WORDS, SUSTAIN, TalkOver, Verdict
 from turn import Mode, Turn
 from voicegate import VoiceGate
 from voice.speech import whisper, whistle
 from voice.spool import queued
-from voice.state import (AWAY, BY_HANDSFREE, CALL_BUTTON_ONLY, CALL_PUSH, CLOSE, HANDSFREE_LOG, HANDSFREE_MODE, LISTEN,
-                         PAUSE, PLAYING, WORKER_PID, in_call, log, mic_source, ptt_busy, release_phase)
+from voice.state import (AWAY, BY_HANDSFREE, CALL_BUTTON_ONLY, CALL_PUSH, CALL_SOUND, CLOSE, HANDSFREE_LOG,
+                         HANDSFREE_MODE, LISTEN, PAUSE, PLAYING, WORKER_PID, in_call, log, mic_source, ptt_busy,
+                         read_json, release_phase)
 
 WINDOW = 8.0  # seconds to answer after a clip
 FOLLOW = 6.0  # seconds to carry on after their own message (once, never chained)
@@ -86,6 +87,8 @@ class Listener:
         self.button, self.playback, self.output = EarbudButton(stop), Playback(stop), Output()
         self.echo_watch, self.restart_due = EchoWatch(restarted=canceller_since), False
         self.wary_until, self.play_started = 0.0, 0.0
+        self.calling = False  # on a phone call (set each frame)
+        self.sound_read, self.sound_leaks, self.call_out = 0.0, False, ""  # the phone's sound, from CALL_SOUND
         self.crashed = False
         # Floors kept apart: while a clip plays the cancelled mic sits far below the room
         self.room, self.echo = collections.deque(maxlen=FLOOR_SPAN), collections.deque(maxlen=FLOOR_SPAN)
@@ -164,9 +167,19 @@ class Listener:
         return time.monotonic() - self.opened - self.frames_read * FRAME / RATE
 
     def echo_slipped(self, why: str) -> None:
-        """Our own voice got past the canceller: a fresh one when it may, and stricter for a while."""
+        """Our own voice got past the canceller: a fresh one when it may, and stricter for a while.
+
+        Not longer while already stricter: each echo verdict pushed it 60 s further, and with the canceller weak
+        it stayed strict for 13 minutes and the user couldn't get a word in (2026-11-21)."""
+        if self.calling:  # the phone's mic: says nothing about the laptop's canceller
+            log(HANDSFREE_LOG, f"{why} (on a call: not stricter)")
+            return
         self.restart_due |= self.echo_watch.may_restart()
-        self.wary_until = time.monotonic() + WARY
+        now = time.monotonic()
+        if now < self.wary_until:
+            log(HANDSFREE_LOG, f"{why} (already stricter, {self.wary_until - now:.0f}s left)")
+            return
+        self.wary_until = now + WARY
         log(HANDSFREE_LOG, f"{why}: stricter about talking over for {WARY:.0f}s")
 
     def restart_canceller(self) -> None:
@@ -199,7 +212,13 @@ class Listener:
         # our voice out, and only "hey Claude" getting in made calls deaf between clips (2026-11-15).
         # The laptop's canceller is not in that path, so the phone's mic says nothing about it: no echo
         # watching (a loud street restarted it mid-call, 2026-11-15)
-        calling = in_call()
+        calling = self.calling = in_call()
+        # On a call the phone's own canceller keeps our voice out of its mic: less voice is needed before the words are
+        # looked at, so the user cuts in sooner (2026-11-21: "you need to stop sooner"). Not on its loudspeaker in clear
+        # sound, or without its canceller: our voice can reach its mic there, and it is judged with care
+        careful = not calling or self.call_sound_leaks()
+        self.talkover.sustain = SUSTAIN if careful else CALL_SUSTAIN
+        self.talkover.new_words_needed = CAREFUL_NEW_WORDS if calling and careful else NEW_WORDS
         if self.play_started and not playing and not calling:
             self.restart_due |= self.echo_watch.clip_over()
         self.play_started = (self.play_started or time.monotonic()) if playing else 0.0
@@ -240,6 +259,23 @@ class Listener:
                   turn_floor)
         return True
 
+    def call_sound_leaks(self) -> bool:
+        """On a call: can our voice reach the phone's mic? Its loudspeaker in clear sound, or no canceller on its mic.
+        Read at most once a second."""
+        now = time.monotonic()
+        if now - self.sound_read >= 1:
+            self.sound_read, sound = now, read_json(CALL_SOUND)
+            self.sound_leaks = (sound.get("aec") is False
+                                or sound.get("sound") == "clear" and sound.get("out") == "speaker")
+            self.call_out = f"the phone's {sound.get('out', 'speaker')}, {sound.get('sound', '?')} sound" if sound else ""
+        return self.sound_leaks
+
+    def output_now(self) -> str:
+        """Where our voice is playing, for the log of every talk-over decision."""
+        if self.calling:
+            return self.call_out or "the phone"
+        return "the laptop's speakers" if self.output.on_speakers() else "headphones"
+
     def wary(self) -> bool:
         """A young canceller, or one that just let our echo through: it slips more."""
         return time.monotonic() - self.canceller_since < WARMUP or time.monotonic() < self.wary_until
@@ -251,8 +287,9 @@ class Listener:
             history.append(db)
         how = self.last_check if speech else "a voice, quieter"
         playing = self.talkover.clip()
+        self.talkover.out = self.output_now()
         verdict = self.talkover.feed(frame, speech or self.gate.still_speaking(), list(self.preroll), how,
-                                     playing.text if playing else "")
+                                     playing.text if playing else "", playing.clip if playing else "")
         if verdict is Verdict.ECHO:
             self.echo_slipped("talking over was the clip's own words")
             return False
@@ -262,13 +299,19 @@ class Listener:
         return True
 
     def talking(self, frame: np.ndarray, db: float, floor: float, playing: bool) -> bool:
-        """Is the user speaking now (and, over a clip, not just our own echo)? voicegate.py decides."""
-        wary = playing and self.wary()
-        played = self.playback.loudest() if playing else None
+        """Is the user speaking now (and, over a clip, not just our own echo)? voicegate.py decides.
+
+        On a call neither the laptop canceller's strictness nor the loudness check against our playback applies:
+        the phone's mic level and the clip's level on the laptop are unrelated (a quiet phone mic, -30 dB against
+        -17 dB of playback, failed the 15 dB margin, and the user couldn't cut in on calls, 2026-11-21); the
+        phone's own echo cancelling keeps our voice out, and the word check still catches echo that gets in."""
+        calling = self.calling
+        wary = playing and not calling and self.wary()
+        played = self.playback.loudest() if playing and not calling else None
         settled = not playing or time.monotonic() - self.play_started > BARGE_GRACE
         speech = self.gate.talking(frame, db, floor, playing, played, settled, wary)
         margin = self.gate.margin
-        if not playing or margin is None or self.gate.checked:  # no check over a clip ran on this frame
+        if not playing or calling or margin is None or self.gate.checked:  # no check over a clip ran on this frame
             return speech
         near_miss = not speech and not in_call() and self.echo_watch.near_miss(margin)
         self.restart_due |= near_miss

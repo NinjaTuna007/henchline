@@ -45,7 +45,7 @@ from voice import chains, commands, cursor_cli, files, minions, pickup, plans, r
 from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
 from voice.desktop import current as desktop, cursor_bridge, tmux  # noqa: E402
 from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CALL_SILENT, CALL_STAY_ON, CALL_HANGUP, CALL_MIRROR, CALL_ORIGIN,  # noqa: E402
-                         CALL_PINNED, CALL_RANG_BACK, CALL_TOLD, PHASE,
+                         CALL_PINNED, CALL_RANG_BACK, CALL_SOUND, CALL_TOLD, PHASE,
                          SPAWNED, TEXTS, VOICE_NOTE_STALE, VOICE_NOTES,
                          CALL_PORT, CALL_PUSH, CALL_INTERRUPT, CALL_CUT_IN, CALL_CHECK, CLAUDE_MODE,
                          CALL_RING, CALL_RINGER, CALL_TLS, HANDSFREE_LOG, HANDSFREE_MODE,
@@ -177,6 +177,11 @@ class Ear:
         self.silent = 0  # … of which the phone played (almost) nothing
         self.clip = ""  # the clip playing at the last report
         self.said = ""  # the last trouble logged: said once, not every 2 s
+        self.flushed_at = 0.0  # the phone was told to drop its queued talkback (the user cut in)
+
+    def flushed(self) -> None:
+        """The phone dropped what it had queued: its next report's quiet is that, not sound lost."""
+        self.flushed_at = time.monotonic()
 
     def report(self, stats: dict) -> None:
         self.loud_ms += stats.get("loud_ms", 0)
@@ -185,6 +190,11 @@ class Ear:
         # Judged only once the same clip was playing a report ago: its first seconds are still being
         # rendered, silent on the laptop too (every "silent" span of the first test call, 2026-11-15)
         if not playing or playing.clip != clip:
+            return
+        # Its first sentence still being made (no audio yet, or only just): silent on the laptop too, not lost
+        if not playing.sounding or time.time() - playing.sounding < 2:
+            return
+        if time.monotonic() - self.flushed_at < FLUSH_GRACE:  # a cut clip's queue dropped on purpose
             return
         self.while_speaking += 1
         trouble = []
@@ -207,6 +217,7 @@ class Ear:
                 f"{self.while_speaking} 2-s spans while talkback played")
 
 
+FLUSH_GRACE = 4.0  # seconds after a flush in which the phone's reports of quiet are the flush itself
 MIC_SILENT_AFTER = 4.0  # seconds of exact zeros from the phone's mic before the user is told
 MIC_SILENT_WORDS = "I can't hear you, your mic is silent."
 
@@ -359,7 +370,12 @@ async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None) ->
     elif "ring_endpoint" in message:  # where `handsfree ring` reaches the app: kept private, never logged
         keep_ring_endpoint(str(message["ring_endpoint"]))
     elif "sound" in message:  # the app's sound mode: turns after this line ran in it, for comparing them
-        log(HANDSFREE_LOG, f"call: phone sound {message['sound']}")
+        out = f", {message['out']}" if message.get("out") else ""
+        aec = {True: ", echo canceller on", False: ", no echo canceller"}.get(message.get("aec"), "")
+        log(HANDSFREE_LOG, f"call: phone sound {message['sound']}{out}{aec}")
+        # For hands-free: on the loudspeaker in clear sound, or without the phone's canceller, our voice can reach
+        # the phone's mic, so talking over is judged as carefully as on the laptop
+        write_json(CALL_SOUND, {k: message[k] for k in ("sound", "out", "aec") if k in message})
     elif "stats" in message:
         ear.report(message["stats"])
     elif "cut_in" in message:  # the call menu: cut in, let it wait, or follow the agent (Cursor cuts in)
@@ -2372,7 +2388,16 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             asked = 0.0  # when a hang-up was asked for
             owed: set[str] = set()  # the clips queued or playing then: only those are waited for
             quiet_since = 0.0  # when those were last all said
+            hearing = False  # hands-free recording the user: a clip cut by their voice
             while not ws.closed:
+                # The user started talking (over a clip, or not): the phone drops the talkback it still has queued, up
+                # to a second and a fifth, so a cut clip stops there too (2026-11-21: it talked on after being cut)
+                phase, by = phase_now()
+                now_hearing = by == BY_HANDSFREE and phase is Phase.RECORDING
+                if now_hearing and not hearing:
+                    await ws.send_json({"flush": True})
+                    ear.flushed()
+                hearing = now_hearing
                 if CALL_HANGUP.exists():  # the user said "hang up", or an agent ran `handsfree hangup`
                     if not asked:
                         asked = time.monotonic()
@@ -2484,11 +2509,11 @@ async def call(request: web.Request) -> web.WebSocketResponse:
         sender = asyncio.create_task(to_phone())
         watchers = [asyncio.create_task(watch_proc("mic", mic)), asyncio.create_task(watch_proc("speaker", speaker))]
         liner = asyncio.create_task(watch_line())
+        ear = Ear()  # before show_status starts: it tells the Ear of each flush
         shower = asyncio.create_task(show_status())
         unmuter = asyncio.create_task(keep_unmuted())
         nudger = asyncio.create_task(nudge())
         heard = 0  # bytes of the phone's mic, for the log
-        ear = Ear()
         silent = SilentMic()
         try:
             async for msg in ws:
@@ -2510,6 +2535,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             CALL_BUTTON_ONLY.unlink(missing_ok=True)  # the next call starts with an open line again
             CALL_STAY_ON.unlink(missing_ok=True)  # and is asked after when it goes quiet
             CALL_SILENT.unlink(missing_ok=True)
+            CALL_SOUND.unlink(missing_ok=True)
             liner.cancel()
             CALL_HANGUP.unlink(missing_ok=True)  # the phone went first: the hang-up is moot
             sender.cancel()

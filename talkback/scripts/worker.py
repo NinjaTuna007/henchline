@@ -115,7 +115,8 @@ class Voice:
             Speaker(clip.session, clip.agent, clip.where, clip.tab).remember()
         # Once, with the words, before the clip file goes: no moment when neither says a clip is under way.
         # Hands-free checks what it hears over a clip against the words (its own echo)
-        Playing(path.name, clip.session, clip.agent, " ".join(sentences)).save()
+        marker = Playing(path.name, clip.session, clip.agent, " ".join(sentences))
+        marker.save()
         path.unlink(missing_ok=True)
         voice = clip.voice or (VOICES[clip.agent] if clip.agent in SYSTEM else chosen_voice(clip.agent))
         ready: queue.Queue = queue.Queue(maxsize=2)
@@ -143,6 +144,10 @@ class Voice:
             while (samples := ready.get()) is not None:
                 if spoken == 0:
                     log(TALKBACK_LOG, f"{clip.agent} first_audio={time.time() - clip.queued:.2f}s")
+                    # The clip is audible from now: until then the call's report of silence on the phone was the
+                    # first sentence still being made, not sound lost (2026-11-21, 4-20 s first audio under load)
+                    marker.sounding = time.time()
+                    marker.save()
                 else:
                     samples = np.concatenate([np.zeros(int(RATE * PAUSE), "<f4"), samples])
                 data = samples.astype("<f4")

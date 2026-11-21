@@ -35,6 +35,7 @@ HOLDS = STATE / "talkback.holds"  # one file per session whose clips wait
 LOCK = STATE / "talkback.lock"  # the one worker holds it
 WORKER_PID = STATE / "talkback.pid"
 PLAYING = STATE / "talkback.playing"
+SOUNDING = STATE / "talkback.sounding"  # {"clip", "at"}: kept apart so older readers of PLAYING never see a new key
 LAST = STATE / "talkback.last"  # the agent a hands-free reply goes to
 SPEAKERS = STATE / "talkback.speakers"  # every agent heard lately, one file each
 RENAMED = STATE / "talkback.renamed.json"  # {old key: new key}: an agent found running, then heard under its own
@@ -62,6 +63,7 @@ CALL_CHECK = STATE / "call.check"  # the next call starts on check-on-me (a wake
 AWAY = STATE / "away"
 VOICE_CHOICE = STATE / "voices.json"  # how the agents sound: each its own, one voice, or a surprise pick
 CLAUDE_MODE = STATE / "claude-mode"  # a plan-chip press, until Claude's own log catches up
+CALL_SOUND = STATE / "call.sound"  # the phone's sound on a call: {"sound": clear/call, "out": speaker/..., "aec": bool}
 CALL_SILENT = STATE / "call.no-audio"  # the phone's mic stopped arriving mid-call (a dropped line): talkback waits
 CALL_RING = STATE / "call.ring-endpoint"  # where Henchline can be rung (its UnifiedPush address): private, never logged
 CALL_RINGER = STATE / "call.ringer"  # who rang the user last (session, when): the call server routes the answer there
@@ -403,14 +405,27 @@ class Playing:
     session: str
     agent: str
     text: str
+    sounding: float = 0.0  # when its first audio went out (0 while the first sentence is still being made)
 
     @classmethod
     def now(cls) -> Playing | None:
         data = read_json(PLAYING)
-        return cls(**data) if data.keys() >= {"clip", "session", "agent", "text"} else None
+        if not data.keys() >= {"clip", "session", "agent", "text"}:
+            return None
+        playing = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        sounding = read_json(SOUNDING)
+        if sounding.get("clip") == playing.clip and isinstance(sounding.get("at"), (int, float)):
+            playing.sounding = float(sounding["at"])
+        return playing
 
     def save(self) -> None:
-        write_json(PLAYING, asdict(self))
+        """PLAYING keeps its original four fields (a process started before `sounding` reads it with cls(**data));
+        the first-audio time goes in SOUNDING."""
+        data = asdict(self)
+        sounding = data.pop("sounding")
+        write_json(PLAYING, data)
+        if sounding:
+            write_json(SOUNDING, {"clip": self.clip, "at": sounding})
 
 
 def last_speaker() -> Speaker | None:

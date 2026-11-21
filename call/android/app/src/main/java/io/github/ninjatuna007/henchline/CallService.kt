@@ -105,6 +105,7 @@ class CallService : Service() {
     private fun reroute() {
         Thread { synchronized(audioLock) { if (running && !clear) route() } }.start()
         aimTrack()
+        socket?.send(soundNote())  // the laptop's talk-over is careful on the loudspeaker: a speaker tap must reach it
     }
 
     @Volatile private var playing: AudioTrack? = null  // the sound playing now, to aim at a device
@@ -464,7 +465,7 @@ class CallService : Service() {
                 if (lostAt > 0) {  // back: the audio never stopped, the laptop kept the agent
                     lostAt = 0
                     android.util.Log.i("Henchline", "call: reconnected")
-                    webSocket.send(org.json.JSONObject().put("sound", if (clear) "clear" else "call").toString())
+                    webSocket.send(soundNote())
                     if (talking) webSocket.send(org.json.JSONObject().put("push", true).toString())  // the laptop forgot
                     Bus.listener?.invoke("""{"reconnecting": false}""")
                     return
@@ -486,6 +487,10 @@ class CallService : Service() {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (me != link) return
                 val message = try { org.json.JSONObject(text) } catch (_: Exception) { null }
+                if (message?.optBoolean("flush") == true) {  // the user started talking: drop the talkback still queued
+                    flushSpeaker()
+                    return
+                }
                 if (message?.has("agents") == true) Bus.lastAgents = text
                 else if (message?.has("mode") == true) Bus.lastMode = text
                 // Kept here, by the call, whether or not the screen is showing: lines that came while another app
@@ -543,7 +548,7 @@ class CallService : Service() {
     private fun startAudio() = synchronized(audioLock) {
         val round = generation.get()
         // The server logs each sound, so turns can be compared by it (transcription, turn taking)
-        socket?.send(org.json.JSONObject().put("sound", if (clear) "clear" else "call").toString())
+        socket?.send(soundNote())
         recorder = Thread {
             try {
                 val size = maxOf(AudioRecord.getMinBufferSize(MIC_RATE, AudioFormat.CHANNEL_IN_MONO,
@@ -560,6 +565,8 @@ class CallService : Service() {
                     if (AcousticEchoCanceler.isAvailable()) AcousticEchoCanceler.create(mic.audioSessionId) else null,
                     if (NoiseSuppressor.isAvailable()) NoiseSuppressor.create(mic.audioSessionId) else null,
                 ).onEach { it.enabled = true } else emptyList()
+                echoCanceller = if (clear) effects.any { it is AcousticEchoCanceler } else null
+                socket?.send(soundNote())  // where it plays now (a restart or a sound switch may have moved it)
                 if (clear) Bus.listener?.invoke(org.json.JSONObject().put("note",
                     "Clear voice: phone echo canceller ${if (effects.any { it is AcousticEchoCanceler }) "on" else "not available"}").toString())
                 try {
@@ -635,6 +642,30 @@ class CallService : Service() {
                 fail("The speaker failed: ${e.message}")
             }
         }.apply { name = "speaker"; start() }
+    }
+
+    @Volatile private var echoCanceller: Boolean? = null  // the phone's canceller on the mic: null in call mode (built in)
+
+    /** The sound mode, where it plays, and whether the phone's echo canceller is on, for the laptop: on the loudspeaker
+     *  in clear sound, or without a canceller, our voice can reach this mic and talking over is judged with care. */
+    private fun soundNote(): String = org.json.JSONObject().put("sound", if (clear) "clear" else "call").put("out", where)
+        .apply { echoCanceller?.let { put("aec", it) } }.toString()
+
+    /** The laptop heard the user start talking: what is still queued to play (up to a second, plus the speaker's
+     *  own fifth of a second) is dropped, so a clip they cut stops at once here too (2026-11-21). */
+    private fun flushSpeaker() {
+        val dropped = heard.size
+        heard.clear()
+        playing?.let { track ->
+            try {
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    track.pause()
+                    track.flush()
+                    track.play()
+                }
+            } catch (_: IllegalStateException) {}  // released by a sound switch just now: nothing left to drop
+        }
+        if (dropped > 0) android.util.Log.i("Henchline", "call: the user is talking, dropped $dropped queued chunks")
     }
 
     // What the phone played, told to the laptop every 2 s as the call page does: the laptop can't hear the phone,
