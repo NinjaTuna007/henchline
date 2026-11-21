@@ -16,8 +16,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+import routing
 from routing import Heard
-from sensing import (FRAME, PER_SECOND, RATE, EarbudButton, EchoWatch, Output, Playback, Wake, level,
+from sensing import (FRAME, PER_SECOND, RATE, EarbudButton, EchoWatch, Load, Output, Playback, Wake, Xruns, level,
                      mic_stream, read_frame, start_canceller)
 from talkover import CALL_SUSTAIN, CAREFUL_NEW_WORDS, NEW_WORDS, SUSTAIN, TalkOver, Verdict
 from turn import Mode, Turn
@@ -36,6 +37,8 @@ WARY = 60.0  # after our own echo slipped through, how long talking over stays s
 FLOOR_SPAN = 10 * PER_SECOND  # frames of history a floor is taken from
 FLOOR_MIN = 30  # frames of history before a floor is trusted; until then the frame itself is the floor
 PREROLL = 15  # frames kept from before speech started
+XRUN_REST = 30.0  # seconds a canceller is given before an xrun restarts it; doubles while xruns keep coming
+XRUN_REST_MAX = 5 * 60.0
 
 
 @dataclass
@@ -86,6 +89,9 @@ class Listener:
         self.wake = Wake.available()
         self.button, self.playback, self.output = EarbudButton(stop), Playback(stop), Output()
         self.echo_watch, self.restart_due = EchoWatch(restarted=canceller_since), False
+        self.xruns, self.load = Xruns(stop), Load()
+        self.xrun_due, self.xrun_rest, self.last_xrun = False, XRUN_REST, 0.0
+        self.busy_told = False  # this busy spell's spoken notice, said once
         self.wary_until, self.play_started = 0.0, 0.0
         self.calling = False  # on a phone call (set each frame)
         self.sound_read, self.sound_leaks, self.call_out = 0.0, False, ""  # the phone's sound, from CALL_SOUND
@@ -100,6 +106,7 @@ class Listener:
     def run(self) -> None:
         self.button.start()
         self.playback.start()
+        self.xruns.start()
         try:
             self.listen()
         except Exception:
@@ -131,10 +138,11 @@ class Listener:
                         self.turn([], Heard.WOKE, floor_of(self.room, level(frame)))
                         was_busy = talkback_busy()
                         continue
+                self.watch_xruns()
                 if self.step(samples, frame):
                     was_busy = talkback_busy()
-                elif self.restart_due and not busy and not ptt_busy():  # between clips; a reply window may be open
-                    self.restart_canceller()
+                elif (self.restart_due or self.xrun_ready()) and not busy and not ptt_busy():
+                    self.restart_canceller()  # between clips; a reply window may be open
                 elif not busy and not self.window.is_open():
                     self.transcriber.settle()  # back to the GPU once a training run lets go
         finally:
@@ -182,10 +190,34 @@ class Listener:
         self.wary_until = now + WARY
         log(HANDSFREE_LOG, f"{why}: stricter about talking over for {WARY:.0f}s")
 
+    def watch_xruns(self) -> None:
+        """New xruns on the canceller's path ask for a fresh canceller at the next quiet moment (not on a call: the
+        phone's mic doesn't go through it)."""
+        grew = self.xruns.take()
+        if not grew or self.calling:
+            return
+        now = time.monotonic()
+        if now - self.last_xrun > XRUN_REST_MAX:  # the first xrun after a quiet spell: the short rest again
+            self.xrun_rest = XRUN_REST
+        self.last_xrun, self.xrun_due = now, True
+        log(HANDSFREE_LOG, "canceller xrun: " + ", ".join(f"{node} +{n}" for node, n in grew.items())
+            + ", restart when quiet")
+
+    def xrun_ready(self) -> bool:
+        """An xrun asked for a restart and may have it now: the canceller had XRUN_REST since its last start (not the
+        drift watch's five minutes: an xrun broke a canceller for good in one step), and the laptop isn't so busy that
+        a fresh one would break again at once."""
+        return (self.xrun_due and time.monotonic() - self.echo_watch.restarted >= self.xrun_rest
+                and not self.load.high())
+
     def restart_canceller(self) -> None:
         """A fresh canceller, between clips (about a second; a reply starting then loses its first words)."""
-        log(HANDSFREE_LOG, "restarting the echo canceller before it drifts further")
-        self.restart_due = False
+        if self.xrun_due:  # each xrun restart makes the next wait longer, up to five minutes, until xruns stop
+            self.xrun_rest = min(XRUN_REST_MAX, self.xrun_rest * 2)
+        log(HANDSFREE_LOG, "restarting the echo canceller " + ("after an xrun" if self.xrun_due
+                                                                else "before it drifts further"))
+        self.restart_due = self.xrun_due = False
+        self.xruns.settle()
         self.stream.terminate()
         self.canceller_since = start_canceller(restart=True)
         self.echo_watch.restarted = time.monotonic()
@@ -219,8 +251,13 @@ class Listener:
         careful = not calling or self.call_sound_leaks()
         self.talkover.sustain = SUSTAIN if careful else CALL_SUSTAIN
         self.talkover.new_words_needed = CAREFUL_NEW_WORDS if calling and careful else NEW_WORDS
+        busy_laptop = not calling and self.load.high()  # echo not judged: a restart can't help while it lasts
+        self.tell_busy(playing, busy_laptop, calling)
         if self.play_started and not playing and not calling:
-            self.restart_due |= self.echo_watch.clip_over()
+            if busy_laptop:
+                self.echo_watch.discard()
+            else:
+                self.restart_due |= self.echo_watch.clip_over()
         self.play_started = (self.play_started or time.monotonic()) if playing else 0.0
         button_only = calling and CALL_BUTTON_ONLY.exists()  # a noisy place: noise must not talk over us
         open_ = ((playing or calling or self.window.is_open()) and not button_only
@@ -243,11 +280,12 @@ class Listener:
         turn_floor = max(floor, floor_of(self.room, floor))
         self.preroll.append(frame)
         self.gate.add(frame, db)
-        if playing and not calling and time.monotonic() - self.play_started > BARGE_GRACE:
+        if playing and not calling and not busy_laptop and time.monotonic() - self.play_started > BARGE_GRACE:
             self.echo_watch.add(max(self.gate.levels), self.playback.loudest())
         unknown = self.output.on_speakers() and self.playback.loudest() is None
-        if playing and (self.talkover.notice_playing() or unknown):
-            history.append(db)  # our own notice, or playback level unknown: only the wake word talks over it
+        # Our own notice, playback level unknown, or the laptop too busy for the canceller: only the wake word
+        if playing and (self.talkover.notice_playing() or unknown or busy_laptop):
+            history.append(db)
             return self.woke(samples, turn_floor)
         speech = self.talking(frame, db, floor, playing)
         if playing or self.talkover.over:
@@ -258,6 +296,15 @@ class Listener:
         self.turn(list(self.preroll), self.window.kind if self.window.is_open() or not calling else Heard.CALL,
                   turn_floor)
         return True
+
+    def tell_busy(self, playing: bool, busy_laptop: bool, calling: bool) -> None:
+        """Once a busy spell, over a clip and never on a call: why talking over it doesn't work now (said after the
+        clip it began in)."""
+        if playing and busy_laptop and not self.busy_told:
+            self.busy_told = True
+            routing.say("The laptop's busy, so say the wake word to interrupt me.")
+        elif not busy_laptop and not calling:
+            self.busy_told = False
 
     def call_sound_leaks(self) -> bool:
         """On a call: can our voice reach the phone's mic? Its loudspeaker in clear sound, or no canceller on its mic.

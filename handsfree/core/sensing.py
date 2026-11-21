@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import collections
 import difflib
+import os
 import pickle
 import re
 import select
@@ -16,8 +17,8 @@ import time
 import numpy as np
 from faster_whisper.vad import VadOptions
 
-from voice.state import (EC_SOURCE, EC_UNIT, HANDSFREE_LOG, JARVIS_MODEL, JARVIS_PERSONAL, WAKE_MODEL, log,
-                         speaker_monitor)
+from voice.state import (EC_SOURCE, EC_UNIT, HANDSFREE_LOG, JARVIS_MODEL, JARVIS_PERSONAL, WAKE_MODEL, canceller_mic,
+                         log, speaker_monitor)
 
 RATE = 16000
 FRAME = 480  # 30 ms at 16 kHz
@@ -128,6 +129,123 @@ class EchoWatch:
         log(HANDSFREE_LOG, f"clip echo: {abs(closest):.0f} dB {side} the playback at the closest"
                            f"{', canceller drifting: restart when quiet' if drifting else ''}")
         return drifting
+
+
+EC_NODES = ("talkback_ec_capture", EC_SOURCE, "echo-cancel-sink")  # the canceller's own nodes
+PW_TOP_ROW = re.compile(r"^\S+\s+(\d+)\s+(?:\S+\s+){6}(\d+)\s.*?(\S+)\s*$")
+
+
+def pw_errors(text: str) -> dict[tuple[int, str], int]:
+    """Each node's error (xrun) count, by (id, name), from `pw-top -b -n 2`: its last block, the first has no counts."""
+    blocks = re.split(r"^S\s+ID\s.*$", text, flags=re.M)
+    counts = {}
+    for line in blocks[-1].splitlines() if len(blocks) > 1 else []:
+        found = PW_TOP_ROW.match(line)
+        if found:
+            counts[(int(found.group(1)), found.group(3))] = int(found.group(2))
+    return counts
+
+
+class Xruns(threading.Thread):
+    """New xruns on the canceller's nodes, the mic it cancels and the speakers, polled every few seconds.
+
+    A long test (2026-11-21, 29 min of stereo "video" plus our voice) broke the canceller in one step at an xrun:
+    our echo went from about 55 to 21 dB under the playback, Whisper heard our words, and it never recovered by
+    itself; load had not changed. A fresh canceller is the cure, so an xrun asks for one at the next quiet moment.
+    A node seen for the first time (a canceller just restarted gets new nodes) only sets the count to compare with.
+    """
+
+    EVERY = 5.0  # seconds between polls (pw-top -b -n 2 takes about 20 ms)
+    SETTLE = 6.0  # seconds after a canceller restart in which counts are taken, not reported
+
+    def __init__(self, stop: threading.Event, poll=None, watched=None, on_speakers=None) -> None:
+        super().__init__(daemon=True)
+        self.stop = stop
+        self.seen: dict[tuple[int, str], int] = {}
+        self.new: collections.Counter = collections.Counter()
+        self.lock = threading.Lock()
+        self.quiet_until = 0.0
+        self.poll_text = poll or (lambda: subprocess.run(["pw-top", "-b", "-n", "2"], capture_output=True, text=True,
+                                                         timeout=5).stdout)
+        self.watched = watched or self.nodes
+        self.on_speakers = on_speakers or Output().on_speakers  # its own: this thread isn't the listener's
+
+    def nodes(self) -> set[str]:
+        """The canceller's nodes and its mic; the default output too, when it is the laptop speakers (headphones'
+        xruns say nothing about our echo)."""
+        sink = ""
+        if self.on_speakers():
+            sink = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True,
+                                  timeout=3).stdout.strip()
+        return {*EC_NODES, canceller_mic(), sink} - {""}
+
+    def settle(self) -> None:
+        """The canceller is being restarted: counts from the next few seconds are a new start, not news."""
+        self.quiet_until = time.monotonic() + self.SETTLE
+        with self.lock:
+            self.new.clear()
+
+    def poll(self) -> None:
+        try:
+            counts, watched = pw_errors(self.poll_text()), self.watched()
+        except (OSError, subprocess.SubprocessError):
+            return
+        quiet = time.monotonic() < self.quiet_until
+        grew = collections.Counter()
+        for key, count in counts.items():
+            if key[1] not in watched:
+                continue
+            before = self.seen.get(key)
+            if before is not None and count > before and not quiet:
+                grew[key[1]] += count - before
+            self.seen[key] = count
+        self.seen = {key: count for key, count in self.seen.items() if key in counts}  # gone nodes forgotten
+        if grew:
+            with self.lock:
+                self.new.update(grew)
+
+    def take(self) -> dict[str, int]:
+        """New xruns by node since the last take (cheap: called every frame)."""
+        if not self.new:
+            return {}
+        with self.lock:
+            grew, self.new = dict(self.new), collections.Counter()
+        return grew
+
+    def run(self) -> None:
+        while not self.stop.wait(self.EVERY):
+            self.poll()
+
+
+class Load:
+    """Is the laptop too busy for the canceller: 1-minute load over LIMIT, read at most once a second.
+
+    At load 20-32 (22 cores) the canceller let whole sentences of ours through, with dozens of xruns (2026-11-21);
+    a restart can't help while it lasts, so echo is not judged: only the wake word or the earbud button stops a clip.
+    """
+
+    SHARE = 0.55  # of the cores: about 12 on this 22-core laptop
+
+    def __init__(self, cores: int | None = None, loadavg=os.getloadavg) -> None:
+        self.limit = self.SHARE * (cores or os.cpu_count() or 4)
+        self.loadavg = loadavg
+        self.at, self.busy, self.last = 0.0, False, 0.0
+
+    def high(self) -> bool:
+        now = time.monotonic()
+        if now - self.at >= 1:
+            self.at = now
+            try:
+                self.last = self.loadavg()[0]
+            except OSError:
+                return self.busy
+            busy = self.last > self.limit
+            if busy != self.busy:
+                self.busy = busy
+                log(HANDSFREE_LOG, f"laptop busy (load {self.last:.1f} over {self.limit:.0f}): echo not judged, "
+                                   "only the wake word or the button stops a clip" if busy else
+                                   f"load back to {self.last:.1f}: talking over clips judged again")
+        return self.busy
 
 
 class Output:

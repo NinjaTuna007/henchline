@@ -30,6 +30,14 @@ from voice.state import (AWAY, BY_HANDSFREE, CALL_SILENT, KOKORO_MODELS, LOCK, P
 THREADS = int(os.environ.get("TALKBACK_THREADS", "4"))  # CPU threads: 4 measured best (latency vs load)
 RATE = 24000
 PAUSE = 0.25  # seconds between sentences
+JOIN = 0.05  # seconds between the first piece of a split sentence and its rest
+# The first sentence is said in two pieces when long, so speech starts once a short piece is made: a whole sentence
+# took 2.3-2.9 s to render under load, its first 8 words about 1 s (2026-11-21). Long enough that the rest is made
+# while the first piece plays; a one-word piece ("Done:") would leave a gap after it
+FIRST_WORDS = 8  # words in the first piece when no comma or colon comes sooner
+FIRST_MIN, FIRST_MAX = 4, 10  # a comma, semicolon, colon or dash ending one of these words splits there instead
+SPLIT_FROM = 11  # sentences shorter than this (in words) are said whole
+INTROS = 16  # rendered "<Agent> here, from <where>." kept, by text and voice
 PIECE = 0.1  # seconds of audio written between checks of the mic
 VOICES = {**AGENT_VOICES, BY_HANDSFREE: "bm_george"}  # system notices: the user's "Jarvis" voice, not an agent's
 HANDSFREE = Path(__file__).resolve().parents[2] / "handsfree/handsfree.py"
@@ -39,12 +47,40 @@ PLAYER = ["pacat", "--playback", "--raw", "--format=float32le", f"--rate={RATE}"
           "--latency-msec=100", "--client-name=talkback", "--stream-name=talkback"]
 
 
+def first_piece(sentence: str) -> tuple[str, str]:
+    """A long first sentence in two: (head, rest); rest is "" when it is said whole."""
+    words = sentence.split()
+    if len(words) < SPLIT_FROM:
+        return sentence, ""
+    cut = next((i + 1 for i in range(FIRST_MIN - 1, min(FIRST_MAX, len(words) - 3))
+                if words[i][-1] in ",;:—"), FIRST_WORDS)
+    return " ".join(words[:cut]), " ".join(words[cut:])
+
+
+def fast_cores(root: Path = Path("/sys/devices/system/cpu")) -> set[int] | None:
+    """The fastest cores (within 10% of the top clock); None when all are alike or the clocks can't be read.
+
+    ONNX waits for its slowest thread: a render with one thread on an efficiency core was 2.2x slower (2026-11-21)."""
+    clocks = {}
+    for cpu in root.glob("cpu[0-9]*"):
+        try:
+            clocks[int(cpu.name[3:])] = int((cpu / "cpufreq/cpuinfo_max_freq").read_text())
+        except (OSError, ValueError):
+            return None
+    if not clocks:
+        return None
+    fast = {cpu for cpu, clock in clocks.items() if clock >= 0.9 * max(clocks.values())}
+    return fast if len(fast) >= THREADS and len(fast) < len(clocks) else None
+
+
 class Voice:
     """Kokoro, loaded on first use; SIGUSR1 skips the clip being played."""
 
     def __init__(self) -> None:
         self._kokoro = None
         self.skip = False
+        self.intros: dict[tuple[str, str], object] = {}  # an agent's intro, said again and again: rendered once
+        self.intros_lock = threading.Lock()  # two clips' render threads can overlap
         signal.signal(signal.SIGUSR1, self.on_skip)
 
     def on_skip(self, *_) -> None:
@@ -59,19 +95,33 @@ class Voice:
             opts = rt.SessionOptions()
             opts.intra_op_num_threads = THREADS
             opts.inter_op_num_threads = 1
+            # Threads sleep between runs instead of spinning: about 20% less CPU, first audio no slower (measured
+            # 2026-11-21, 4 threads, on the fast cores and off them)
+            opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
             session = rt.InferenceSession(str(KOKORO_MODELS / "kokoro-v1.0.onnx"), opts,
                                           providers=["CPUExecutionProvider"])
             self._kokoro = Kokoro.from_session(session, str(KOKORO_MODELS / "voices-v1.0.bin"))
         return self._kokoro
 
-    def render(self, sentence: str, voice: str):
-        """Audio for one sentence; empty for a bare tag Kokoro cannot say."""
+    def render(self, sentence: str, voice: str, keep: bool = False):
+        """Audio for one sentence; empty for a bare tag Kokoro cannot say. keep: an intro, rendered once."""
         import numpy as np
 
         plain = TAGS.sub("", sentence).strip()  # Kokoro would read [laugh] aloud
         if not plain:
             return np.zeros(0, dtype="<f4")
-        return self.kokoro.create(plain, voice=voice, lang="en-us")[0]
+        if keep:
+            with self.intros_lock:
+                kept = self.intros.get((plain, voice))
+            if kept is not None:
+                return kept
+        samples = self.kokoro.create(plain, voice=voice, lang="en-us")[0]
+        if keep:
+            with self.intros_lock:
+                if len(self.intros) >= INTROS and (plain, voice) not in self.intros:
+                    self.intros.pop(next(iter(self.intros)))
+                self.intros[(plain, voice)] = samples
+        return samples
 
     def play(self, path: Path) -> None:
         """Speak one clip; put back what is left if the user cuts in."""
@@ -105,13 +155,19 @@ class Voice:
             path.unlink(missing_ok=True)
             log(TALKBACK_LOG, f"{clip.agent} clip for the call, which ended: texted to the phone instead")
             return
-        sentences = clip.sentences
+        began = time.time()
+        sentences = list(clip.sentences)
+        head, rest = first_piece(sentences[0]) if sentences else ("", "")
+        if rest:
+            sentences[0:1] = [head, rest]
+        joined = {1} if rest else set()  # pieces said straight after the one before, as one sentence
         intro = 0
         if clip.agent not in SYSTEM:
             last = last_speaker()
             if not last or last.session != clip.session:
                 name = clip.agent.capitalize()
                 sentences, intro = [f"{name} here, from {clip.where}."] + sentences, 1
+                joined = {n + 1 for n in joined}
             Speaker(clip.session, clip.agent, clip.where, clip.tab).remember()
         # Once, with the words, before the clip file goes: no moment when neither says a clip is under way.
         # Hands-free checks what it hears over a clip against the words (its own echo)
@@ -124,8 +180,8 @@ class Voice:
 
         def make() -> None:
             try:
-                for sentence in sentences:
-                    samples = self.render(sentence, voice)
+                for n, sentence in enumerate(sentences):
+                    samples = self.render(sentence, voice, keep=n < intro)
                     while not done.is_set():
                         try:
                             ready.put(samples, timeout=0.2)
@@ -143,13 +199,18 @@ class Voice:
         try:
             while (samples := ready.get()) is not None:
                 if spoken == 0:
-                    log(TALKBACK_LOG, f"{clip.agent} first_audio={time.time() - clip.queued:.2f}s")
+                    # Waiting (behind another clip, or put back after a cut) apart from making the first piece:
+                    # from the queue alone, a clip behind another looked like a 20 s render (2026-11-21)
+                    now = time.time()
+                    log(TALKBACK_LOG, f"{clip.agent} first_audio={now - began:.2f}s "
+                                      f"(waited {max(0.0, began - clip.queued):.2f}s before)")
                     # The clip is audible from now: until then the call's report of silence on the phone was the
                     # first sentence still being made, not sound lost (2026-11-21, 4-20 s first audio under load)
                     marker.sounding = time.time()
                     marker.save()
                 else:
-                    samples = np.concatenate([np.zeros(int(RATE * PAUSE), "<f4"), samples])
+                    gap = JOIN if spoken in joined else PAUSE
+                    samples = np.concatenate([np.zeros(int(RATE * gap), "<f4"), samples])
                 data = samples.astype("<f4")
                 for n, start in enumerate(range(0, len(data), piece)):
                     # The call started or ended mid-clip: the rest is said where the user is now (or texted), not
@@ -226,6 +287,12 @@ def work() -> int:
     if fd is None:
         return 0  # another worker holds the lock and will see our text
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    cores = fast_cores()
+    if cores:  # before Kokoro loads: its threads are made on the cores allowed now
+        try:
+            os.sched_setaffinity(0, cores)
+        except OSError:
+            pass
     WORKER_PID.write_text(str(os.getpid()))
     t0, voice, since = time.monotonic(), None, None
     while fd is not None:
