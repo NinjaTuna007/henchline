@@ -847,7 +847,7 @@ class MainActivity : Activity() {
         })
         val name = names[current] ?: prefs().getString("current_name", "")?.ifEmpty { null }.takeIf { current.isNotEmpty() }
         who.text = name?.substringBefore(",") ?: "Henchline"
-        avatar.setImageResource(if (name != null) avatarOf(current) else R.drawable.avatar_handsfree)
+        avatar.setImageResource(if (name != null) avatarOf(current, teams[current] ?: "") else R.drawable.avatar_handsfree)
     }
 
     private fun setUpTalkButton() {
@@ -1652,6 +1652,22 @@ class MainActivity : Activity() {
     private fun seenKey(session: String) = "helpers_seen_$session"
 
     /** The chat's helpers as the laptop last told them: the badge, the line back to the boss, and the sheet when open. */
+    /** This chat's hard hat from its job, on every poll (the crew list only refreshes now and then): white while it
+     *  manages a running child, yellow while it is a running child, none once that's over. */
+    private fun wearHat(chain: JSONObject?) {
+        val minions = chain?.optJSONArray("minions")
+        val running = (0 until (minions?.length() ?: 0)).map { minions!!.getJSONObject(it) }.filter { it.optString("state") == "running" }
+        val role = when {
+            chain == null || chain.optBoolean("closed") -> ""  // an ended job: no hats (the laptop's teams() agrees)
+            chain.optBoolean("is_boss") -> if (running.isNotEmpty()) "manager" else ""
+            running.any { it.optString("session") == current } -> "crew"
+            else -> ""
+        }
+        if ((teams[current] ?: "") == role) return
+        teams = if (role.isEmpty()) teams - current else teams + (current to role)
+        if (current.isNotEmpty()) avatar.setImageResource(avatarOf(current, role))
+    }
+
     private fun showHelpers(chain: JSONObject?, helpers: JSONArray?) {
         minionChain = chain
         minionHelpers = helpers
@@ -1663,6 +1679,7 @@ class MainActivity : Activity() {
             if (!prefs().contains(seenKey(current))) prefs().edit().putLong(seenKey(current), newest).apply()
         }
         val seen = prefs().getLong(seenKey(current), 0L)
+        if (chain != null || helpers != null) wearHat(chain)
         // A child waiting for End or Keep: in the boss's list, or this chat itself when it is the delegated one
         val own = if (chain != null && !chain.optBoolean("is_boss")) chain.optJSONArray("minions")?.let { all ->
             (0 until all.length()).map { all.getJSONObject(it) }.firstOrNull { it.optString("session") == current && it.has("end_waiting") }
@@ -2386,7 +2403,7 @@ class MainActivity : Activity() {
             setOnClickListener { open(session) }
             setOnLongClickListener { chatMenu(session, project, agent); true }
         }
-        row.addView(ImageView(this).apply { setImageResource(avatarOf(session)) }, LinearLayout.LayoutParams(dp(52), dp(52)))
+        row.addView(ImageView(this).apply { setImageResource(avatarOf(session, teams[session] ?: "")) }, LinearLayout.LayoutParams(dp(52), dp(52)))
         val words = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, 0, 0) }
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         top.addView(TextView(this).apply {
@@ -3021,12 +3038,15 @@ class MainActivity : Activity() {
         followRenames(answer)
         val found = answer.optJSONArray("agents") ?: return
         names = (0 until found.length()).associate { found.getJSONObject(it).getString("session") to found.getJSONObject(it).getString("name") }
+        teams = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
+            a.optString("team").takeIf { it.isNotEmpty() }?.let { a.getString("session") to it } } }.toMap()
         flows = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
             a.optJSONObject("workflow")?.let { a.getString("session") to it } } }.toMap()
         prefs().edit().putString("crew", found.toString()).apply()
     }
 
     private var flows: Map<String, JSONObject> = emptyMap()  // a workflow running in a chat, by session: its list line
+    private var teams: Map<String, String> = emptyMap()  // a chat's crew role, by session: its hard hat ("manager", "crew")
 
     private fun startedHere(session: String): Boolean = try {
         val crew = org.json.JSONArray(prefs().getString("crew", "[]"))
@@ -4161,6 +4181,21 @@ class MainActivity : Activity() {
             sessionOrName.startsWith("cursor", ignoreCase = true) -> R.drawable.avatar_cursor
             sessionOrName.startsWith("codex", ignoreCase = true) -> R.drawable.avatar_codex
             else -> R.drawable.avatar_handsfree
+        }
+
+        /** The henchman with its crew hard hat (the user's pick, 2026-11-21): white for a manager whose crew is
+         *  still working, yellow for crew; a chat working solo ("" or anything else) wears none. */
+        fun avatarOf(sessionOrName: String, team: String): Int {
+            val claude = sessionOrName.startsWith("claude", ignoreCase = true)
+            val cursor = sessionOrName.startsWith("cursor", ignoreCase = true)
+            val codex = sessionOrName.startsWith("codex", ignoreCase = true)
+            return when (team) {
+                "manager" -> when { claude -> R.drawable.avatar_claude_manager; cursor -> R.drawable.avatar_cursor_manager
+                                    codex -> R.drawable.avatar_codex_manager; else -> R.drawable.avatar_handsfree_manager }
+                "crew" -> when { claude -> R.drawable.avatar_claude_crew; cursor -> R.drawable.avatar_cursor_crew
+                                 codex -> R.drawable.avatar_codex_crew; else -> R.drawable.avatar_handsfree_crew }
+                else -> avatarOf(sessionOrName)
+            }
         }
     }
 }

@@ -46,6 +46,47 @@ def shapes(body, light, glow, eyes):
     return out
 
 
+# Hard hats (the user's pick, A1, 2026-11-21): white for a manager that started others, yellow for its crew,
+# none for a chat working solo. The hat carries the antenna, poking out of the crown; the brim stops above the eyes.
+HATS = {
+    "manager": dict(fill="#F4F7FC", shade="#D5DDEA", hi="#FFFFFF", line="#C9D1E0"),
+    "crew": dict(fill="#FFC629", shade="#E09E0E", hi="#FFE27A", line="#B07A08"),
+}
+HAT_DOME = "M36.5,33.5 C36.5,21 43.5,13 54,13 C64.5,13 71.5,21 71.5,33.5 Z"
+HAT_SHADOW = "M61.5,15 C68,18.5 71.5,25 71.5,33.5 H65.5 C65.5,25.5 64.5,19.5 61.5,15 Z"  # right side in shade
+HAT_RIDGE = "M51,33.5 L51.6,14.6 Q54,12.6 56.4,14.6 L57,33.5 Z"
+HAT_RIBS = "M43.5,33.5 C43.5,24.5 46,18.5 49.8,15.4 M64.5,33.5 C64.5,24.5 62,18.5 58.2,15.4"
+
+
+def hat(role, light, glow):
+    """A full-brimmed hard hat with a front peak, a ridge and two ribs, in the role's colours."""
+    c = HATS[role]
+    under = ellipse_path(54, 33, 25, 3.2)
+    return [
+        ("path", dict(d=under, fill=c["line"])),
+        ("path", dict(d=ellipse_path(54, 32, 24.6, 2.6), fill=c["fill"])),
+        ("path", dict(d="M54,13 V7", stroke=light, sw=2)),  # the antenna, out through the crown
+        ("circle", dict(cx=54, cy=5, r=3.2, fill=glow)),
+        ("path", dict(d=HAT_DOME, fill=c["fill"])),
+        ("path", dict(d=HAT_SHADOW, fill=c["shade"])),
+        ("path", dict(d="M40.2,30.5 C40.2,23.5 43,18.5 47.2,16", stroke=c["hi"], sw=2.2)),  # light from the left
+        ("path", dict(d=HAT_RIBS, stroke=c["shade"], sw=1.5)),
+        ("path", dict(d=HAT_RIDGE, fill=c["hi"])),
+        ("path", dict(d="M56.2,15.2 L56.6,32.5", stroke=c["shade"], sw=1.2)),
+        ("path", dict(d=HAT_DOME, stroke=c["line"], sw=1)),
+        ("path", dict(d="M38,33.4 Q54,32 70,33.4 Q67,36.3 54,36.4 Q41,36.3 38,33.4 Z", fill=c["shade"])),  # peak
+        ("path", dict(d="M40,33.3 Q54,32.1 68,33.3", stroke=c["hi"], sw=1)),
+        ("path", dict(d=under, stroke=c["line"], sw=0.8)),
+    ]
+
+
+def hatted(body, light, glow, eyes, role):
+    """The henchman with its role's hat on: its own antenna gives way to the one the hat carries."""
+    items = [i for i in shapes(body, light, glow, eyes)
+             if not (i[0] == "circle" and i[1]["cy"] == 20) and not (i[0] == "path" and i[1].get("d") == "M54,22 V30")]
+    return items + hat(role, light, glow)
+
+
 GREY, BLACK, COAT, COAT_DARK, COAT_LINE = "#9AA1AD", "#2B2E36", "#2A2D35", "#1C1E24", "#3C414D"
 
 
@@ -278,8 +319,13 @@ if __name__ == "__main__":
         (res / f"avatar_{name}.xml").write_text(vector(items, f"{name.capitalize()}'s henchman"))
         (res / f"avatar_{name}_live.xml").write_text(live_vector(name, body, light, glow, eyes))
         (res / f"avatar_{name}_alive.xml").write_text(alive(name))
+        for role in HATS:
+            (res / f"avatar_{name}_{role}.xml").write_text(
+                vector(hatted(body, light, glow, eyes, role), f"{name.capitalize()}'s henchman, {role} hard hat"))
         if previews:
             (previews / f"avatar_{name}.svg").write_text(svg(items))
+            for role in HATS:
+                (previews / f"avatar_{name}_{role}.svg").write_text(svg(hatted(body, light, glow, eyes, role)))
     (res / "avatar_you.xml").write_text(vector(boss(), "The boss (you)"))
     (res / "avatar_you_away.xml").write_text(vector(boss(away=True), "The boss, away: headset off"))
     if previews:

@@ -436,9 +436,15 @@ def agents() -> dict:
     """The agents a call can switch to: heard lately and still running, and the one replies go to now."""
     current, locked = last_speaker(), desktop().locked()
     started = spawned()
+    try:
+        teams = chains.teams()  # the avatar's hard hat: a manager with live crew, or crew; solo chats aren't listed
+    except Exception as e:  # never let a bad chain record empty the phone's chat list
+        print(f"teams: {e}", file=sys.stderr)
+        teams = {}
     listed = [{"session": s.session,
                "name": s.spoken() + chat_named(s) + (" (laptop locked)" if s.in_editor and locked else ""),
                "spawned": s.tab.owner == tmux.OWNER and s.tab.address in started,
+               "team": teams.get(s.session, ""),
                # a workflow running in it: shown in place of the chat's last line on the phone's list
                "workflow": workflows.live(s.session) if s.agent == "claude" else None}
               for s in recent_speakers() if routing.reachable(s)]

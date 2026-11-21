@@ -476,12 +476,31 @@ def _same_launch_line(event: dict, launch: dict) -> bool:
     return _same_pid(int(launch.get("pid") or 0), int(event.get("pid") or 0))
 
 
-def view(session: str) -> dict:
-    """One job as the phone may show it, including each child's ordered hand-offs."""
+_LOOK = object()  # look the panes up here (one tmux call)
+
+
+def _panes(alive):
+    """Every tmux pane with its first process, for reaping: the caller's list, or one looked up now. None (tmux
+    couldn't be asked) means nothing is known gone."""
+    if alive is not _LOOK:
+        return alive
+    try:
+        from voice.desktop import tmux
+        return tmux.pane_pids()
+    except Exception:
+        return None
+
+
+def view(session: str, alive=_LOOK) -> dict:
+    """One job as the phone may show it, including each child's ordered hand-offs. A child whose pane is gone is
+    reaped first, so it isn't shown running (or wearing a hat) after it crashed or exited by itself."""
+    panes = _panes(alive)
     with _locked():
         chain = _chain_of(session)
         if not chain:
             return {}
+        if not chain.closed:
+            _reap(chain, panes)
         events = list(chain.events)
         launches = [(index, event) for index, event in enumerate(events) if event.get("kind") == "launch"]
         minions = []
@@ -536,12 +555,48 @@ def view(session: str) -> dict:
             "id": chain.id,
             "boss": _canonical(chain.boss),
             "is_boss": chain.boss in _renamed_as(session),
+            "closed": chain.closed,  # an ended job: no hats, as teams() says
             "used": _active(events),
             "slots": chain.slots,
             "minions": minions,
             "handoffs": [{key: value for key, value in item.items() if key != "order"}
                          for item in sorted(timeline, key=lambda item: item["order"])],
         }
+
+
+def teams(alive=_LOOK) -> dict[str, str]:
+    """Each chat's place in a crew, for its avatar's hard hat: "manager" (its job is open and a child still runs),
+    "crew" (a child that hasn't ended); a chat in neither works solo and isn't listed. A child whose pane is gone
+    (it crashed, or typed /exit) is reaped first, so it doesn't keep the hats on. Keyed by each chat's current key
+    only: an old folder placeholder is not a chat, and a new chat started in that folder must not inherit a hat."""
+    out: dict[str, str] = {}
+    panes = _panes(alive)
+    with _locked():
+        found_all = _load_all()
+        for chain in found_all:
+            if not chain.closed:
+                _reap(chain, panes)
+    for chain in found_all:
+        if chain.closed:
+            continue
+        events = chain.events
+        live = []
+        for index, launch in enumerate(events):
+            if launch.get("kind") != "launch" or not _launch_open(events, index):
+                continue
+            child = str(launch.get("session") or "")
+            for event in events[index + 1:]:
+                if event.get("kind") == "bound" and _same_launch_line(event, launch):
+                    child = str(event.get("session") or child)
+            live.append(child)  # an unbound child still makes its boss a manager; it has no chat yet
+        if not live:
+            continue
+        out[_canonical(chain.boss)] = "manager"
+        for child in live:
+            key = _canonical(child) if child else ""
+            if key and out.get(key) != "manager":  # a manager stays one, whatever else it is
+                out[key] = "crew"
+    return out
 
 
 def pending_end(session: str) -> bool:

@@ -50,6 +50,63 @@ class Chains(unittest.TestCase):
         start.assert_not_called()
         server.assert_not_called()
 
+    def test_teams_give_a_manager_and_its_crew_their_hats(self):
+        self.assertEqual(chains.teams(alive=None), {})  # nobody started anyone: all solo
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="kid", pane="%1", pid=1, depth=2)
+        chains.append(chain, "launch", parent="boss", pane="%2", pid=2, depth=2)  # not bound yet
+        chains.bind("kid2", "%2", 2)
+        teams = chains.teams(alive=None)
+        self.assertEqual(teams["boss"], "manager")
+        self.assertEqual((teams["kid"], teams["kid2"]), ("crew", "crew"))
+        self.assertNotIn("stranger", teams)
+
+    def test_an_ended_child_loses_its_hat_and_the_last_one_takes_the_bosss(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="kid", pane="%1", pid=1, depth=2)
+        chains.append(chain, "launch", parent="boss", session="kid2", pane="%2", pid=2, depth=2)
+        chains.append(chain, "ended", session="kid", pane="%1", pid=1)
+        teams = chains.teams(alive=None)
+        self.assertNotIn("kid", teams)
+        self.assertEqual((teams["boss"], teams["kid2"]), ("manager", "crew"))
+        chains.append(chain, "ended", session="kid2", pane="%2", pid=2)
+        self.assertEqual(chains.teams(alive=None), {})  # no live crew: the boss works solo again
+
+    def test_a_renamed_crew_member_wears_its_hat_under_its_current_key_only(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="folder-kid", pane="%1", pid=1, depth=2)
+        RENAMED.write_text('{"folder-kid": "claude-kid"}')
+        teams = chains.teams(alive=None)
+        self.assertEqual(teams["claude-kid"], "crew")
+        self.assertNotIn("folder-kid", teams)  # a new chat started in that folder must not inherit the hat
+
+    def test_a_bound_child_is_not_filed_under_its_folder_placeholder(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="claude-_home_x", pane="%1", pid=1, depth=2)
+        chains.bind("claude-real", "%1", 1)
+        teams = chains.teams(alive=None)
+        self.assertEqual(teams["claude-real"], "crew")
+        self.assertNotIn("claude-_home_x", teams)
+
+    def test_a_child_whose_pane_is_gone_loses_its_hat_and_stops_running(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="kid", pane="%1", pid=1, depth=2, at=1.0)
+        chains.append(chain, "launch", parent="boss", session="kid2", pane="%2", pid=2, depth=2, at=1.0)
+        self.assertEqual(chains.teams(alive=None)["kid"], "crew")  # tmux couldn't be asked: nothing is gone
+        teams = chains.teams(alive={"%2": 2})  # kid typed /exit: its pane is gone
+        self.assertNotIn("kid", teams)
+        self.assertEqual((teams["boss"], teams["kid2"]), ("manager", "crew"))
+        states = {m["session"]: m["state"] for m in chains.view("boss", alive={"%2": 2})["minions"]}
+        self.assertEqual(states, {"kid": "ended", "kid2": "running"})
+        self.assertEqual(chains.teams(alive={}), {})  # every pane gone: the boss works solo again
+
+    def test_a_closed_job_puts_no_hats_on_and_says_so(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="kid", pane="%1", pid=1, depth=2)
+        chains.append(chain, "ended", session="boss")  # the boss itself ended: the job is closed
+        self.assertEqual(chains.teams(alive=None), {})
+        self.assertTrue(chains.view("kid", alive=None)["closed"])
+
     def test_the_ninth_start_is_refused(self):
         chain = chains.open("boss")
         for i in range(8):
