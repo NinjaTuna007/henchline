@@ -599,6 +599,42 @@ def teams(alive=_LOOK) -> dict[str, str]:
     return out
 
 
+def ended(within: float = 3 * 86400) -> list[str]:
+    """Chats whose work is over, for the phone's list: a child whose launch was ended or replaced (handsfree end, the
+    phone's End, or reaped when its pane was gone) and a boss whose job closed, in the last `within` seconds. A chat
+    that is live again in another job is left out. Current keys only. Call after teams(), which reaps first."""
+    since = time.time() - within
+    over: set[str] = set()
+    live: set[str] = set()
+    for chain in _load_all():
+        events = chain.events
+        for index, launch in enumerate(events):
+            if launch.get("kind") != "launch":
+                continue
+            child = str(launch.get("session") or "")
+            closing = None
+            for event in events[index + 1:]:
+                if event.get("kind") == "bound" and _same_launch_line(event, launch):
+                    child = str(event.get("session") or child)
+                elif _closes(event, launch):
+                    closing = event
+            if not child:
+                continue
+            key = _canonical(child)
+            if _launch_open(events, index):
+                live.add(key)
+            elif closing is not None and float(closing.get("at") or 0) >= since:
+                over.add(key)
+        if chain.closed:
+            at = max((float(e.get("at") or 0) for e in events if e.get("kind") == "ended"), default=0)
+            if at >= since:
+                over.add(_canonical(chain.boss))
+    # Only keys that name one chat: a folder placeholder (a Codex helper's codex-<folder>) would hide every later
+    # chat of that agent in that folder from the phone's offline list
+    from voice import resume
+    return sorted(key for key in over - live if resume.chat_id(key))
+
+
 def pending_end(session: str) -> bool:
     """True when this child has an unanswered End-or-Keep request."""
     shown = view(session)

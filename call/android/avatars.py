@@ -90,6 +90,24 @@ def hatted(body, light, glow, eyes, role):
 GREY, BLACK, COAT, COAT_DARK, COAT_LINE = "#9AA1AD", "#2B2E36", "#2A2D35", "#1C1E24", "#3C414D"
 
 
+BELL, BELL_LIGHT, BELL_DARK = "#F2B544", "#FFD77E", "#B9822A"  # the reminders' bell: not a henchman, a notice
+
+
+def reminders():
+    """Reminders (a timer or a script texting, no agent behind it): a bell on the navy disc, so it never reads as a
+    henchman you could talk to (the user's screenshot, 2026-11-21: a nameless blue "Agent")."""
+    return [
+        ("circle", dict(cx=54, cy=54, r=54, fill=NAVY)),
+        ("circle", dict(cx=54, cy=30, r=3.6, fill=BELL_LIGHT)),  # the hanger
+        # the bell: a dome flaring to a lip
+        ("path", dict(d="M54,32 C42,32 37,42 37,54 V66 C37,70 33,72 31,75 H77 C75,72 71,70 71,66 V54 C71,42 66,32 54,32 Z",
+                      fill=BELL)),
+        ("path", dict(d="M43,56 C43,46 46,40 52,38", stroke=BELL_LIGHT, sw=3)),  # shine
+        ("rect", dict(x=29, y=74, w=50, h=6, rx=3, fill=BELL_DARK)),  # the lip
+        ("circle", dict(cx=54, cy=85, r=5.2, fill=BELL_LIGHT)),  # the clapper
+    ]
+
+
 def bezier(p0, p1, p2, p3, n=24):
     return [tuple((1 - t) ** 3 * a + 3 * (1 - t) ** 2 * t * b + 3 * (1 - t) * t ** 2 * c + t ** 3 * d
                   for a, b, c, d in zip(p0, p1, p2, p3)) for t in (i / n for i in range(n + 1))]
@@ -326,8 +344,10 @@ if __name__ == "__main__":
             (previews / f"avatar_{name}.svg").write_text(svg(items))
             for role in HATS:
                 (previews / f"avatar_{name}_{role}.svg").write_text(svg(hatted(body, light, glow, eyes, role)))
+    (res / "avatar_reminders.xml").write_text(vector(reminders(), "Reminders: a bell, not a henchman"))
     (res / "avatar_you.xml").write_text(vector(boss(), "The boss (you)"))
     (res / "avatar_you_away.xml").write_text(vector(boss(away=True), "The boss, away: headset off"))
     if previews:
+        (previews / "avatar_reminders.svg").write_text(svg(reminders()))
         (previews / "avatar_you.svg").write_text(svg(boss()))
         (previews / "avatar_you_away.svg").write_text(svg(boss(away=True)))

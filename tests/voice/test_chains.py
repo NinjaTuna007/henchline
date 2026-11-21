@@ -107,6 +107,38 @@ class Chains(unittest.TestCase):
         self.assertEqual(chains.teams(alive=None), {})
         self.assertTrue(chains.view("kid", alive=None)["closed"])
 
+    def test_ended_lists_helpers_whose_work_is_over_for_the_phones_list(self):
+        boss, kid, kid2 = (f"claude-{n}0000000-0000-4000-8000-000000000000" for n in "123")
+        self.assertEqual(chains.ended(), [])
+        chain = chains.open(boss)
+        chains.append(chain, "launch", parent=boss, session=kid, pane="%1", pid=1, depth=2)
+        chains.append(chain, "launch", parent=boss, pane="%2", pid=2, depth=2)
+        chains.bind(kid2, "%2", 2)
+        self.assertEqual(chains.ended(), [])  # both still working
+        chains.append(chain, "ended", session=kid, pane="%1", pid=1)
+        chains.append(chain, "ended", session=kid2, pane="%2", pid=2)
+        self.assertEqual(chains.ended(), sorted([kid, kid2]))  # the bound child under its own key
+        self.assertNotIn(boss, chains.ended())  # its job is still open: the boss isn't over
+
+    def test_ended_leaves_out_old_ends_a_helper_live_again_and_names_a_closed_boss(self):
+        boss, old, again = (f"claude-{n}0000000-0000-4000-8000-000000000000" for n in "456")
+        chain = chains.open(boss)
+        chains.append(chain, "launch", parent=boss, session=old, pane="%1", pid=1, depth=2, at=1.0)
+        chains.append(chain, "ended", session=old, pane="%1", pid=1, at=2.0)  # long ago: not listed
+        chains.append(chain, "launch", parent=boss, session=again, pane="%2", pid=2, depth=2)
+        chains.append(chain, "ended", session=again, pane="%2", pid=2)
+        chains.append(chain, "launch", parent=boss, session=again, pane="%3", pid=3, depth=2)  # started again
+        self.assertEqual(chains.ended(), [])
+        chains.append(chain, "ended", session=boss)  # the boss itself ended: its job closed
+        self.assertEqual(chains.ended(), [boss])
+
+    def test_ended_leaves_out_folder_placeholders(self):
+        boss = "claude-70000000-0000-4000-8000-000000000000"
+        chain = chains.open(boss)
+        chains.append(chain, "launch", parent=boss, session="codex-_home_me_project", pane="%1", pid=1, depth=2)
+        chains.append(chain, "ended", session="codex-_home_me_project", pane="%1", pid=1)
+        self.assertEqual(chains.ended(), [])  # would hide every later Codex chat in that folder
+
     def test_the_ninth_start_is_refused(self):
         chain = chains.open("boss")
         for i in range(8):

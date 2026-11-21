@@ -28,6 +28,28 @@ class Replied(unittest.TestCase):
         self.assertFalse(handsfree.text_replied(""))
 
 
+class Reminders(unittest.TestCase):
+    """A text no agent sends (a timer, a script over ssh) is from Reminders, not a nameless "Agent"."""
+
+    def test_a_named_script_gets_its_own_reminders_chat(self):
+        self.assertEqual(handsfree.sender("Class reminders"), ("reminders", "reminders-class_reminders"))
+        self.assertEqual(handsfree.sender(""), ("reminders", "reminders-reminders"))
+        self.assertEqual(handsfree.sender("  !!  "), ("reminders", "reminders-reminders"))
+
+    def test_with_no_agent_behind_it_a_text_is_kept_as_from_reminders(self):
+        from unittest import mock
+        TEXTS.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(handsfree, "caller", return_value=None), \
+             mock.patch.object(handsfree, "identity", return_value=("agent", "agent-_tmp")), \
+             mock.patch.object(handsfree, "in_call", return_value=False), \
+             mock.patch.object(handsfree, "push", return_value=False):
+            handsfree.text("class in 30 minutes")
+            handsfree.text("dryer done", sent_by="Laundry")
+        kept = sorted((read_json(p) for p in TEXTS.glob("*.json")), key=lambda r: r.get("at", 0))
+        mine = [(r["agent"], r["session"]) for r in kept if r.get("words") in ("class in 30 minutes", "dryer done")]
+        self.assertEqual(mine, [("reminders", "reminders-reminders"), ("reminders", "reminders-laundry")])
+
+
 class RingAs(unittest.TestCase):
     def test_unknown_agent_is_not_rung(self):
         self.assertEqual(handsfree.ring("why", now=True, wait=False, as_session="claude-nobody"), 1)

@@ -737,6 +737,7 @@ class MainActivity : Activity() {
     /** The agents a call can switch to; the chat shows the current one's lines. */
     private fun showAgents(status: JSONObject) {
         followRenames(status)
+        takeEnded(status)
         val list = status.getJSONArray("agents")
         names = (0 until list.length()).associate {
             list.getJSONObject(it).getString("session") to list.getJSONObject(it).getString("name")
@@ -782,9 +783,13 @@ class MainActivity : Activity() {
         // Chats an agent texted lately that the laptop's crew list doesn't name: named from the session ("cursor-_tmp");
         // older ones stay out of the list (long-press clears one that's in it). Not hands-free's own: it is the
         // switchboard, not an agent (its "Now talking to …" notices from calls, 2026-11-16)
-        chats = chats + Chats.sessions(this).filter { s -> s !in names && !s.startsWith("handsfree-") && (Chats.last(this, s)?.optLong("at") ?: 0) > System.currentTimeMillis() - 3 * 86_400_000L }.map { session ->
+        // A helper whose work is over (ended from its boss or here, or its terminal gone) leaves the list: hidden when
+        // idle (the user's screenshot, 2026-11-21: an ended helper lingered). A search still finds it.
+        chats = chats + Chats.sessions(this).filter { s -> s !in names && !s.startsWith("handsfree-") && (query.isNotEmpty() || s !in ended) && (Chats.last(this, s)?.optLong("at") ?: 0) > System.currentTimeMillis() - 3 * 86_400_000L }.map { session ->
             val agent = session.substringBefore("-").replaceFirstChar { it.uppercase() }
-            Chat(session, agent, "not on the crew list", Chats.last(this, session), "")  // its key can't say its folder
+            // A timer's or a script's texts have their own group: no agent is behind them to put on the crew list
+            if (isReminders(session)) Chat(session, "Reminders", "reminders", Chats.last(this, session), "")
+            else Chat(session, agent, "not on the crew list", Chats.last(this, session), "")  // its key can't say its folder
         }
         // One that texted since the crew was last asked: likely an agent just started from a new chat, under its own
         // key now (the user's catch, 2026-11-16: "not on the crew list" until the app was reopened): asked at once,
@@ -1445,7 +1450,8 @@ class MainActivity : Activity() {
         callButton.setBackgroundResource(if (on) R.drawable.round_hang else R.drawable.round_call)
         callButton.contentDescription = if (on) "Hang up" else "Call"
         // Off a call the message box stays when an agent's chat is shown: what is typed (or attached) is a text
-        val typing = on || current.isNotEmpty()
+        // Reminders take no replies (nothing reads them): the box goes, the chat is read-only
+        val typing = on || (current.isNotEmpty() && !isReminders(current))
         talk.isEnabled = on
         text.isEnabled = typing
         send.isEnabled = typing
@@ -3040,6 +3046,7 @@ class MainActivity : Activity() {
         names = (0 until found.length()).associate { found.getJSONObject(it).getString("session") to found.getJSONObject(it).getString("name") }
         teams = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
             a.optString("team").takeIf { it.isNotEmpty() }?.let { a.getString("session") to it } } }.toMap()
+        takeEnded(answer)
         flows = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
             a.optJSONObject("workflow")?.let { a.getString("session") to it } } }.toMap()
         prefs().edit().putString("crew", found.toString()).apply()
@@ -3047,6 +3054,14 @@ class MainActivity : Activity() {
 
     private var flows: Map<String, JSONObject> = emptyMap()  // a workflow running in a chat, by session: its list line
     private var teams: Map<String, String> = emptyMap()  // a chat's crew role, by session: its hard hat ("manager", "crew")
+    private var ended: Set<String> = emptySet()  // helpers whose work is over (the laptop says): off the list, still searchable
+
+    /** The laptop's list of chats whose work is over (a helper ended, or reaped when its terminal went): kept only when
+     *  the answer carries one, so an older laptop leaves the list as it was. */
+    private fun takeEnded(answer: JSONObject) {
+        val list = answer.optJSONArray("ended") ?: return
+        ended = (0 until list.length()).map { list.optString(it) }.filter { it.isNotEmpty() }.toSet()
+    }
 
     private fun startedHere(session: String): Boolean = try {
         val crew = org.json.JSONArray(prefs().getString("crew", "[]"))
@@ -4176,7 +4191,11 @@ class MainActivity : Activity() {
         const val OPEN_FILE = "io.github.ninjatuna007.henchline.OPEN_FILE"  // a file's notification, tapped
 
         /** Each agent's henchman, by its session (claude-…, cursor-…, codex-…) or its name. */
+        /** A chat no agent is behind: a timer's or a script's texts (handsfree text with no agent). No replies. */
+        fun isReminders(session: String) = session.startsWith("reminders-")
+
         fun avatarOf(sessionOrName: String): Int = when {
+            sessionOrName.startsWith("reminders", ignoreCase = true) -> R.drawable.avatar_reminders
             sessionOrName.startsWith("claude", ignoreCase = true) -> R.drawable.avatar_claude
             sessionOrName.startsWith("cursor", ignoreCase = true) -> R.drawable.avatar_cursor
             sessionOrName.startsWith("codex", ignoreCase = true) -> R.drawable.avatar_codex

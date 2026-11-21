@@ -218,6 +218,7 @@ class IncomingActivity : Activity() {
             "claude" -> "Claude"
             "cursor" -> "Cursor"
             "codex" -> "Codex"
+            "reminders" -> "Reminders"
             else -> "Your crew"
         }
     }

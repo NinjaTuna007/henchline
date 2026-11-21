@@ -444,6 +444,11 @@ def agents() -> dict:
     except Exception as e:  # never let a bad chain record empty the phone's chat list
         print(f"teams: {e}", file=sys.stderr)
         teams = {}
+    try:
+        over = chains.ended()  # helpers whose work is over: the phone keeps them off its list (still searchable)
+    except Exception as e:
+        print(f"ended: {e}", file=sys.stderr)
+        over = []
     listed = [{"session": s.session,
                "name": s.spoken() + chat_named(s) + (" (laptop locked)" if s.in_editor and locked else ""),
                "spawned": s.tab.owner == tmux.OWNER and s.tab.address in started,
@@ -453,6 +458,7 @@ def agents() -> dict:
               for s in recent_speakers() if routing.reachable(s)]
     return {"agents": listed,
             "current": current.session if current else "",
+            "ended": over,
             "renamed": read_json(RENAMED)}  # chats the phone moves to an agent's own key
 
 

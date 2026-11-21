@@ -18,14 +18,16 @@
                                        go quiet (a wake-up, or an answer is needed). The usual call stays on.
                                        --as SESSION: ring as
                                        that agent (the call server calling back after a quiet call)
-    handsfree text [--until-read MIN | --until-replied MIN] WORDS
+    handsfree text [--until-read MIN | --until-replied MIN] [--from NAME] WORDS
                                        a message to the user's phone, not a call: a notification they can
                                        reply to from the notification itself (the reply comes back tagged
                                        [phone · text]); on a call it goes to the chat.
                                        Prints its id. --until-read MIN: wait that long for the user to read
                                        it, then ring if they haven't; --until-replied MIN: the same, until
-                                       they answer it (any message of theirs to this agent after it). Exit 0
-                                       sent (or read, or answered), 1 not
+                                       they answer it (any message of theirs to this agent after it).
+                                       --from NAME: a script's own name; run with no agent (a timer, a
+                                       script) it shows as Reminders, a chat with a bell that takes no
+                                       replies. Exit 0 sent (or read, or answered), 1 not
     handsfree text-status ID            sent, delivered (on the phone) or read (opened, or replied to)
     handsfree remind [--keep-awake] [--to "AGENT [in WORKSPACE]"] TIME WORDS
                                        type WORDS into an agent at TIME (08:30, tomorrow 08:30,
@@ -307,7 +309,15 @@ def taken_as(args: list[str]) -> tuple[list[str], str | None]:
     return args[:at] + args[at + 2:], session
 
 
-def text(words: str, until_read: float = 0, until: str = "read", as_session: str = "") -> int:
+def sender(name: str = "") -> tuple[str, str]:
+    """A text with no agent behind it (a timer, a script, the class reminder over ssh): "reminders", under a key named
+    for it (--from NAME), so the phone shows a Reminders chat with a bell, not a nameless "Agent" (the user's
+    screenshot, 2026-11-21). Nothing reads replies to it."""
+    slug = re.sub(r"[^a-z0-9_.-]+", "_", (name or "reminders").strip().lower()).strip("_") or "reminders"
+    return "reminders", f"reminders-{slug}"[:120]
+
+
+def text(words: str, until_read: float = 0, until: str = "read", as_session: str = "", sent_by: str = "") -> int:
     """A message for the user's phone from the agent running this: a notification with a reply box, or a line
     in the call's chat when a call is up. Its id is printed: `handsfree text-status ID` says how far it got,
     the way messaging apps do it (sent, delivered: on the phone, read: the user opened that chat or replied). until_read:
@@ -315,13 +325,17 @@ def text(words: str, until_read: float = 0, until: str = "read", as_session: str
     this agent after it), and then ring if it wasn't: a text first, a call when it goes unanswered (the user's
     idea, 2026-11-16)."""
     if not words.strip():
-        print("usage: handsfree text [--until-read MINUTES | --until-replied MINUTES] WORDS")
+        print("usage: handsfree text [--until-read MINUTES | --until-replied MINUTES] [--from NAME] WORDS")
         return 1
     if as_session:
         agent, session = as_session.split("-", 1)[0], as_session
+    elif sent_by:
+        agent, session = sender(sent_by)
     else:
         speaker = caller()
         agent, session = (speaker.agent, speaker.session) if speaker else identity()
+        if agent == "agent":  # no agent at all runs this: a timer or a script
+            agent, session = sender()
     tid = secrets.token_hex(8)
     # The words kept too (private): the app fetches any text whose push never reached it (2026-11-18). Records
     # older than a week go, so the folder (read on every catch-up) stays small
@@ -647,7 +661,15 @@ def main() -> int:
                     return 1
                 args = args[:at] + args[at + 2:]
                 until = flag.removeprefix("--until-")
-        return text(" ".join(args), minutes, until, as_session)
+        sent_by = ""
+        if "--from" in args:  # a script's own name, for its Reminders chat on the phone
+            at = args.index("--from")
+            if at + 1 >= len(args) or not args[at + 1].strip():
+                print("--from needs a name")
+                return 1
+            sent_by = args[at + 1]
+            args = args[:at] + args[at + 2:]
+        return text(" ".join(args), minutes, until, as_session, sent_by)
     if command == "text-backup" and args:  # internal: the backup, detached so `handsfree text` returns now
         _backup_text(args[0])
         return 0

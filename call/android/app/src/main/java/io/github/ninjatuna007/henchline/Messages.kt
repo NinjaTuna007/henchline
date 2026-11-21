@@ -87,17 +87,18 @@ object Messages {
             PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)  // mutable: the reply text is added to it
         val open = PendingIntent.getActivity(context, id, Intent(context, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE)
-        manager.notify(id, Notification.Builder(context, CHANNEL)
+        val built = Notification.Builder(context, CHANNEL)
             .setSmallIcon(R.drawable.ic_notify)
             .setStyle(style)
             .setCategory(Notification.CATEGORY_MESSAGE)
             .setContentIntent(open)
             .setOnlyAlertOnce(sending)  // your own reply landing in it doesn't buzz
             .setAutoCancel(true)
-            .addAction(Notification.Action.Builder(null, "Reply", reply)
-                .addRemoteInput(RemoteInput.Builder(KEY).setLabel("Reply to ${IncomingActivity.nameOf(agent)}").build())
-                .setAllowGeneratedReplies(false).build())
-            .build())
+        // A reminder (a timer's or a script's text) has no agent to read a reply: no reply box on it
+        if (!MainActivity.isReminders(session)) built.addAction(Notification.Action.Builder(null, "Reply", reply)
+            .addRemoteInput(RemoteInput.Builder(KEY).setLabel("Reply to ${IncomingActivity.nameOf(agent)}").build())
+            .setAllowGeneratedReplies(false).build())
+        manager.notify(id, built.build())
     }
 
     /** Words to an agent session over Tailscale, within 8 s: "" when an agent took them, else why not. */
