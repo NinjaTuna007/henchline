@@ -415,6 +415,23 @@ class Commands(unittest.TestCase):
         self.assertEqual(store.host_rows()[0]["revoked_at"], None)
         self.assertTrue(store.revoke_host("h"))
 
+    def test_a_second_opener_racing_the_column_upgrade_is_fine(self):
+        path = self.folder / "old2.sqlite3"
+        db = sqlite3.connect(path)
+        db.executescript("""CREATE TABLE hosts(host_id TEXT PRIMARY KEY, public_key BLOB NOT NULL,
+            enrolled_at REAL NOT NULL, descriptor BLOB NOT NULL, descriptor_seq INTEGER NOT NULL,
+            observed_at REAL NOT NULL, withdrawn_at REAL);""")
+        db.close()
+        store = DirectoryStore.__new__(DirectoryStore)
+        store.path, store._lock = path, threading.RLock()
+        store._db = _Racing(sqlite3.connect(path, check_same_thread=False), path)
+        store._db.row_factory = sqlite3.Row
+        store._migrate()  # another process adds the column between its look and its ALTER: no error
+        self.assertTrue(store._db.raced)
+        store.close()
+        columns = [r[1] for r in sqlite3.connect(path).execute("PRAGMA table_info(hosts)")]
+        self.assertEqual(columns.count("revoked_at"), 1)
+
     def test_refusals(self):
         for changes, words in (({"rotate_identity": True}, "rotate_identity"),
                                ({"base_url": "http://x/"}, "base_url"),
@@ -429,6 +446,34 @@ class Commands(unittest.TestCase):
         code, _, err = self.run_cli("--config", str(write_config(self.folder, expected_build_id="other")))
         self.assertEqual(code, 1)
         self.assertIn("expects build other", err)
+
+
+class _Racing:
+    """A connection that lets "another process" add hosts.revoked_at just before this one's ALTER TABLE."""
+
+    def __init__(self, connection, path):
+        self.__dict__.update(_db=connection, _path=path, raced=False)
+
+    def execute(self, sql, *args):
+        if sql.startswith("ALTER TABLE hosts ADD COLUMN revoked_at") and not self.raced:
+            self.__dict__["raced"] = True
+            other = sqlite3.connect(self._path)
+            other.execute(sql)
+            other.commit()
+            other.close()
+        return self._db.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._db, name, value)
+
+    def __enter__(self):
+        return self._db.__enter__()
+
+    def __exit__(self, *exc):
+        return self._db.__exit__(*exc)
 
 
 if __name__ == "__main__":

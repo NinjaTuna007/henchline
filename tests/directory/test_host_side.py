@@ -162,7 +162,7 @@ class Publishing(unittest.TestCase):
         from call.host_store import HostStore
         path = Path(tempfile.mkdtemp(dir=sandbox.HOME)) / "host.sqlite3"
         HostStore(path).close()
-        with multiprocessing.get_context("fork").Pool(6) as pool:
+        with multiprocessing.get_context("spawn").Pool(6) as pool:
             runs = pool.map(_publish_many, [(str(path), c) for c in "abcdef"])
         claims: dict[int, set[str]] = {}
         for run in runs:

@@ -95,7 +95,11 @@ class DirectoryStore:
             """)
             columns = {r["name"] for r in self._db.execute("PRAGMA table_info(hosts)")}
             if "revoked_at" not in columns:  # a database from the first build of this schema
-                self._db.execute("ALTER TABLE hosts ADD COLUMN revoked_at REAL")
+                try:
+                    self._db.execute("ALTER TABLE hosts ADD COLUMN revoked_at REAL")
+                except sqlite3.OperationalError as exc:  # another process opening it added it first
+                    if "duplicate column" not in str(exc):
+                        raise
             row = self._db.execute("SELECT * FROM meta").fetchone()
             if row is None:
                 self._db.execute("INSERT INTO meta VALUES (?,?,?)", (SCHEMA_VERSION, str(uuid.uuid4()), time.time()))
