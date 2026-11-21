@@ -42,10 +42,14 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    // The laptop's own signature vectors, read in place: the phone's tests can never drift from the server's
+    sourceSets["test"].resources.srcDir("../../../tests/fixtures")
 }
 
 dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")  // pull down the chat list to find every agent
     implementation("org.unifiedpush.android:connector:3.0.10")  // rung awake through the ntfy app, no Google
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")  // the real org.json on the JVM (Android's is a stub in unit tests)
 }
