@@ -2,6 +2,7 @@ package io.github.ninjatuna007.henchline
 
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -105,11 +106,28 @@ class HostClient(
         val descriptor = answer.json().optJSONObject("descriptor") ?: throw DescriptorRefused("No description in the answer.")
         if (!HostDescriptor.verify(descriptor, host.hostKey)) throw DescriptorRefused("${host.label}'s description isn't signed by its pinned key.")
         if (descriptor.optString("host_id") != host.hostId) throw DescriptorRefused("Another computer's description came back.")
-        val before = try { JSONObject(host.descriptor).optLong("descriptor_seq", 0) } catch (e: Exception) { 0L }
+        val stored = try { JSONObject(host.descriptor) } catch (e: Exception) { JSONObject() }
+        val before = stored.optLong("descriptor_seq", 0)
         val seq = descriptor.optLong("descriptor_seq", 0)
         if (seq < before) throw DescriptorRefused("${host.label} sent an older description ($seq < $before): ignored.")
-        return host.copy(label = descriptor.optString("label", host.label), baseUrl = descriptor.getString("base_url"),
-            tlsAuthority = descriptor.getString("tls_authority"), descriptor = descriptor.toString())
+        if (seq == before && stored.has("signature") && !Canonical.jcs(descriptor).contentEquals(Canonical.jcs(stored))) {
+            throw DescriptorRefused("${host.label} sent a different description under the same number ($seq): ignored.")
+        }
+        val (baseUrl, authority) = origin(descriptor.optString("base_url"), descriptor.optString("tls_authority"))
+        return host.copy(label = descriptor.optString("label", host.label), baseUrl = baseUrl, tlsAuthority = authority,
+            descriptor = descriptor.toString())
+    }
+
+    /** A signed address is still checked as pairing checks a typed one: a bare https origin whose authority is
+     *  exactly the tls_authority beside it. */
+    private fun origin(baseUrl: String, tlsAuthority: String): Pair<String, String> {
+        val url = baseUrl.toHttpUrlOrNull() ?: throw DescriptorRefused("${host.label} sent an unreadable address.")
+        val authority = if (url.port == 443) url.host else "${url.host}:${url.port}"
+        if (!url.isHttps || url.toString() != baseUrl || url.encodedPath != "/" || url.query != null ||
+            url.username.isNotEmpty() || url.password.isNotEmpty() || tlsAuthority != authority.lowercase()) {
+            throw DescriptorRefused("${host.label} sent an address that isn't a bare https origin matching its authority.")
+        }
+        return baseUrl to tlsAuthority
     }
 
     /** Before this phone forgets the host: the host stops trusting this phone's key. True when it has (or already

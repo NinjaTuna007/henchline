@@ -216,11 +216,25 @@ class PairingTest {
         return JSONObject(unsigned.toString()).put("signature", Canonical.b64url(signature))
     }
 
+    private fun reseqRaw(seq: Int, base: String, authority: String): JSONObject {
+        val unsigned = JSONObject(descriptor().toString()).apply {
+            remove("signature"); put("descriptor_seq", seq); put("base_url", base); put("tls_authority", authority)
+        }
+        val signature = Signature.getInstance("Ed25519").run { initSign(hostPair.private); update(Canonical.jcs(unsigned)); sign() }
+        return JSONObject(unsigned.toString()).put("signature", Canonical.b64url(signature))
+    }
+
     @Test fun refreshTakesNewerSignedDescriptorsOnly() {
         val newer = refreshed(reseq(4, "Host A, renamed", "https://host-a2.example.ts.net/"))
         assertEquals(listOf("Host A, renamed", "https://host-a2.example.ts.net/", "host-a2.example.ts.net"),
             listOf(newer.label, newer.baseUrl, newer.tlsAuthority))
         try { refreshed(reseq(2)); fail("older accepted") } catch (expected: DescriptorRefused) {}
+        assertEquals("same content, same number: fine", "Host A", refreshed(descriptor()).label)
+        try { refreshed(reseq(3, "Changed", "https://elsewhere.example.ts.net/")); fail("same number, new content") } catch (expected: DescriptorRefused) {}
+        for (bad in listOf("http://host-a.example.ts.net/", "https://host-a.example.ts.net/sub/", "https://user@host-a.example.ts.net/")) {
+            try { refreshed(reseqRaw(4, bad, "host-a.example.ts.net")); fail("took $bad") } catch (expected: DescriptorRefused) {}
+        }
+        try { refreshed(reseqRaw(4, "https://host-a.example.ts.net/", "other.example.ts.net")); fail("authority mismatch") } catch (expected: DescriptorRefused) {}
         val other = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
         try { refreshed(descriptor(signer = other.private)); fail("other key accepted") } catch (expected: DescriptorRefused) {}
     }

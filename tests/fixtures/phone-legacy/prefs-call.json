@@ -1,0 +1,17 @@
+{
+  "clear": true,
+  "crew": "[{\"session\": \"claude-1a2b\", \"name\": \"Claude, project\"}, {\"session\": \"cursor:chat 7f\", \"name\": \"Cursor, plan\"}]",
+  "current": "claude-1a2b",
+  "current_name": "Claude, project",
+  "dance": true,
+  "helpers_seen_claude-1a2b": 1795000110000,
+  "model_claude-1a2b": "opus high",
+  "my_name": "Boss",
+  "pinned": [
+    "claude-1a2b",
+    "a:b"
+  ],
+  "seen_a:b": 1795000310000,
+  "seen_claude-1a2b": 1795000100000,
+  "server": "https://laptop.example.ts.net/"
+}

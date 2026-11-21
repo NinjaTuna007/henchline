@@ -1,0 +1,4 @@
+{"from":"you","text":"Run the tests, please.","mine":true,"id":"m-1","status":"read","at":1795000000000}
+{"from":"Claude","text":"All 12 pass.","at":1795000060000}
+{"from":"","note":true,"mine":false,"text":"Call ended, 2 min","at":1795000120000}
+{"from":"Claude","text":"Here is the chart.","file":{"url":"/files/abc/chart.png","name":"chart.png"},"thumb":"chats/thumbs/t1.jpg","at":1795000180000}

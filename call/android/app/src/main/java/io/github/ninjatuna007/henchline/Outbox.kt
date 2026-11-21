@@ -11,7 +11,7 @@ import org.json.JSONObject
 import java.io.File
 
 /**
- * Messages written while the laptop can't be reached (asleep, off Tailscale, on the way to KTH): kept here and sent
+ * Messages written while the laptop can't be reached (asleep, off Tailscale, on the way to work): kept here and sent
  * by themselves once it can be, oldest first, as a messaging app does (the user's idea, 2026-11-17). Meanwhile the
  * bubble shows a clock instead of a tick. Android runs OutboxJob whenever there is a network, and the app tries again
  * when it comes to the front and when the laptop pushes anything.
