@@ -126,6 +126,22 @@ class Commands(unittest.TestCase):
             self.assertEqual(server.main(), 1)
 
 
+class Texts(unittest.TestCase):
+    def test_a_text_only_moves_forward(self):
+        tid = "ab" * 8
+        server.write_json(server.TEXTS / f"{tid}.json", {"id": tid, "status": "sent", "words": "hi"}, private=True)
+        self.addCleanup(lambda: (server.TEXTS / f"{tid}.json").unlink(missing_ok=True))
+        self.assertTrue(server.advance_text(tid, "delivered"))
+        self.assertTrue(server.advance_text(tid, "read"))
+        self.assertFalse(server.advance_text(tid, "delivered"))  # never back
+        self.assertFalse(server.advance_text(tid, "read"))
+        self.assertEqual(server.read_json(server.TEXTS / f"{tid}.json")["status"], "read")
+        self.assertFalse(server.advance_text("../etc/passwd", "read"))
+        self.assertFalse(server.advance_text("cd" * 8, "read"))  # no such text
+        self.assertFalse(server.advance_text(tid, "sent"))
+        self.assertIn(tid, [r.get("id") for r in server.LocalHost().texts()])
+
+
 class Backup(unittest.TestCase):
     def setUp(self):
         self.folder = Path(tempfile.mkdtemp(dir=sandbox.HOME))

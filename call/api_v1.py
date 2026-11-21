@@ -38,6 +38,9 @@ DEFAULT_LIMIT, MAX_LIMIT = 50, 200
 MAX_TEXT = 64 * 1024  # characters in one message
 UNSIGNED_PER_MINUTE = 60  # health, descriptor and pairing claims together: they are reachable before pairing
 SESSION_ID = re.compile(r"[^\x00-\x1f\x7f]{1,256}")
+TEXT_ID = re.compile(r"[0-9a-f]{16}")
+INGEST_EVERY = 2.0  # seconds between looks for agents' new texts
+PRUNE_EVERY = 3600.0  # seconds between sweeps of events older than the host's ledger_days
 
 
 class LocalHost(Protocol):
@@ -51,6 +54,12 @@ class LocalHost(Protocol):
 
     def announce(self, words: str) -> None:
         """Tell the user something they must know about (a phone was enrolled)."""
+
+    def texts(self) -> list[dict[str, Any]]:
+        """The agents' texts to the phone this host still keeps: [{id, agent, session, words, at, status}]."""
+
+    def mark_text(self, text_id: str, status: str) -> bool:
+        """A text delivered or read on a phone: moved forward only (never back). Whether it moved."""
 
 
 @dataclass
@@ -88,6 +97,9 @@ def setup(app: web.Application, config: HostConfig, store: HostStore, host: Loca
         r.add_get("/api/v1/chats", signed(chats))
         r.add_get("/api/v1/chats/{session_id}/events", signed(chat_events))
         r.add_post("/api/v1/chats/{session_id}/messages", idempotent(send_message))
+        r.add_post("/api/v1/chats/{session_id}/receipts", idempotent(receipts))
+        app.on_startup.append(start_ledger)
+        app.on_cleanup.append(stop_ledger)
     r.add_route("*", "/api/v1/{tail:.*}", not_found)  # last: everything else answers in the error envelope
     return api
 
@@ -376,3 +388,79 @@ async def send_message(request: web.Request, api: Api, signed_request: SignedReq
 
 def utc(at: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+
+
+# ---- the reply ledger: agents' texts kept as chat events -----------------------------------------------------
+
+def ingest(api: Api) -> int:
+    """Each agent text this host keeps, added once to its chat's events (kind agent_text). Safe to run again and
+    again, and after a restart: the text's id is the event's source, kept unique. How many were new."""
+    added = 0
+    for record in api.host.texts():
+        tid, words, session = str(record.get("id", "")), record.get("words"), str(record.get("session", ""))
+        at = record.get("at")
+        if (not TEXT_ID.fullmatch(tid) or not isinstance(words, str) or not words.strip()
+                or not SESSION_ID.fullmatch(session) or not isinstance(at, (int, float)) or isinstance(at, bool)):
+            continue
+        body = {"agent": str(record.get("agent", "")), "text": words, "text_id": tid, "created_at": utc(at)}
+        if api.store.append_event(session, "agent_text", json.dumps(body).encode(), now=float(at),
+                                  source=f"text:{tid}") is not None:
+            added += 1
+    return added
+
+
+async def keep_ledger(api: Api) -> None:
+    loop = asyncio.get_running_loop()
+    pruned_at = 0.0
+    while True:
+        try:
+            await loop.run_in_executor(None, ingest, api)
+            if time.monotonic() - pruned_at > PRUNE_EVERY:
+                await loop.run_in_executor(None, api.store.prune_events, time.time() - api.config.ledger_days * 86400)
+                pruned_at = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # the loop outlives any one bad record or a busy database
+            LOG.exception("api v1: ledger")
+        await asyncio.sleep(INGEST_EVERY)
+
+
+LEDGER_KEY = web.AppKey("henchline_api_v1_ledger", asyncio.Task)
+
+
+async def start_ledger(app: web.Application) -> None:
+    app[LEDGER_KEY] = asyncio.create_task(keep_ledger(app[API_KEY]))
+
+
+async def stop_ledger(app: web.Application) -> None:
+    app[LEDGER_KEY].cancel()
+
+
+async def receipts(request: web.Request, api: Api, signed_request: SignedRequest) -> web.Response:
+    """{host_id, session_id, event_ids: [...], state: delivered | read}: the agents' texts among those events,
+    moved forward on this host as the phone's notification would (a read text stops an until-read ring)."""
+    rid = signed_request.request_id
+    session_id = session_of(request, rid)
+    body = auth.json_body(signed_request)
+    if str(body.get("host_id", "")).lower() != api.config.host_id:
+        raise ApiError(422, "validation_failed", "host_id names another host", request_id=rid)
+    if body.get("session_id") != session_id:
+        raise ApiError(422, "validation_failed", "session_id differs from the path", request_id=rid)
+    state, ids = body.get("state"), body.get("event_ids")
+    if state not in ("delivered", "read"):
+        raise ApiError(422, "validation_failed", "state is delivered or read", request_id=rid)
+    if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_LIMIT or not all(isinstance(i, str) for i in ids):
+        raise ApiError(422, "validation_failed", f"event_ids is a list of 1..{MAX_LIMIT} ids", request_id=rid)
+    loop = asyncio.get_running_loop()
+    marked, unknown = [], []
+    for event_id in dict.fromkeys(ids):
+        row = await loop.run_in_executor(None, api.store.event, event_id)
+        if row is None or row["session_id"] != session_id or row["kind"] != "agent_text":
+            unknown.append(event_id)
+            continue
+        tid = json.loads(row["body"]).get("text_id", "")
+        await loop.run_in_executor(None, api.host.mark_text, tid, state)
+        marked.append(event_id)
+    return ok(signed_request, {"host_id": api.config.host_id, "session_id": session_id, "state": state,
+                               "marked": marked, "unknown": unknown})

@@ -60,6 +60,7 @@ class HostConfig:
     key_file: Path = DEFAULT_KEY
     min_app_version: int = 1
     api_version: str = API_VERSION
+    ledger_days: int = 30  # how long the host keeps chat events (agents' texts, messages sent over v1)
 
     @classmethod
     def from_dict(cls, raw: Any) -> "HostConfig":
@@ -85,6 +86,9 @@ class HostConfig:
         if not isinstance(capabilities, dict) or any(k not in CAPABILITIES or not isinstance(v, bool)
                                                     for k, v in capabilities.items()):
             raise ValueError("capabilities contain an unknown name or non-boolean value")
+        ledger_days = raw.get("ledger_days", 30)
+        if not isinstance(ledger_days, int) or isinstance(ledger_days, bool) or not 1 <= ledger_days <= 3650:
+            raise ValueError("ledger_days must be a whole number of days, 1..3650")
         api_version = str(raw.get("api_version", API_VERSION))
         if api_version != API_VERSION:
             raise ValueError(f"api_version {api_version} is not supported (this host speaks {API_VERSION})")
@@ -100,6 +104,7 @@ class HostConfig:
             key_file=Path(raw.get("key_file", DEFAULT_KEY)).expanduser(),
             min_app_version=minimum,
             api_version=api_version,
+            ledger_days=ledger_days,
         )
 
     @classmethod

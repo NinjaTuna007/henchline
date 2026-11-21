@@ -166,6 +166,29 @@ class Events(Base):
         self.assertEqual(len(self.store.events("claude-1", limit=0)), 1)
 
 
+class SchemaTwo(Base):
+    def test_a_fresh_store_is_version_two_with_sources(self):
+        self.assertEqual(self.store._db.execute("SELECT version FROM schema_meta").fetchone()[0], 2)
+        self.assertIn("source", [r[1] for r in self.store._db.execute("PRAGMA table_info(host_events)")])
+
+    def test_a_source_is_kept_once(self):
+        first = self.store.append_event("c", "agent_text", b"{}", now=T0, source="text:1")
+        self.assertIsNotNone(first)
+        self.assertIsNone(self.store.append_event("c", "agent_text", b"{}", now=T0, source="text:1"))
+        self.reopen()
+        self.assertIsNone(self.store.append_event("c", "agent_text", b"{}", now=T0, source="text:1"))
+        self.assertIsNotNone(self.store.append_event("c", "message", b"{}", now=T0))  # no source: always new
+        self.assertIsNotNone(self.store.append_event("c", "message", b"{}", now=T0))
+        self.assertEqual(len(self.store.events("c")), 3)
+        self.assertEqual(self.store.event(first)["source"], "text:1")
+
+    def test_pruning(self):
+        self.store.append_event("c", "agent_text", b"{}", now=T0 - 100, source="text:old")
+        self.store.append_event("c", "agent_text", b"{}", now=T0, source="text:new")
+        self.assertEqual(self.store.prune_events(T0 - 50), 1)
+        self.assertEqual([r["source"] for r in self.store.events("c")], ["text:new"])
+
+
 class Migration(unittest.TestCase):
     """A schema-1 database made by an earlier build opens unchanged and keeps its promises."""
 
@@ -191,6 +214,16 @@ class Migration(unittest.TestCase):
 
     def test_events_are_kept(self):
         self.assertEqual(len(self.store.events("claude-1")), 1)
+
+    def test_schema_one_becomes_two(self):
+        self.assertEqual(self.store._db.execute("SELECT version FROM schema_meta").fetchone()[0], 2)
+        [row] = self.store.events("claude-1")
+        self.assertIsNone(row["source"])  # an event from before keeps no source
+        self.assertIsNotNone(self.store.append_event("claude-1", "agent_text", b"{}", source="text:x"))
+        self.assertIsNone(self.store.append_event("claude-1", "agent_text", b"{}", source="text:x"))
+        self.store.close()
+        self.store = HostStore(self.path)  # opening an upgraded store again changes nothing
+        self.assertEqual(len(self.store.events("claude-1")), 2)
 
 
 if __name__ == "__main__":

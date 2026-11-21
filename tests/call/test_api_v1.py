@@ -26,7 +26,8 @@ from tests.call import hostkit
 
 class FakeHost:
     def __init__(self):
-        self.delivered, self.announced = [], []
+        self.delivered, self.announced, self.marked = [], [], []
+        self.texts_kept = []
         self.reachable = {"claude-1", "a/b", "żółw"}
         self.fail_with = None
 
@@ -43,6 +44,15 @@ class FakeHost:
 
     def announce(self, words):
         self.announced.append(words)
+
+    texts_kept: list = []
+
+    def texts(self):
+        return list(self.texts_kept)
+
+    def mark_text(self, text_id, status):
+        self.marked.append((text_id, status))
+        return True
 
 
 class Base(AioHTTPTestCase):
@@ -383,6 +393,93 @@ class Devices(Base):
         self.assertTrue(again["replayed"])
         status, _ = await self.call(key, device, "POST", f"/api/v1/requests/{uuid.uuid4()}/ack")
         self.assertEqual(status, 404)
+
+
+def text(tid, session="claude-1", words="Tests pass.", at=1795000000.0, agent="claude"):
+    return {"id": tid, "agent": agent, "session": session, "words": words, "at": at, "status": "sent"}
+
+
+class Ledger(Base):
+    async def events(self, key, device, session="claude-1"):
+        status, body = await self.call(key, device, "GET", f"/api/v1/chats/{session}/events")
+        self.assertEqual(status, 200, body)
+        return body["events"]
+
+    async def test_texts_are_kept_once_however_often_ingested(self):
+        key, device = await self.enrolled()
+        self.host.texts_kept = [text("a" * 16, at=1795000010.0), text("b" * 16, words="Second.", at=1795000020.0)]
+        self.assertEqual(api_v1.ingest(self.api), 2)
+        self.assertEqual(api_v1.ingest(self.api), 0)  # a rescan
+        self.store.close()
+        self.api.store = self.store = HostStore(self.config.database)  # a restart
+        self.assertEqual(api_v1.ingest(self.api), 0)
+        events = [e for e in await self.events(key, device) if e["kind"] == "agent_text"]
+        self.assertEqual([(e["text"], e["text_id"], e["agent"]) for e in events],
+                         [("Tests pass.", "a" * 16, "claude"), ("Second.", "b" * 16, "claude")])
+        self.assertEqual(events[0]["created_at"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(1795000010)))
+
+    async def test_a_late_older_text_takes_its_place(self):
+        key, device = await self.enrolled()
+        self.host.texts_kept = [text("b" * 16, words="Later.", at=1795000020.0)]
+        api_v1.ingest(self.api)
+        self.host.texts_kept.append(text("a" * 16, words="Earlier.", at=1795000010.0))
+        api_v1.ingest(self.api)
+        self.assertEqual([e["text"] for e in await self.events(key, device)], ["Earlier.", "Later."])
+
+    async def test_records_that_are_not_texts_are_skipped(self):
+        self.host.texts_kept = [text("short"), text("c" * 16, words=""), text("d" * 16, session="bad\nid"),
+                                {**text("e" * 16), "at": "yesterday"}, {**text("f" * 16), "words": None},
+                                text("0" * 16, session="other")]
+        self.assertEqual(api_v1.ingest(self.api), 1)
+        self.assertEqual([r["session_id"] for r in self.store.events("other")], ["other"])
+
+    async def test_the_loop_ingests_as_the_server_runs(self):
+        key, device = await self.enrolled()
+        self.host.texts_kept = [text("a" * 16)]
+        for _ in range(50):  # the first pass runs at once, then every INGEST_EVERY seconds
+            if self.store.events("claude-1"):
+                break
+            await asyncio.sleep(0.05)
+        self.assertEqual(len(await self.events(key, device)), 1)
+
+    async def test_read_receipts_move_texts_forward_once(self):
+        key, device = await self.enrolled()
+        self.host.texts_kept = [text("a" * 16)]
+        api_v1.ingest(self.api)
+        status, sent = await self.call(key, device, "POST", "/api/v1/chats/claude-1/messages", self.message())
+        [agent_event] = [e for e in await self.events(key, device) if e["kind"] == "agent_text"]
+        body = {"host_id": self.config.host_id, "session_id": "claude-1", "state": "read",
+                "event_ids": [agent_event["event_id"], sent["event_id"], "no-such-event"]}
+        rid = str(uuid.uuid4())
+        status, answer = await self.call(key, device, "POST", "/api/v1/chats/claude-1/receipts", body, rid)
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(answer["marked"], [agent_event["event_id"]])
+        self.assertEqual(answer["unknown"], [sent["event_id"], "no-such-event"])  # a message isn't a text
+        self.assertEqual(self.host.marked, [("a" * 16, "read")])
+        status, again = await self.call(key, device, "POST", "/api/v1/chats/claude-1/receipts", body, rid)
+        self.assertTrue(again["replayed"])
+        self.assertEqual(len(self.host.marked), 1)
+
+    async def test_receipts_are_for_this_chat_and_host_only(self):
+        key, device = await self.enrolled()
+        self.host.texts_kept = [text("a" * 16, session="claude-2")]
+        api_v1.ingest(self.api)
+        [event] = self.store.events("claude-2")
+        good = {"host_id": self.config.host_id, "session_id": "claude-1", "state": "read", "event_ids": [event["event_id"]]}
+        status, answer = await self.call(key, device, "POST", "/api/v1/chats/claude-1/receipts", good)
+        self.assertEqual((status, answer["marked"]), (200, []))  # another chat's text
+        for bad in ({**good, "state": "seen"}, {**good, "event_ids": []}, {**good, "host_id": hostkit.OTHER_HOST_ID},
+                    {**good, "session_id": "claude-2"}):
+            status, answer = await self.call(key, device, "POST", "/api/v1/chats/claude-1/receipts", bad)
+            self.assertEqual((status, answer["error"]["code"]), (422, "validation_failed"))
+        self.assertEqual(self.host.marked, [])
+
+    async def test_old_events_are_pruned(self):
+        self.host.texts_kept = [text("a" * 16, at=time.time() - 40 * 86400), text("b" * 16, at=time.time())]
+        api_v1.ingest(self.api)
+        self.assertEqual(self.store.prune_events(time.time() - self.config.ledger_days * 86400), 1)
+        self.assertEqual([json.loads(r["body"])["text_id"] for r in self.store.events("claude-1")], ["b" * 16])
+        self.assertEqual(api_v1.ingest(self.api), 1)  # still kept by the host: back in, until it ages out there too
 
 
 class NoChat(Base):

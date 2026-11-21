@@ -16,7 +16,7 @@ from call.canonical import b64url, crockford
 from call.sqlite_backup import backup  # noqa: F401  (voice-call backup)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: host_events.source, so an ingested record is kept once
 PAIRING_LIFETIME = 5 * 60
 NONCE_LIFETIME = 10 * 60
 PAIRING_ATTEMPTS = 5
@@ -118,10 +118,19 @@ class HostStore:
                 );
             """)
             row = self._db.execute("SELECT version FROM schema_meta").fetchone()
+            version = SCHEMA_VERSION if row is None else int(row[0])
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(f"unsupported host database schema {version}")
+            # 1 -> 2: where an event came from ("text:<id>"), unique, so ingesting again never duplicates it
+            columns = {r[1] for r in self._db.execute("PRAGMA table_info(host_events)")}
+            if "source" not in columns:
+                self._db.execute("ALTER TABLE host_events ADD COLUMN source TEXT")
+            self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS host_events_source ON host_events(source) "
+                             "WHERE source IS NOT NULL")
             if row is None:
                 self._db.execute("INSERT INTO schema_meta(version) VALUES (?)", (SCHEMA_VERSION,))
-            elif int(row[0]) != SCHEMA_VERSION:
-                raise RuntimeError(f"unsupported host database schema {row[0]}")
+            elif version != SCHEMA_VERSION:
+                self._db.execute("UPDATE schema_meta SET version=?", (SCHEMA_VERSION,))
 
     @staticmethod
     def _pair_digest(nonce: str) -> bytes:
@@ -294,14 +303,25 @@ class HostStore:
                 self._db.rollback()
                 raise
 
-    def append_event(self, session_id: str, kind: str, body: bytes, now: float | None = None) -> str:
+    def append_event(self, session_id: str, kind: str, body: bytes, now: float | None = None,
+                     source: str | None = None) -> str | None:
+        """The new event's id; None when source names an event already kept (ingested before)."""
         event_id = str(uuid.uuid4())
         with self._lock, self._db:
-            self._db.execute(
-                "INSERT INTO host_events(event_id,session_id,kind,body,created_at) VALUES (?,?,?,?,?)",
-                (event_id, session_id, kind, body, time.time() if now is None else now),
-            )
-        return event_id
+            added = self._db.execute(
+                "INSERT OR IGNORE INTO host_events(event_id,session_id,kind,body,created_at,source) VALUES (?,?,?,?,?,?)",
+                (event_id, session_id, kind, body, time.time() if now is None else now, source),
+            ).rowcount
+        return event_id if added else None
+
+    def event(self, event_id: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._db.execute("SELECT * FROM host_events WHERE event_id=?", (event_id,)).fetchone()
+
+    def prune_events(self, before: float) -> int:
+        """Events older than that go: the ledger is not a second, unbounded copy of every message."""
+        with self._lock, self._db:
+            return self._db.execute("DELETE FROM host_events WHERE created_at < ?", (before,)).rowcount
 
     def events(self, session_id: str, limit: int = 50,
                after: tuple[float, str] | None = None) -> list[sqlite3.Row]:

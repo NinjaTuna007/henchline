@@ -2271,14 +2271,24 @@ async def text_status(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="expected JSON")
     if status not in ("delivered", "read"):
         raise web.HTTPBadRequest(text="status: delivered or read")
-    order = ["sent", "delivered", "read"]
     for tid in ids:
-        if not re.fullmatch(r"[0-9a-f]{16}", tid):
-            continue
-        record = read_json(TEXTS / f"{tid}.json")
-        if record and order.index(status) > order.index(record.get("status", "sent")):
-            write_json(TEXTS / f"{tid}.json", {**record, "status": status, f"{status}_at": time.time()}, private=True)
+        advance_text(tid, status)
     return web.json_response({"ok": True})
+
+
+TEXT_ORDER = ["sent", "delivered", "read"]
+
+
+def advance_text(tid: str, status: str) -> bool:
+    """A text this laptop sent, moved forward to delivered or read (never back). Whether it moved."""
+    if status not in TEXT_ORDER or not re.fullmatch(r"[0-9a-f]{16}", tid):
+        return False
+    record = read_json(TEXTS / f"{tid}.json")
+    current = record.get("status", "sent") if record else ""
+    if not record or current not in TEXT_ORDER or TEXT_ORDER.index(status) <= TEXT_ORDER.index(current):
+        return False
+    write_json(TEXTS / f"{tid}.json", {**record, "status": status, f"{status}_at": time.time()}, private=True)
+    return True
 
 
 async def texts_pending(request: web.Request) -> web.Response:
@@ -2809,6 +2819,17 @@ class LocalHost:
         listed = agents()
         return [{"session_id": a["session"], "name": a["name"], "current": a["session"] == listed["current"]}
                 for a in listed["agents"]]
+
+    def texts(self) -> list[dict]:
+        found = []
+        for path in TEXTS.glob("*.json"):
+            record = read_json(path)
+            if isinstance(record, dict):
+                found.append(record)
+        return found
+
+    def mark_text(self, text_id: str, status: str) -> bool:
+        return advance_text(text_id, status)
 
     def announce(self, words: str) -> None:
         log(HANDSFREE_LOG, words)
