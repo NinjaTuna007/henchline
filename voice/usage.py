@@ -14,6 +14,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -44,6 +45,10 @@ def _window_name(minutes) -> str:
     return "Limit"
 
 
+CLAUDE_SESSION = "Current session"  # Claude's own /usage wording, so the phone's card reads like its panel
+CLAUDE_WEEK = "Current week (all models)"
+
+
 def claude(session: str, status_dir: Path = CLAUDE_STATUS) -> dict:
     uuid = session.removeprefix("claude-")
     if not re.fullmatch(r"[0-9a-f-]{36}", uuid):
@@ -62,9 +67,9 @@ def claude(session: str, status_dir: Path = CLAUDE_STATUS) -> dict:
     cost = (status.get("cost") or {}).get("total_cost_usd")
     return {
         "model": str((status.get("model") or {}).get("display_name", "")),
-        "limits": [x for x in (_limit("5-hour session", (limits.get("five_hour") or {}).get("used_percentage"),
+        "limits": [x for x in (_limit(CLAUDE_SESSION, (limits.get("five_hour") or {}).get("used_percentage"),
                                       (limits.get("five_hour") or {}).get("resets_at")),
-                               _limit("Week", (limits.get("seven_day") or {}).get("used_percentage"),
+                               _limit(CLAUDE_WEEK, (limits.get("seven_day") or {}).get("used_percentage"),
                                       (limits.get("seven_day") or {}).get("resets_at"))) if x],
         "context": {"percent": float(used), "size": int(size or 0), "used": tokens, "parts": []}
                    if isinstance(used, (int, float)) else None,
@@ -151,8 +156,110 @@ def codex(session: str, root: Path = CODEX_SESSIONS) -> dict:
     if isinstance(size, int) and size and isinstance(used, int):
         context = {"percent": round(100 * used / size, 1), "size": size, "used": used, "parts": []}
     plan = limits.get("plan_type")
-    return {"model": "", "limits": found, "context": context,
-            "notes": [f"Plan: {plan}"] if isinstance(plan, str) and plan else []}
+    notes = [f"Plan: {plan}"] if isinstance(plan, str) and plan else []
+    if _no_credits(limits):
+        found.insert(0, {"label": "Out of credits", "percent": 100.0, "resets": 0})
+        notes.insert(0, OUT_OF_CREDITS)
+    return {"model": "", "limits": found, "context": context, "notes": notes}
+
+
+OUT_OF_CREDITS = "Out of credits: Codex can't run until the workspace is refilled"
+
+
+def _rate_lines(log: Path) -> list[dict]:
+    """Every rate_limits report in a Codex session log, oldest first, with the line's own time (0 when unknown)."""
+    found = []
+    try:
+        with log.open("rb") as f:
+            for raw in f:
+                if b'"rate_limits"' not in raw:
+                    continue
+                try:
+                    line = json.loads(raw)
+                except ValueError:
+                    continue
+                payload = line.get("payload") if isinstance(line, dict) else None
+                limits = payload.get("rate_limits") if isinstance(payload, dict) else None
+                if isinstance(limits, dict):
+                    found.append({"limits": limits, "at": _stamp(line.get("timestamp"))})
+    except OSError:
+        pass
+    return found
+
+
+def _stamp(text) -> float:
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"{max(1, seconds // 60)} min"
+    if seconds < 172800:
+        return f"{seconds // 3600} h"
+    return f"{seconds // 86400} days"
+
+
+def _windows(limits: dict, now: float | None = None) -> list[dict]:
+    """A report's windows; one whose reset time has passed since says so ("reset since") rather than a bare 0%."""
+    now = time.time() if now is None else now
+    items = []
+    for key in ("primary", "secondary"):
+        window = limits.get(key)
+        if isinstance(window, dict):
+            name = _window_name(window.get("window_minutes"))
+            resets = window.get("resets_at")
+            if isinstance(resets, (int, float)) and 0 < resets < now:  # read before that window ended: it's new now
+                if isinstance(window.get("used_percent"), (int, float)):
+                    items.append({"label": name + " (reset since)", "percent": 0.0, "resets": 0})
+                continue
+            item = _limit(name, window.get("used_percent"), resets)
+            if item:
+                items.append(item)
+    return items
+
+
+def _no_credits(limits: dict) -> bool:
+    credits = limits.get("credits")
+    return isinstance(credits, dict) and credits.get("has_credits") is False and not credits.get("unlimited")
+
+
+def codex_account(root: Path = CODEX_SESSIONS, now: float | None = None) -> dict:
+    """The Codex card for the phone's Usage tab, from the newest session logs: {limits, notes}, or {} with no report.
+    The newest report decides credits and plan; the windows come from the newest report that has them (a workspace
+    out of credits reports none), marked with their age when that isn't the newest."""
+    now = time.time() if now is None else now
+    newest = None
+    windows, windows_at = [], 0.0
+    for log in sorted(root.glob("*/*/*/rollout-*.jsonl"), key=_mtime, reverse=True)[:10]:
+        lines = _rate_lines(log)
+        if not lines:
+            continue
+        if newest is None:
+            newest = lines[-1]
+        for line in reversed(lines):
+            got = _windows(line["limits"], now)
+            if got:
+                windows, windows_at = got, line["at"] or _mtime(log)
+                break
+        if windows:
+            break
+    if newest is None:
+        return {}
+    limits, notes = [], []
+    if _no_credits(newest["limits"]):
+        limits.append({"label": "Out of credits", "percent": 100.0, "resets": 0})
+        notes.append(OUT_OF_CREDITS)
+    limits += windows
+    if windows and windows_at and newest["at"] and windows_at < newest["at"] - 60:
+        notes.append(f"Limits as last reported, {_ago(now - windows_at)} ago")
+    plan = newest["limits"].get("plan_type")
+    if isinstance(plan, str) and plan:
+        notes.append(f"Plan: {plan}")
+    return {"limits": limits, "notes": notes}
 
 
 CURSOR_ROOM = STATE / "cursor-usage"  # the hidden CLI's own folder: trusted once (--trust), nothing else in it
@@ -249,6 +356,186 @@ def _ask_cursor(wait: float) -> tuple[list[dict], list[str]]:
     return limits, notes
 
 
+# Claude's per-model weekly limits (Fable, ...) aren't in its status line: its /usage panel shows them, so a hidden
+# Claude CLI is asked, the way Cursor's is: in its own tmux server, nothing typed until its empty input box is on
+# screen, /usage read, closed. It sends nothing to the model (the panel shows $0 and no tokens). It runs in
+# Henchline's own folder, which Claude already trusts there; anywhere else its trust question appears and nothing is
+# typed. HENCHLINE_USAGE_PROBE keeps it out of Henchline's own records (claude-status.py, the call mirror hook).
+CLAUDE_ROOM = Path(__file__).resolve().parents[1]
+_claude_plan: tuple[float, list[dict]] = (0.0, [])
+_claude_lock = threading.Lock()
+TRUST_QUESTION = re.compile(r"trust this folder|Quick safety check", re.I)
+CLAUDE_BOX = re.compile(r"^❯ ?\S?", re.M)
+
+
+def parse_claude_usage(screen: str, now: datetime | None = None) -> list[dict]:
+    """Claude's /usage panel, as text: every "Current session" / "Current week" row, with its model in brackets when
+    it has one ("Current week (Fable)"), in the panel's order, labelled as the panel labels it."""
+    now = now or datetime.now()
+    found = []
+    for block in re.finditer(r"^\s*(Current (?:session|week)(?: \([^)\n]+\))?)\s*\n(?:[^\n]*\n)??[^\n]*?"
+                             r"(\d+(?:\.\d+)?)% used[^\n]*\n\s*Resets ([^\n(]+)", screen, re.M):
+        label = block.group(1).strip()
+        if label == "Current week":
+            label = CLAUDE_WEEK
+        found.append({"label": label, "percent": float(block.group(2)), "resets": _claude_reset(block.group(3), now)})
+    return found
+
+
+def _claude_reset(text: str, now: datetime) -> int:
+    """'Nov 28, 5am' or 'Nov 28, 5:30pm' (local time) to a timestamp; 0 when unreadable."""
+    hit = re.match(r"\s*([A-Z][a-z]{2})\s+(\d{1,2}),?\s*(\d{1,2})(?::(\d{2}))?\s*([ap]m)", text.strip(), re.I)
+    if not hit:
+        alone = re.match(r"\s*(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*$", text.strip(), re.I)  # "4:50am": the next one
+        if not alone:
+            return 0
+        at = now.replace(hour=int(alone.group(1)) % 12 + (12 if alone.group(3).lower() == "pm" else 0),
+                         minute=int(alone.group(2) or 0), second=0, microsecond=0)
+        if at <= now:
+            at = at.fromtimestamp(at.timestamp() + 86400)
+        return int(at.timestamp())
+    try:
+        hour = int(hit.group(3)) % 12 + (12 if hit.group(5).lower() == "pm" else 0)
+        day = datetime.strptime(f"{hit.group(1)} {hit.group(2)} {now.year}", "%b %d %Y").replace(
+            hour=hour, minute=int(hit.group(4) or 0))
+        if day < now.replace(hour=0, minute=0, second=0, microsecond=0):
+            day = day.replace(year=now.year + 1)
+        return int(day.timestamp())
+    except ValueError:
+        return 0
+
+
+CLAUDE_PROJECTS = Path.home() / ".claude/projects"
+PROBE_PARTS = re.compile(r"<command-name>/usage</command-name>|<command-message>usage</command-message>|"
+                         r"<command-args>\s*</command-args>|<local-command-std(?:out|err)>[\s\S]*?</local-command-std(?:out|err)>")
+
+
+def _probe_text(text: str) -> bool:
+    """A user turn that is nothing but the /usage command (its tags, or the bare words) and its panel."""
+    return PROBE_PARTS.sub("", text).strip() in ("", "/usage") and ("usage" in text)
+
+
+def drop_probe_log(started: float, projects: Path = CLAUDE_PROJECTS, room: Path = CLAUDE_ROOM) -> str:
+    """The hidden Claude's own session log, so probes don't pile up in `claude --resume`. Deleted only when every
+    test holds: the newest log in Henchline's folder, made after the probe started, its user turns nothing but the
+    /usage command, no model output. Otherwise nothing is deleted. Returns what happened, for the log."""
+    folder = projects / re.sub(r"[^A-Za-z0-9]", "-", str(room))
+    logs = sorted(folder.glob("*.jsonl"), key=_mtime, reverse=True) if folder.is_dir() else []
+    if not logs:
+        return "no probe log"
+    log = logs[0]
+    try:
+        with log.open() as f:  # when the log began: its first stamped line (its file times move with every write)
+            first = next((json.loads(raw) for raw in f if '"timestamp"' in raw), {})
+    except (OSError, ValueError):
+        return f"kept {log.name}: unreadable"
+    made = _stamp(first.get("timestamp")) if isinstance(first, dict) else 0.0
+    if not made or made < started - 1:
+        return "no probe log"  # the newest log is someone's chat that began before the probe: the probe left none
+    try:
+        lines = [json.loads(raw) for raw in log.read_text().splitlines() if raw.strip()]
+    except (OSError, ValueError):
+        return f"kept {log.name}: unreadable"
+    if any(isinstance(line, dict) and (line.get("type") == "assistant"
+                                       or (line.get("message") or {}).get("role") == "assistant") for line in lines):
+        return f"kept {log.name}: it has model output"
+    users = 0
+    for line in lines:
+        if isinstance(line, dict) and line.get("type") == "user":
+            content = (line.get("message") or {}).get("content")
+            texts = [content] if isinstance(content, str) else [c.get("text", "") for c in content or []
+                                                                  if isinstance(c, dict) and c.get("type") == "text"]
+            if not texts or not all(_probe_text(t) for t in texts):
+                return f"kept {log.name}: a user turn that isn't /usage"
+            users += 1
+    if not users:
+        return f"kept {log.name}: no /usage turn in it"
+    try:
+        log.unlink()
+    except OSError as e:
+        return f"kept {log.name}: {e}"
+    return f"dropped {log.name}"
+
+
+def claude_rows(status: list[dict], panel: list[dict]) -> list[dict]:
+    """The Claude card's rows in /usage's order and wording: the panel's rows, with the session and all-models week
+    taken from the status line when it has them (it's live; the panel is read every ten minutes). The status line's
+    two rows alone when the panel couldn't be read."""
+    live = {row["label"]: row for row in status}
+    if not panel:
+        return list(status)
+    rows = [live.get(row["label"], row) for row in panel]
+    shown = {row["label"] for row in rows}
+    return [row for row in status if row["label"] not in shown] + rows
+
+
+def claude_plan(wait: float = 20.0, fresh: bool = False) -> list[dict]:
+    """Claude's per-model weekly limits from its /usage panel, kept ten minutes ([] when not shown)."""
+    global _claude_plan
+    with _claude_lock:
+        if time.time() - _claude_plan[0] < (5 if fresh else PLAN_FOR if _claude_plan[1] else FAILED_FOR):
+            return _claude_plan[1]
+        found = _ask_claude(wait)
+        _claude_plan = (time.time(), found)
+        return found
+
+
+def _ask_claude(wait: float) -> list[dict]:
+    if not shutil.which("claude") or not shutil.which("tmux"):
+        return []
+    tmux = ["tmux", "-L", "henchline-claude-usage"]
+
+    def screen() -> str:
+        shown = subprocess.run([*tmux, "capture-pane", "-p", "-t", "u"], capture_output=True, text=True, timeout=5).stdout
+        return shown.replace("\xa0", " ")  # its box writes "❯" and a no-break space
+
+    def ready(shown: str) -> bool:
+        return "Claude Code" in shown and not TRUST_QUESTION.search(shown) and bool(CLAUDE_BOX.search(shown))
+
+    started = 0.0
+    try:
+        subprocess.run([*tmux, "kill-server"], capture_output=True, timeout=5)
+        from voice.desktop import tmux as desktop_tmux
+        started = time.time()
+        subprocess.run([*tmux, "new-session", "-d", "-s", "u", "-x", "160", "-y", "60", "-c", str(CLAUDE_ROOM),
+                        "-e", "HENCHLINE_USAGE_PROBE=1", *desktop_tmux.clean_env(), "claude"],
+                       capture_output=True, timeout=10, check=True)
+        until = time.monotonic() + wait
+        while not ready(screen()) and time.monotonic() < until:
+            time.sleep(0.5)
+        if not ready(screen()):  # its trust question, a login, an update: nothing is typed into it
+            return []
+        for _ in range(4):  # the box is drawn before its input takes keys: typed again only while it's still empty
+            time.sleep(1.0)
+            subprocess.run([*tmux, "send-keys", "-t", "u", "-l", "/usage"], timeout=5)
+            time.sleep(0.7)
+            box = [line for line in screen().splitlines() if line.startswith("❯")]
+            if box and box[-1].strip() == "❯ /usage":
+                break
+            if box and not box[-1].startswith("❯ Try"):  # something else in its box: nothing more is typed, no Enter
+                return []
+        else:
+            return []
+        subprocess.run([*tmux, "send-keys", "-t", "u", "Enter"], timeout=5)
+        shown = ""
+        while time.monotonic() < until:
+            shown = screen()
+            if "Current week" in shown and "Resets" in shown.split("Current week")[-1]:
+                time.sleep(0.5)
+                shown = screen()
+                break
+            time.sleep(0.5)
+        return parse_claude_usage(shown)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    finally:
+        subprocess.run([*tmux, "kill-server"], capture_output=True, timeout=5)
+        if started:
+            outcome = drop_probe_log(started)
+            if not outcome.startswith(("dropped", "no probe")):
+                print(f"usage probe: {outcome}", file=sys.stderr)
+
+
 def cursor(record: dict) -> dict:
     """From Cursor's own record of the chat (cursor_bridge.composer)."""
     if not record:
@@ -308,29 +595,11 @@ def overview(fresh: bool = False) -> list[dict]:
     if newest:
         got = claude(f"claude-{newest[0].stem}")
         if got.get("limits"):
-            found.append({"agent": "claude", "limits": got["limits"], "notes": ["From your newest Claude session"]})
-    logs = sorted(CODEX_SESSIONS.glob("*/*/*/rollout-*.jsonl"), key=_mtime, reverse=True)
-    for log in logs[:5]:
-        last = None
-        try:
-            with log.open("rb") as f:
-                for raw in f:
-                    if b'"rate_limits"' in raw:
-                        last = raw
-        except OSError:
-            continue
-        if last:
-            try:
-                payload = json.loads(last).get("payload") or {}
-            except ValueError:
-                continue
-            limits = payload.get("rate_limits") or {}
-            items = [_limit(_window_name((limits.get(k) or {}).get("window_minutes")), (limits.get(k) or {}).get("used_percent"),
-                            (limits.get(k) or {}).get("resets_at")) for k in ("primary", "secondary")]
-            plan = limits.get("plan_type")
-            found.append({"agent": "codex", "limits": [i for i in items if i],
-                          "notes": [f"Plan: {plan}"] if isinstance(plan, str) and plan else []})
-            break
+            found.append({"agent": "claude", "limits": claude_rows(got["limits"], claude_plan(fresh=fresh)),
+                          "notes": ["From your newest Claude session"]})
+    codex_card = codex_account()
+    if codex_card:
+        found.append({"agent": "codex", **codex_card})
     limits, notes = cursor_plan(fresh=fresh)
     if limits:
         found.append({"agent": "cursor", "limits": limits, "notes": notes})

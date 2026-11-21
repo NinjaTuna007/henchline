@@ -15,6 +15,8 @@ from pathlib import Path
 
 DIR = Path.home() / ".local/state/ptt/claude-status"
 
+if os.environ.get("HENCHLINE_USAGE_PROBE"):  # Henchline's hidden Claude reading its /usage: not a chat
+    sys.exit(0)
 try:
     status = json.load(sys.stdin)
 except ValueError:
