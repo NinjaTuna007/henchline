@@ -84,12 +84,12 @@ class PairingTest {
         val candidate = pairing.lookUp(pairing.origin("host-a.example.ts.net"))
         assertEquals(Canonical.fingerprint(Canonical.unb64url(hostKey)), candidate.fingerprint)
         val key = phoneKey()
-        val host = pairing.claim(candidate, "abcde-fghjk", key, "Test phone")
+        val host = pairing.claim(candidate, "abcde-fghjk", { key }, "Test phone")
         assertEquals("ABCDEFGHJK", fake.lastClaim!!.getString("nonce"))
         assertEquals("p256", fake.lastClaim!!.getString("algorithm"))
         assertEquals(listOf(hostId, deviceId, hostKey, origin, "host-a.example.ts.net"),
             listOf(host.hostId, host.deviceId, host.hostKey, host.baseUrl, host.tlsAuthority))
-        expectError("expired or was used") { pairing.claim(candidate, "ABCDEFGHJK", key, "Test phone") }
+        expectError("expired or was used") { pairing.claim(candidate, "ABCDEFGHJK", { key }, "Test phone") }
     }
 
     @Test fun aDescriptorForAnotherAddressIsRefused() {
@@ -111,18 +111,43 @@ class PairingTest {
         val candidate = pairing.lookUp(pairing.origin("host-a.example.ts.net"))
         fake.claimAnswer = { HttpAnswer(201, JSONObject().put("host_id", hostId).put("device_id", deviceId)
             .put("descriptor", descriptor(signer = other.private, key = otherKey)).toString()) }
-        expectError("isn't signed") { pairing.claim(candidate, "ABCDEFGHJK", phoneKey(), "p") }
+        expectError("isn't signed") { pairing.claim(candidate, "ABCDEFGHJK", { phoneKey() }, "p") }
         fake.claimAnswer = { HttpAnswer(201, JSONObject().put("host_id", "00000000-0000-4000-8000-000000000002")
             .put("device_id", deviceId).put("descriptor", descriptor()).toString()) }
-        expectError("doesn't match") { pairing.claim(candidate, "ABCDEFGHJK", phoneKey(), "p") }
+        expectError("doesn't match") { pairing.claim(candidate, "ABCDEFGHJK", { phoneKey() }, "p") }
     }
 
     @Test fun badCodesNeverLeaveThePhone() {
         val fake = FakeHost()
         val pairing = Pairing(fake)
         val candidate = pairing.lookUp(pairing.origin("host-a.example.ts.net"))
-        expectError("letters and digits") { pairing.claim(candidate, "AB_CD", phoneKey(), "p") }
+        var made = 0
+        expectError("letters and digits") { pairing.claim(candidate, "AB_CD", { made++; phoneKey() }, "p") }
         assertEquals(0, fake.claims)
+        assertEquals("no key is made for a code that can't be sent", 0, made)
+    }
+
+    private fun sentness(answer: () -> HttpAnswer): PairingError {
+        val fake = FakeHost()
+        val pairing = Pairing(fake)
+        val candidate = pairing.lookUp(pairing.origin("host-a.example.ts.net"))
+        fake.claimAnswer = { answer() }
+        try { pairing.claim(candidate, "ABCDEFGHJK", { phoneKey() }, "p") } catch (e: PairingError) { return e }
+        fail("paired"); throw IllegalStateException()
+    }
+
+    @Test fun aClaimThatMayHaveLandedSaysHowToRevokeIt() {
+        for (thrown in listOf(java.net.UnknownHostException("x"), java.net.ConnectException("x"))) {
+            val e = sentness { throw thrown }
+            assertFalse(e.sent); assertFalse(e.message!!.contains("voice-call devices"))
+        }
+        for (answer in listOf<() -> HttpAnswer>({ throw java.net.SocketTimeoutException("read") }, { HttpAnswer(500, "") },
+                { HttpAnswer(201, JSONObject().put("host_id", hostId).put("device_id", "nope").toString()) })) {
+            val e = sentness(answer)
+            assertTrue(e.sent); assertTrue(e.message, e.message!!.contains("voice-call devices revoke"))
+        }
+        val refused = sentness { HttpAnswer(410, """{"error":{"code":"pairing_expired"}}""") }
+        assertFalse(refused.sent)
     }
 
     private fun host() = Host(hostId, "Host A", origin, "host-a.example.ts.net", hostKey, deviceId, "{}", 1L)
@@ -153,8 +178,51 @@ class PairingTest {
     @Test fun revocationIsDoneWhenTheHostSaysSoOrAlreadyHad() {
         assertTrue(HostClient(host(), phoneKey(), { _, _, _, _ -> HttpAnswer(200, """{"host_id":"$hostId","revoked":true}""") }).revokeSelf())
         assertTrue(HostClient(host(), phoneKey(), { _, _, _, _ -> HttpAnswer(403, """{"error":{"code":"device_revoked"}}""") }).revokeSelf())
+        assertTrue(HostClient(host(), phoneKey(), { _, _, _, _ ->
+            HttpAnswer(401, """{"error":{"code":"bad_signature","reason":"unknown_device"}}""") }).revokeSelf())
+        assertFalse(HostClient(host(), phoneKey(), { _, _, _, _ ->
+            HttpAnswer(401, """{"error":{"code":"bad_signature","message":"request signature did not verify"}}""") }).revokeSelf())
         assertFalse(HostClient(host(), phoneKey(), { _, _, _, _ -> throw java.io.IOException("offline") }).revokeSelf())
         assertFalse(HostClient(host(), phoneKey(), { _, _, _, _ -> HttpAnswer(503, "") }).revokeSelf())
+    }
+
+    @Test fun aSkewedClockIsNamedWithItsSize() {
+        val client = HostClient(host(), phoneKey(), { _, _, _, _ ->
+            HttpAnswer(401, """{"error":{"code":"timestamp_out_of_window","server_time":1795000300}}""") }, clock = { 1795000000 })
+        try { client.call("GET", listOf("api", "v1", "chats")); fail() } catch (e: ClockSkew) {
+            assertEquals(300, e.seconds); assertTrue(e.message!!.contains("300 s behind Host A"))
+        }
+    }
+
+    private fun withDescriptor(d: JSONObject) = host().copy(descriptor = d.toString())
+
+    @Test fun capabilitiesComeOnlyFromTheVerifiedDescriptor() {
+        val client = HostClient(withDescriptor(descriptor()), phoneKey(), { _, _, _, _ -> fail(); HttpAnswer(0, "") })
+        assertTrue(client.offers("chat"))
+        assertFalse(client.offers("calls"))
+        assertFalse(client.offers("teleport"))
+        client.require("chat")
+        try { client.require("calls"); fail() } catch (expected: CapabilityMissing) {}
+    }
+
+    private fun refreshed(served: JSONObject, stored: JSONObject = descriptor()): Host =
+        HostClient(withDescriptor(stored), phoneKey(), { _, _, _, _ ->
+            HttpAnswer(200, JSONObject().put("host_id", hostId).put("descriptor", served).toString()) }).refresh()
+
+    private fun reseq(seq: Int, label: String = "Host A", base: String = origin): JSONObject {
+        val d = descriptor(base = base)
+        val unsigned = JSONObject(d.toString()).apply { remove("signature"); put("descriptor_seq", seq); put("label", label) }
+        val signature = Signature.getInstance("Ed25519").run { initSign(hostPair.private); update(Canonical.jcs(unsigned)); sign() }
+        return JSONObject(unsigned.toString()).put("signature", Canonical.b64url(signature))
+    }
+
+    @Test fun refreshTakesNewerSignedDescriptorsOnly() {
+        val newer = refreshed(reseq(4, "Host A, renamed", "https://host-a2.example.ts.net/"))
+        assertEquals(listOf("Host A, renamed", "https://host-a2.example.ts.net/", "host-a2.example.ts.net"),
+            listOf(newer.label, newer.baseUrl, newer.tlsAuthority))
+        try { refreshed(reseq(2)); fail("older accepted") } catch (expected: DescriptorRefused) {}
+        val other = KeyPairGenerator.getInstance("Ed25519").generateKeyPair()
+        try { refreshed(descriptor(signer = other.private)); fail("other key accepted") } catch (expected: DescriptorRefused) {}
     }
 
     @Test fun theRegistryKeepsHostsAcrossReads() {

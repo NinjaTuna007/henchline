@@ -109,7 +109,8 @@ async def authenticate(request: web.Request, config: HostConfig, store: HostStor
     loop = asyncio.get_running_loop()  # SQLite may wait on its lock: never on the event loop
     device = await loop.run_in_executor(None, store.device, device_id)
     if device is None:
-        raise ApiError(401, "bad_signature", "unknown device", request_id=request_id)
+        # reason: a phone removing this host may then forget it (nothing here trusts its key)
+        raise ApiError(401, "bad_signature", "unknown device", request_id=request_id, reason="unknown_device")
     if device.revoked_at is not None:
         raise ApiError(403, "device_revoked", "device has been revoked", request_id=request_id)
     timestamp_text = _header(request, "X-Henchline-Timestamp")

@@ -31,7 +31,10 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
     }
 
     private fun background(work: () -> Unit) = Thread {
-        try { work() } catch (e: Exception) { activity.runOnUiThread { tell("Something went wrong", e.message ?: e.javaClass.simpleName) } }
+        try { work() } catch (e: Exception) {
+            val title = if (e is ClockSkew) "Check the phone's clock" else "Something went wrong"
+            activity.runOnUiThread { tell(title, e.message ?: e.javaClass.simpleName) }
+        }
     }.start()
 
     private fun tell(title: String, words: String, then: () -> Unit = {}) {
@@ -87,8 +90,12 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
             .setPositiveButton("It matches: pair") { _, _ ->
                 val typed = code.text.toString()
                 background {
-                    val key = HostKeys.forAuthority("host", candidate.hostId)
-                    val host = try { pairing.claim(candidate, typed, key, Build.MODEL ?: "Phone") } catch (e: PairingError) {
+                    val existed = HostKeys.exists("host", candidate.hostId)  // a retry reuses the same key
+                    val host = try {
+                        pairing.claim(candidate, typed, { HostKeys.forAuthority("host", candidate.hostId) }, Build.MODEL ?: "Phone")
+                    } catch (e: PairingError) {
+                        // A key made for this try and never sent anywhere is dropped; one that may be paired is kept
+                        if (!e.sent && !existed) HostKeys.delete("host", candidate.hostId)
                         activity.runOnUiThread { tell("Not paired", e.message ?: "") }
                         return@background
                     }
@@ -107,11 +114,38 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
         val words = "${host.baseUrl}\nFingerprint ${host.fingerprint}\nThis phone there: ${host.deviceId.take(8)}" +
             if (host.revocationPending) "\n\nRemoval is pending: the computer couldn't be reached, so this phone is still " +
                 "authorized there. On the computer: voice-call devices revoke ${host.deviceId}" else ""
-        AlertDialog.Builder(activity).setTitle(host.label).setMessage(words)
+        AlertDialog.Builder(activity).setTitle(host.label).setMessage(words + "\n\n" + offers(host))
             .setPositiveButton(if (host.revocationPending) "Try again" else "Remove") { _, _ -> remove(host) }
-            .apply { if (host.revocationPending) setNeutralButton("Forget anyway") { _, _ -> forgetAnyway(host) } }
+            .apply {
+                if (host.revocationPending) setNeutralButton("Forget anyway") { _, _ -> forgetAnyway(host) }
+                else setNeutralButton("Check now") { _, _ -> check(host) }
+            }
             .setNegativeButton("Close", null)
             .show()
+    }
+
+    private fun offers(host: Host): String {
+        val client = HostClient(host, NoKey)
+        val names = listOf("chat", "calls", "files", "usage", "plans", "workflows", "delegated_agents", "notifications", "reminders")
+        val (on, off) = names.partition { client.offers(it) }
+        return "Offers: ${on.joinToString(", ").ifEmpty { "nothing yet" }}" +
+            if (off.isNotEmpty()) "\nNot yet: ${off.joinToString(", ")}" else ""
+    }
+
+    /** A signed round trip: reachable, the clock agrees, and the latest signed description saved. */
+    private fun check(host: Host) = background {
+        val words = try {
+            val fresh = HostClient(host, HostKeys.forAuthority("host", host.hostId)).refresh()
+            registry.put(fresh)
+            "Reachable, and this phone is still paired.\n\n" + offers(fresh)
+        } catch (e: ClockSkew) {
+            e.message ?: ""
+        } catch (e: DescriptorRefused) {
+            e.message ?: ""
+        } catch (e: java.io.IOException) {
+            "Couldn't reach ${host.label}: ${e.message ?: e.javaClass.simpleName}"
+        }
+        activity.runOnUiThread { onChanged(); tell(host.label, words) { show() } }
     }
 
     /** Revoke first, then forget: the key is deleted only once the computer no longer trusts it. */
@@ -143,4 +177,11 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
             .setNegativeButton("Cancel", null)
             .show()
     }
+}
+
+/** For reading a host's descriptor only: never signs. */
+private object NoKey : RequestKey {
+    override val algorithm = "p256"
+    override val publicKey = ""
+    override fun sign(message: ByteArray): ByteArray = throw IllegalStateException("not for signing")
 }

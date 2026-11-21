@@ -46,6 +46,9 @@ object HostKeys {
         return P256Key(private, public)
     }
 
+    fun exists(kind: String, id: String): Boolean =
+        KeyStore.getInstance(STORE).apply { load(null) }.containsAlias(alias(kind, id))
+
     /** Forget that key (after the host acknowledged its revocation, or the user chose to forget it anyway). */
     fun delete(kind: String, id: String) {
         KeyStore.getInstance(STORE).apply { load(null) }.deleteEntry(alias(kind, id))

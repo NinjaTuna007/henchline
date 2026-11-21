@@ -115,7 +115,7 @@ class Authenticate(AioHTTPTestCase):
 
     async def test_an_unknown_device_fails(self):
         status, body = await self.send(device="99999999-9999-4999-8999-999999999999")
-        self.assertEqual(status, 401)
+        self.assertEqual((status, body["error"]["code"], body["error"]["reason"]), (401, "bad_signature", "unknown_device"))
 
     async def test_another_devices_key_fails(self):
         status, body = await self.send(key=hostkit.ed25519_key())
