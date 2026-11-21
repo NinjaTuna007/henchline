@@ -31,12 +31,23 @@ THREADS = int(os.environ.get("TALKBACK_THREADS", "4"))  # CPU threads: 4 measure
 RATE = 24000
 PAUSE = 0.25  # seconds between sentences
 JOIN = 0.05  # seconds between the first piece of a split sentence and its rest
-# The first sentence is said in two pieces when long, so speech starts once a short piece is made: a whole sentence
-# took 2.3-2.9 s to render under load, its first 8 words about 1 s (2026-11-21). Long enough that the rest is made
-# while the first piece plays; a one-word piece ("Done:") would leave a gap after it
-FIRST_WORDS = 8  # words in the first piece when no comma or colon comes sooner
-FIRST_MIN, FIRST_MAX = 4, 10  # a comma, semicolon, colon or dash ending one of these words splits there instead
-SPLIT_FROM = 11  # sentences shorter than this (in words) are said whole
+# A clip is said in pieces, each made while the one before plays: a whole long sentence took 2.3-2.9 s to render
+# under load, and a short first sentence ("Done.") then a long one left 2-3 s of silence while the long one was made
+# (the user's catch, 2026-11-21). Pieces are cut only at punctuation (the user's call, 2026-11-22: a cut with none,
+# "between my | first and second", sounded wrong), never inside a [tag], and only when a sentence said whole would
+# not be ready in time; with no punctuation in reach the sentence is said whole and the small wait accepted
+CUTS = ",;:—–"  # a word ending in one of these may end a piece
+FIRST_MIN, FIRST_MAX = 3, 12  # the first sentence splits at punctuation ending one of these words, when long
+SPLIT_FROM = 11  # first sentences shorter than this (in words) are said whole
+PHRASE_MIN = 3  # no piece, and no rest, shorter than this (in words)
+SPEECH_CPS = 17.5  # characters of text per second of Kokoro speech (measured 2026-11-22)
+RENDER_RTF = 0.6  # render seconds per audio second the plan assumes (0.3 idle, 0.9 at load 10, measured)
+RENDER_RTF_BUSY = 0.9  # ... when the laptop is busy: the same limit hands-free's load guard uses (0.55 x cores)
+BUSY_PER_CORE = 0.55
+LOOKAHEAD = 4  # pieces made ahead of the one playing
+HOLD = 1.0  # at most this long, the first piece waits for a late second one: a pause before speaking, not in it
+EDGE = 0.035  # seconds kept beyond the first and last sound where pieces of one sentence join
+QUIET = 0.005  # below this share of the piece's peak (-46 dB) counts as quiet: soft s, f, th and breath stay
 INTROS = 16  # rendered "<Agent> here, from <where>." kept, by text and voice
 PIECE = 0.1  # seconds of audio written between checks of the mic
 VOICES = {**AGENT_VOICES, BY_HANDSFREE: "bm_george"}  # system notices: the user's "Jarvis" voice, not an agent's
@@ -47,14 +58,125 @@ PLAYER = ["pacat", "--playback", "--raw", "--format=float32le", f"--rate={RATE}"
           "--latency-msec=100", "--client-name=talkback", "--stream-name=talkback"]
 
 
+def cuts(words: list[str], lo: int = PHRASE_MIN, hi: int | None = None) -> list[int]:
+    """Where a piece may end: after a word ending in punctuation, outside a [tag], leaving PHRASE_MIN words on each
+    side. Returned as word counts (cut after that many words), within lo..hi."""
+    found, depth = [], 0
+    hi = len(words) - PHRASE_MIN if hi is None else min(hi, len(words) - PHRASE_MIN)
+    for i, word in enumerate(words):
+        depth += word.count("[") - word.count("]")
+        if lo <= i + 1 <= hi and depth <= 0 and word.rstrip("]")[-1:] in CUTS and not word.endswith("]"):
+            found.append(i + 1)
+    return found
+
+
 def first_piece(sentence: str) -> tuple[str, str]:
-    """A long first sentence in two: (head, rest); rest is "" when it is said whole."""
+    """A long first sentence in two at its first punctuation in reach: (head, rest); rest is "" when said whole."""
     words = sentence.split()
     if len(words) < SPLIT_FROM:
         return sentence, ""
-    cut = next((i + 1 for i in range(FIRST_MIN - 1, min(FIRST_MAX, len(words) - 3))
-                if words[i][-1] in ",;:—"), FIRST_WORDS)
-    return " ".join(words[:cut]), " ".join(words[cut:])
+    found = cuts(words, FIRST_MIN, FIRST_MAX)
+    if not found:
+        return sentence, ""
+    return " ".join(words[:found[0]]), " ".join(words[found[0]:])
+
+
+def speech(text: str) -> float:
+    """Seconds of speech a piece of text makes, about."""
+    return len(text) / SPEECH_CPS
+
+
+class Plan:
+    """The pieces of a clip, which go straight on the piece before (same sentence), and each piece's sentence."""
+
+    def __init__(self, rtf: float = RENDER_RTF) -> None:
+        self.rtf = rtf  # render seconds per audio second assumed
+        self.pieces: list[str] = []
+        self.joined: set[int] = set()
+        self.sentence: list[int] = []  # each piece's sentence in the clip (-1: the intro)
+        self.late: set[int] = set()  # pieces with no punctuation to cut at, expected after the audio ahead runs out
+        self.made = 0.0  # when the pieces so far are made, from the start (seconds, estimated)
+        self.ends = 0.0  # when the audio of the pieces so far has been said
+
+    def add(self, text: str, sentence: int, joined: bool) -> None:
+        if joined:
+            self.joined.add(len(self.pieces))
+        gap = 0.0 if not self.pieces else (JOIN if joined else PAUSE)
+        self.made += self.rtf * speech(text)
+        self.ends = max(self.ends + gap, self.made) + speech(text)
+        self.pieces.append(text)
+        self.sentence.append(sentence)
+
+    def left(self, spoken: int, sentences: list[str]) -> list[str]:
+        """What to say again after a cut during piece `spoken`: from the start of its sentence, as the clip's own
+        sentences (pieces saved as sentences would get full pauses between them); a cut intro is not kept."""
+        at = self.sentence[spoken] if spoken < len(self.pieces) else len(sentences)
+        return sentences[max(at, 0):]
+
+    def ready_in_time(self, text: str, joined: bool) -> bool:
+        gap = JOIN if joined else PAUSE
+        return not self.pieces or self.made + self.rtf * speech(text) <= self.ends + gap
+
+
+def render_rtf() -> float:
+    """The render speed to plan with: slower when the laptop is busy (1-minute load over 0.55 x cores)."""
+    try:
+        busy = os.getloadavg()[0] > BUSY_PER_CORE * (os.cpu_count() or 1)
+    except OSError:
+        busy = False
+    return RENDER_RTF_BUSY if busy else RENDER_RTF
+
+
+def pieces(sentences: list[str], intro: str = "", rtf: float | None = None) -> Plan:
+    """The clip in the pieces it is made and said in.
+
+    The first sentence splits at its first punctuation when long (speech starts sooner); a later sentence is said
+    whole when it would be made before the audio queued ahead of it runs out, else cut at the punctuation that lets
+    the longest piece still be ready in time (the earliest one if none does). Joined with spaces the pieces are the
+    clip's words, unchanged: hands-free matches its echo on them."""
+    plan = Plan(render_rtf() if rtf is None else rtf)
+    if intro:
+        plan.add(intro, -1, False)
+    for n, sentence in enumerate(sentences):
+        if n == 0 and not intro:
+            head, rest = first_piece(sentence)
+            plan.add(head, 0, False)
+            words, first = rest.split(), False
+        else:
+            words, first = sentence.split(), True
+        while words:
+            text = " ".join(words)
+            if plan.ready_in_time(text, not first):
+                plan.add(text, n, not first)
+                break
+            found = cuts(words)
+            if not found:  # no punctuation in reach: said whole, the wait accepted
+                plan.late.add(len(plan.pieces))
+                plan.add(text, n, not first)
+                break
+            fits = [c for c in found if plan.ready_in_time(" ".join(words[:c]), not first)]
+            cut = fits[-1] if fits else found[0]
+            plan.add(" ".join(words[:cut]), n, not first)
+            words, first = words[cut:], False
+    return plan
+
+
+def trim(samples, lead: bool, tail: bool):
+    """Kokoro's own quiet lead-in and tail cut (to EDGE) where pieces of one sentence join, so JOIN is the gap heard:
+    about 40-80 ms in front and 60-210 ms behind each piece (measured 2026-11-22). Cut gently: a low threshold and
+    EDGE kept beyond the sound, so a soft consonant before a comma or a breathy start isn't shaved off."""
+    import numpy as np
+
+    if not len(samples) or not (lead or tail):
+        return samples
+    level = np.abs(samples)
+    loud = np.nonzero(level > max(float(level.max()) * QUIET, 1e-5))[0]
+    if not len(loud):
+        return samples
+    keep = int(RATE * EDGE)
+    start = max(0, loud[0] - keep) if lead else 0
+    end = min(len(samples), loud[-1] + 1 + keep) if tail else len(samples)
+    return samples[start:end]
 
 
 def fast_cores(root: Path = Path("/sys/devices/system/cpu")) -> set[int] | None:
@@ -156,32 +278,28 @@ class Voice:
             log(TALKBACK_LOG, f"{clip.agent} clip for the call, which ended: texted to the phone instead")
             return
         began = time.time()
-        sentences = list(clip.sentences)
-        head, rest = first_piece(sentences[0]) if sentences else ("", "")
-        if rest:
-            sentences[0:1] = [head, rest]
-        joined = {1} if rest else set()  # pieces said straight after the one before, as one sentence
-        intro = 0
+        intro = ""
         if clip.agent not in SYSTEM:
             last = last_speaker()
             if not last or last.session != clip.session:
-                name = clip.agent.capitalize()
-                sentences, intro = [f"{name} here, from {clip.where}."] + sentences, 1
-                joined = {n + 1 for n in joined}
+                intro = f"{clip.agent.capitalize()} here, from {clip.where}."
             Speaker(clip.session, clip.agent, clip.where, clip.tab).remember()
+        plan = pieces(list(clip.sentences), intro)
+        sentences, joined = plan.pieces, plan.joined  # joined: said straight after the piece before, one sentence
         # Once, with the words, before the clip file goes: no moment when neither says a clip is under way.
         # Hands-free checks what it hears over a clip against the words (its own echo)
         marker = Playing(path.name, clip.session, clip.agent, " ".join(sentences))
         marker.save()
         path.unlink(missing_ok=True)
         voice = clip.voice or (VOICES[clip.agent] if clip.agent in SYSTEM else chosen_voice(clip.agent))
-        ready: queue.Queue = queue.Queue(maxsize=2)
+        ready: queue.Queue = queue.Queue(maxsize=LOOKAHEAD)
         done = threading.Event()
 
         def make() -> None:
             try:
                 for n, sentence in enumerate(sentences):
-                    samples = self.render(sentence, voice, keep=n < intro)
+                    samples = trim(self.render(sentence, voice, keep=plan.sentence[n] < 0),
+                                   lead=n in joined, tail=n + 1 in joined)
                     while not done.is_set():
                         try:
                             ready.put(samples, timeout=0.2)
@@ -198,6 +316,12 @@ class Voice:
         spoken, cut, self.skip = 0, False, False
         try:
             while (samples := ready.get()) is not None:
+                if spoken == 0 and 1 in plan.late:
+                    # A short first piece and a second that can't be cut: wait for it a little before speaking
+                    # rather than stop in the middle of the reply
+                    until = time.time() + HOLD
+                    while ready.empty() and time.time() < until and not (mic_busy() or self.skip):
+                        time.sleep(0.02)
                 if spoken == 0:
                     # Waiting (behind another clip, or put back after a cut) apart from making the first piece:
                     # from the queue alone, a clip behind another looked like a 20 s render (2026-11-21)
@@ -244,8 +368,9 @@ class Voice:
         if cut and clip.agent in SYSTEM:
             log(TALKBACK_LOG, f"{clip.agent} notice cut and dropped: said later it would be out of place")
         elif cut and not self.skip:
-            # The intro, once heard, is not said again; resume from the cut sentence
-            clip.sentences = sentences[max(spoken, intro):]
+            # The intro, once heard, is not said again; resume from the start of the cut sentence, as sentences
+            # (pieces saved as sentences would be said with full pauses between them)
+            clip.sentences = plan.left(spoken, list(clip.sentences))
             clip.save(path)
             log(TALKBACK_LOG, f"{clip.agent} cut by the mic, {len(clip.sentences)} sentences kept")
 

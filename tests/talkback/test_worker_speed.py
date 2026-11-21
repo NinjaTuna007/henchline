@@ -2,8 +2,10 @@
 keeps to the fastest cores."""
 
 import importlib.util
+import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -19,25 +21,112 @@ class FirstPiece(unittest.TestCase):
     def test_a_short_sentence_is_said_whole(self):
         self.assertEqual(worker.first_piece("Done, the tests pass now."), ("Done, the tests pass now.", ""))
 
-    def test_a_long_sentence_splits_after_eight_words(self):
-        sentence = "I pushed the fix to the branch and the phone should pick it up on the next refresh"
-        head, rest = worker.first_piece(sentence)
-        self.assertEqual(head, "I pushed the fix to the branch and")
-        self.assertEqual(f"{head} {rest}", sentence)
-
-    def test_a_comma_in_reach_splits_there(self):
+    def test_a_long_sentence_splits_at_its_first_punctuation(self):
         head, rest = worker.first_piece("The tests pass and the build works, so you can try it on the phone tonight")
         self.assertEqual(head, "The tests pass and the build works,")
-        self.assertTrue(rest.startswith("so you"))
+        self.assertEqual(rest, "so you can try it on the phone tonight")
+
+    def test_without_punctuation_it_is_said_whole(self):
+        sentence = "The tests pass and the build works so you can try it on the phone tonight"
+        self.assertEqual(worker.first_piece(sentence), (sentence, ""))  # never "between my | first"
 
     def test_a_one_word_lead_does_not_split_there(self):
-        # "Done:" alone would leave a gap while the rest renders: it waits for a piece of some length
-        head, _ = worker.first_piece("Done: the tests pass and I pushed the fix to the branch for you to try")
-        self.assertEqual(len(head.split()), worker.FIRST_WORDS)
+        head, _ = worker.first_piece("Done: the tests pass and I pushed the fix to the branch, for you to try")
+        self.assertEqual(head, "Done: the tests pass and I pushed the fix to the branch,")
 
-    def test_no_split_leaves_a_tiny_rest(self):
-        head, rest = worker.first_piece("One two three four five six seven eight nine ten, eleven")
-        self.assertGreaterEqual(len(rest.split()), 3)
+
+class Pieces(unittest.TestCase):
+    def test_words_are_unchanged_when_joined(self):
+        sentences = ["Done.", "Here is a much longer second sentence, that takes a while to render; properly and fully."]
+        self.assertEqual(" ".join(worker.pieces(sentences).pieces), " ".join(sentences))  # hands-free's echo match
+
+    def test_never_cut_without_punctuation(self):
+        plan = worker.pieces(["Got it.", "Tell me if you still hear a pause between my first and second sentence."])
+        self.assertEqual(plan.pieces, ["Got it.", "Tell me if you still hear a pause between my first and second sentence."])
+        self.assertIn(1, plan.late)  # the first piece may wait for it a little: a pause before speaking, not in it
+
+    def test_a_long_sentence_after_a_short_one_is_cut_at_its_commas(self):
+        plan = worker.pieces(["Okay.", "The reviewer passed it, so I committed and pushed the change, and the phone "
+                                       "will get it on the next install."])
+        self.assertEqual(plan.pieces[1], "The reviewer passed it,")
+        for piece in plan.pieces[1:-1]:
+            self.assertIn(piece[-1], worker.CUTS)  # every cut at punctuation
+        self.assertNotIn(1, plan.joined)  # a new sentence: the normal pause
+        self.assertEqual(plan.joined, set(range(2, len(plan.pieces))))  # the rest of it: short joins
+        self.assertEqual(plan.sentence, [0] + [1] * (len(plan.pieces) - 1))
+
+    def test_whole_when_there_is_audio_enough_ahead(self):
+        first = "I looked at the logs, and the test runs on the laptop, the phone and the server without trouble."
+        plan = worker.pieces([first, "Short, but cuttable."])
+        self.assertEqual(plan.pieces[-1], "Short, but cuttable.")  # made long before the first sentence ends
+
+    def test_never_cut_inside_a_tag(self):
+        words = "Well, [clear throat] that part, the long one, is done now".split()
+        for cut in worker.cuts(words):
+            self.assertEqual(" ".join(words[:cut]).count("["), " ".join(words[:cut]).count("]"))
+        self.assertNotIn(2, worker.cuts("I think [clear throat] it works now fine".split()))
+
+    def test_the_intro_comes_first_and_is_its_own_sentence(self):
+        plan = worker.pieces(["The tests pass and the build works, so you can try it on the phone tonight."],
+                             intro="Claude here, from henchline.")
+        self.assertEqual(plan.pieces[0], "Claude here, from henchline.")
+        self.assertEqual(plan.sentence[0], -1)
+        self.assertEqual(" ".join(plan.pieces[1:]), "The tests pass and the build works, so you can try it on the phone "
+                                                     "tonight.")
+
+    def test_a_cut_resumes_from_the_start_of_its_sentence(self):
+        sentences = ["Okay.", "The reviewer passed it, so I committed and pushed the change, and the phone will get "
+                              "it on the next install.", "Tell me when."]
+        plan = worker.pieces(sentences, intro="Claude here, from henchline.")
+        mid = next(i for i, s in enumerate(plan.sentence) if s == 1 and i in plan.joined)  # a later piece of sentence 1
+        self.assertEqual(plan.left(mid, sentences), sentences[1:])  # whole sentences, not leftover pieces
+        self.assertEqual(plan.left(0, sentences), sentences)  # cut in the intro: everything again
+        self.assertEqual(plan.left(len(plan.pieces), sentences), [])
+
+    def test_empty(self):
+        self.assertEqual(worker.pieces([]).pieces, [])
+
+
+class RenderSpeed(unittest.TestCase):
+    def test_a_busy_laptop_plans_slower_renders(self):
+        cores = os.cpu_count() or 1
+        with mock.patch.object(worker.os, "getloadavg", return_value=(0.6 * cores, 0, 0)):
+            self.assertEqual(worker.render_rtf(), worker.RENDER_RTF_BUSY)
+        with mock.patch.object(worker.os, "getloadavg", return_value=(0.1 * cores, 0, 0)):
+            self.assertEqual(worker.render_rtf(), worker.RENDER_RTF)
+        with mock.patch.object(worker.os, "getloadavg", side_effect=OSError):
+            self.assertEqual(worker.render_rtf(), worker.RENDER_RTF)
+
+    def test_slower_renders_cut_sooner(self):
+        sentences = ["Sure, here it is.", "I looked into the slow start, and the first piece is rendered alone, so "
+                                          "speech starts sooner."]
+        quick, slow = worker.pieces(sentences, rtf=0.3), worker.pieces(sentences, rtf=0.9)
+        self.assertEqual(" ".join(quick.pieces), " ".join(slow.pieces))
+        self.assertGreater(len(slow.pieces), len(quick.pieces))  # a busy laptop needs the comma cut
+
+
+class Trim(unittest.TestCase):
+    def test_quiet_edges_are_cut_where_pieces_join(self):
+        rate = worker.RATE
+        quiet, loud = np.zeros(int(0.2 * rate), "<f4"), np.full(int(0.5 * rate), 0.5, "<f4")
+        samples = np.concatenate([quiet, loud, quiet])
+        both = worker.trim(samples, lead=True, tail=True)
+        self.assertAlmostEqual(len(both) / rate, 0.5 + 2 * worker.EDGE, places=2)
+        self.assertEqual(len(worker.trim(samples, lead=False, tail=False)), len(samples))  # sentence edges kept
+        only_tail = worker.trim(samples, lead=False, tail=True)
+        self.assertAlmostEqual(len(only_tail) / rate, 0.2 + 0.5 + worker.EDGE, places=2)
+
+    def test_soft_sounds_at_the_edges_are_kept(self):
+        rate = worker.RATE
+        soft = np.full(int(0.08 * rate), 0.004, "<f4")  # a soft "s" before the comma: about -42 dB of a 0.5 peak
+        samples = np.concatenate([np.zeros(int(0.2 * rate), "<f4"), np.full(int(0.5 * rate), 0.5, "<f4"), soft,
+                                  np.zeros(int(0.2 * rate), "<f4")])
+        trimmed = worker.trim(samples, lead=True, tail=True)
+        self.assertAlmostEqual(len(trimmed) / rate, 0.5 + 0.08 + 2 * worker.EDGE, places=2)
+
+    def test_silence_and_empty_are_left_alone(self):
+        self.assertEqual(len(worker.trim(np.zeros(100, "<f4"), True, True)), 100)
+        self.assertEqual(len(worker.trim(np.zeros(0, "<f4"), True, True)), 0)
 
 
 class FastCores(unittest.TestCase):
