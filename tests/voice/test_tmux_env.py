@@ -10,7 +10,7 @@ from voice.desktop import tmux
 
 class CleanEnv(unittest.TestCase):
     def test_marks_from_tmux_and_from_us_are_unset(self):
-        shown = "CURSOR_WORKSPACE_LABEL=smarc2\nHOME=/home/me\n-CURSOR_AGENT\nAGENT_TRANSCRIPTS=/x\n"
+        shown = "CURSOR_WORKSPACE_LABEL=robotproj\nHOME=/home/me\n-CURSOR_AGENT\nAGENT_TRANSCRIPTS=/x\n"
         with mock.patch.object(tmux, "out", return_value=shown), \
              mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "t", "PATH": "/usr/bin"}, clear=True):
             words = tmux.clean_env()

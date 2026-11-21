@@ -148,7 +148,7 @@ def available() -> list[str]:
 
 
 # Another agent's marks: a tmux server first started by an agent (a Cursor chat's terminal) hands them to every new
-# window, and a Claude started there introduced itself as that Cursor chat's workspace (smarc2 for sonar_rig, the
+# window, and a Claude started there introduced itself as that Cursor chat's workspace (one project for another, the
 # user's catch, 2026-11-16)
 INHERITED = re.compile(r"^(CURSOR_(?!API_KEY$)|__CURSOR|AGENT_TRANSCRIPTS$|CLAUDECODE$|CLAUDE_CODE_ENTRYPOINT$|"
                        r"CLAUDE_CODE_SESSION_ID$|CODEX_THREAD_ID$|CODEX_SANDBOX|TALKBACK_AGENT$)")

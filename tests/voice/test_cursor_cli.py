@@ -69,7 +69,7 @@ class Menu(unittest.TestCase):
         self.assertFalse(cursor_cli.SLASH.match(got))
 
     def test_a_path_stays_whole(self):
-        path = "look at /home/shekharu/henchline/voice"
+        path = "look at /home/me/henchline/voice"
         self.assertEqual(cursor_cli.disarm(path), path)
 
     def test_high_is_not_read_out_of_extra_high(self):

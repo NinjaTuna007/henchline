@@ -50,7 +50,7 @@ SENTENCES = [
     "Never mind, scratch that, let's do the Android app first.",
     "How much battery do I have left, and is the laptop on AC?",
     "Give me a minute, I'm making coffee in the kitchen.",
-    "Is Aquabase still up, and did the welcome home service fire?",
+    "Is the home server still up, and did the welcome home service fire?",
     "Read me the last three commit messages, please.",
 ]
 

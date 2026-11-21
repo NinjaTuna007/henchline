@@ -380,7 +380,7 @@ class Chains(unittest.TestCase):
         from voice.state import renamed
         chain = chains.open("boss")
         chains.append(chain, "launch", parent="boss", pane="%1", pid=5, depth=2, agent="cursor", where="workproj")
-        folder_key = "cursor-_home_shekharu_workproj"
+        folder_key = "cursor-_home_me_workproj"
         chat = "cursor-22222222-2222-2222-2222-222222222222"
         chains.append(chain, "correction", session=folder_key, text="use the lock", pane="%1", pid=5)
         renamed(folder_key, chat)
@@ -391,9 +391,9 @@ class Chains(unittest.TestCase):
 
     def test_a_renamed_boss_keeps_the_same_job_and_strip(self):
         from voice.state import renamed
-        old = "cursor-_home_shekharu_henchline"
+        old = "cursor-_home_me_henchline"
         new = "cursor-22222222-2222-2222-2222-222222222222"
-        child_old = "claude-_home_shekharu_henchline"
+        child_old = "claude-_home_me_henchline"
         child_new = "claude-33333333-3333-3333-3333-333333333333"
         chain = chains.open(old)
         chains.append(chain, "launch", parent=old, session=child_old, pane="%1", pid=5, depth=2,
@@ -412,7 +412,7 @@ class Chains(unittest.TestCase):
 
     def test_reports_and_final_hand_up_follow_a_renamed_boss(self):
         from voice.state import renamed
-        old = "cursor-_home_shekharu_henchline"
+        old = "cursor-_home_me_henchline"
         new = "cursor-22222222-2222-2222-2222-222222222222"
         chain = chains.open(old)
         chains.append(chain, "launch", parent=old, session="child", pane="%1", pid=5, depth=2,
@@ -437,7 +437,7 @@ class Chains(unittest.TestCase):
 
     def test_a_stale_renamed_child_can_still_be_ended_by_its_current_key(self):
         from voice.state import renamed
-        old = "claude-_home_shekharu_henchline"
+        old = "claude-_home_me_henchline"
         new = "claude-33333333-3333-3333-3333-333333333333"
         chain = chains.open("boss")
         chains.append(chain, "launch", parent="boss", session=old, pane="%1", pid=5, depth=2,

@@ -17,28 +17,28 @@ class WindowByTitle(unittest.TestCase):
     """Cursor's debug targets are picked by window title, as its X11 windows are: exactly one, or none."""
 
     def test_the_workspace_window(self):
-        with listing("Cursor", "Cursor Settings - smarc2 - Cursor"):
-            self.assertEqual(cursor_cdp.page_of("smarc2"), "ws://127.0.0.1/1")
+        with listing("Cursor", "Cursor Settings - robotproj - Cursor"):
+            self.assertEqual(cursor_cdp.page_of("robotproj"), "ws://127.0.0.1/1")
 
     def test_bare_title(self):
-        with listing("smarc2 - Cursor"):
-            self.assertEqual(cursor_cdp.page_of("smarc2"), "ws://127.0.0.1/0")
+        with listing("robotproj - Cursor"):
+            self.assertEqual(cursor_cdp.page_of("robotproj"), "ws://127.0.0.1/0")
 
     def test_not_a_suffix_of_another_name(self):
-        with listing("x - notsmarc2 - Cursor"):
-            self.assertEqual(cursor_cdp.page_of("smarc2"), "")
+        with listing("x - notrobotproj - Cursor"):
+            self.assertEqual(cursor_cdp.page_of("robotproj"), "")
 
     def test_two_windows_is_none(self):
-        with listing("a - smarc2 - Cursor", "b - smarc2 - Cursor"):
-            self.assertEqual(cursor_cdp.page_of("smarc2"), "")
+        with listing("a - robotproj - Cursor", "b - robotproj - Cursor"):
+            self.assertEqual(cursor_cdp.page_of("robotproj"), "")
 
     def test_workers_are_not_windows(self):
-        with listing("smarc2 - Cursor", kind="worker"):
-            self.assertEqual(cursor_cdp.page_of("smarc2"), "")
+        with listing("robotproj - Cursor", kind="worker"):
+            self.assertEqual(cursor_cdp.page_of("robotproj"), "")
 
     def test_no_port(self):
         with mock.patch("urllib.request.urlopen", side_effect=OSError("refused")):
-            self.assertFalse(cursor_cdp.available("smarc2"))
+            self.assertFalse(cursor_cdp.available("robotproj"))
 
 
 class SameWords(unittest.TestCase):
@@ -56,11 +56,11 @@ class SameWords(unittest.TestCase):
 
 class Refusals(unittest.TestCase):
     def test_not_a_chat_id(self):
-        self.assertEqual(cursor_cdp.send("smarc2", "x'] ; alert(1)", "hi"), "not a chat id")
+        self.assertEqual(cursor_cdp.send("robotproj", "x'] ; alert(1)", "hi"), "not a chat id")
 
     def test_no_window(self):
         with mock.patch.object(cursor_cdp, "page_of", return_value=""):
-            self.assertIn("debugging port", cursor_cdp.send("smarc2", CHAT, "hi"))
+            self.assertIn("debugging port", cursor_cdp.send("robotproj", CHAT, "hi"))
 
     def test_selector_holds_only_the_id(self):
         self.assertIn(f'[data-composer-id="{CHAT}"]', cursor_cdp._box(CHAT))

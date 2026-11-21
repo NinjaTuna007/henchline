@@ -8,8 +8,8 @@ class ProjectNames(unittest.TestCase):
     show up as a refused delivery, so these pin the assumption."""
 
     def test_dashed_path(self):
-        self.assertEqual(cursor_bridge.project_of("/home/shekharu/colcon_ws/src/smarc2"),
-                         "home-shekharu-colcon-ws-src-smarc2")
+        self.assertEqual(cursor_bridge.project_of("/home/me/ws/src/robot"),
+                         "home-me-ws-src-robot")
 
     def test_dots_and_doubled_separators(self):
         self.assertEqual(cursor_bridge.project_of("//home/u/my.project__x/"), "home-u-my-project-x")
@@ -17,7 +17,7 @@ class ProjectNames(unittest.TestCase):
     def test_chat_of(self):
         chat = "1e6e96a3-90f8-476a-9fe9-d2be71fc2053"
         self.assertEqual(cursor_bridge.chat_of("cursor-" + chat), chat)
-        self.assertEqual(cursor_bridge.chat_of("cursor-_smarc2"), "")
+        self.assertEqual(cursor_bridge.chat_of("cursor-_robotproj"), "")
 
 
 class DeadWindow(unittest.TestCase):
@@ -26,11 +26,11 @@ class DeadWindow(unittest.TestCase):
         from pathlib import Path
         from unittest.mock import patch
         folder = Path(tempfile.mkdtemp())
-        (folder / "1.json").write_text('{"pid": 5, "folders": ["/home/shekharu/colcon_ws/src/smarc2"]}')
-        (folder / "2.json").write_text('{"pid": 9, "folders": ["/home/shekharu/colcon_ws/src/smarc2"]}')
+        (folder / "1.json").write_text('{"pid": 5, "folders": ["/home/me/ws/src/robot"]}')
+        (folder / "2.json").write_text('{"pid": 9, "folders": ["/home/me/ws/src/robot"]}')
         (folder / "2.sock").write_bytes(b"")
         with patch.object(cursor_bridge, "DIR", folder), patch.object(cursor_bridge, "pid_alive", lambda pid: pid == 5):
-            found = cursor_bridge.windows_of("home-shekharu-colcon-ws-src-smarc2")
+            found = cursor_bridge.windows_of("home-me-ws-src-robot")
         self.assertEqual([note.name for note, _ in found], ["1.json"])
         self.assertFalse((folder / "2.json").exists())
         self.assertFalse((folder / "2.sock").exists())
