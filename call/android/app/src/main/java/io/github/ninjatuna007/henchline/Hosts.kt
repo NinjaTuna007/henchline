@@ -32,23 +32,53 @@ data class Host(
     }
 }
 
-/** The paired computers, in one small file written whole (temp file, then rename). Order: as paired. */
+/** The paired computers, in one small file written whole (temp file, then rename). Order: as paired. Every read
+ *  and write holds one lock for the whole process (instances are made per use), so no write is lost to another. */
 class HostRegistry(private val file: File) {
-    @Synchronized
-    fun all(): List<Host> = try {
-        val array = JSONArray(file.readText())
-        (0 until array.length()).map { Host.fromJson(array.getJSONObject(it)) }
-    } catch (e: java.io.FileNotFoundException) {
-        emptyList()
+    fun all(): List<Host> = synchronized(LOCK) {
+        try {
+            val array = JSONArray(file.readText())
+            (0 until array.length()).map { Host.fromJson(array.getJSONObject(it)) }
+        } catch (e: java.io.FileNotFoundException) {
+            emptyList()
+        }
     }
 
     fun get(hostId: String): Host? = all().firstOrNull { it.hostId == hostId }
 
-    @Synchronized
-    fun put(host: Host) = write(all().filter { it.hostId != host.hostId } + host)
+    fun put(host: Host) = synchronized(LOCK) { write(all().filter { it.hostId != host.hostId } + host) }
 
-    @Synchronized
-    fun remove(hostId: String) = write(all().filter { it.hostId != hostId })
+    /** A background look's result, kept only if it still applies: the same pairing (key, device, when paired: not
+     *  removed and paired again meanwhile), not being removed, and no older a description than the one kept (Check
+     *  now may have saved a newer one meanwhile). True when kept; otherwise nothing is written. */
+    fun replace(host: Host): Boolean = synchronized(LOCK) {
+        val now = all()
+        val kept = now.firstOrNull { it.hostId == host.hostId } ?: return false
+        if (kept.revocationPending || kept.hostKey != host.hostKey || kept.deviceId != host.deviceId ||
+            kept.pairedAt != host.pairedAt || seq(host) < seq(kept)) return false
+        // The same number with other content is not a newer description (the client refuses one too)
+        if (seq(host) == seq(kept) && !sameDescription(host, kept)) return false
+        write(now.map { if (it.hostId == host.hostId) host else it })
+        true
+    }
+
+    /** A change to a computer as it is stored now (not to a copy read earlier): the result, or null when it isn't
+     *  paired (nothing written). */
+    fun update(hostId: String, change: (Host) -> Host): Host? = synchronized(LOCK) {
+        val now = all()
+        val kept = now.firstOrNull { it.hostId == hostId } ?: return null
+        val changed = change(kept)
+        write(now.map { if (it.hostId == hostId) changed else it })
+        changed
+    }
+
+    fun remove(hostId: String) = synchronized(LOCK) { write(all().filter { it.hostId != hostId }) }
+
+    private fun sameDescription(a: Host, b: Host): Boolean = try {
+        Canonical.jcs(org.json.JSONObject(a.descriptor)).contentEquals(Canonical.jcs(org.json.JSONObject(b.descriptor)))
+    } catch (e: Exception) { a.descriptor == b.descriptor }
+
+    private fun seq(host: Host): Long = try { org.json.JSONObject(host.descriptor).optLong("descriptor_seq", 0) } catch (e: Exception) { 0 }
 
     private fun write(hosts: List<Host>) {
         val temp = File(file.parentFile, "${file.name}.tmp")
@@ -57,6 +87,8 @@ class HostRegistry(private val file: File) {
     }
 
     companion object {
+        private val LOCK = Any()
+
         fun of(context: Context) = HostRegistry(File(context.filesDir, "hosts.json"))
     }
 }

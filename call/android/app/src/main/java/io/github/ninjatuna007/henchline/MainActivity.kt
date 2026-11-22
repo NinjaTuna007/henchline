@@ -491,6 +491,7 @@ class MainActivity : Activity() {
         lifecycleSeen = true
         CallService.Bus.listener = { message -> main.post { fromServer(message) } }
         RingService.share(this)  // where texts reach this app: the laptop kept an old address after a reinstall
+        HostRefresh.soon(this)  // multi-host: paired computers' descriptions, when due
         main.removeCallbacks(textsPoll); main.post(textsPoll)
         refreshAway()  // the laptop may have changed Away while the app was in the background
         if (Outbox.all(this).isNotEmpty()) {  // messages that waited: now, maybe, and on any change of network

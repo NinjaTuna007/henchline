@@ -46,6 +46,16 @@ object HostKeys {
         return P256Key(private, public)
     }
 
+    /** That key if this phone has it, else null: never makes one (for looking again at a computer already paired). */
+    @Synchronized
+    fun load(kind: String, id: String): RequestKey? {
+        val alias = alias(kind, id)
+        val store = KeyStore.getInstance(STORE).apply { load(null) }
+        val private = store.getKey(alias, null) as? PrivateKey ?: return null
+        val public = store.getCertificate(alias)?.publicKey?.encoded ?: return null
+        return P256Key(private, public)
+    }
+
     fun exists(kind: String, id: String): Boolean =
         KeyStore.getInstance(STORE).apply { load(null) }.containsAlias(alias(kind, id))
 

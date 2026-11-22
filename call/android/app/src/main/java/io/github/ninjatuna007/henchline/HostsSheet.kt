@@ -100,6 +100,7 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
                         return@background
                     }
                     registry.put(host)
+                    HostRefresh.reset(activity, host.hostId)  // paired again under an old id: not its old schedule
                     HostPush.share(activity)  // its agents' texts and rings can reach this phone
                     activity.runOnUiThread {
                         onChanged()
@@ -178,10 +179,15 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
     /** A signed round trip: reachable, the clock agrees, and the latest signed description saved. */
     private fun check(host: Host): Unit = background {
         val words = try {
-            val fresh = HostClient(host, HostKeys.forAuthority("host", host.hostId)).refresh()
-            registry.put(fresh)
-            HostPush.share(activity)  // it may take signed requests now
-            "Reachable, and this phone is still paired.\n\n" + offers(fresh)
+            var fresh = host
+            when (HostRefresh.look(host, registry, { HostKeys.load("host", it.hostId) }) { h, key -> HostClient(h, key).refresh().also { fresh = it } }) {
+                HostRefresh.Look.NO_KEY -> "This phone no longer has its key for ${host.label}: remove it and pair again."
+                HostRefresh.Look.STALE -> "${host.label} changed on this phone meanwhile (removed, paired again or checked): nothing saved."
+                else -> {
+                    HostPush.share(activity)  // it may take signed requests now
+                    "Reachable, and this phone is still paired.\n\n" + offers(fresh)
+                }
+            }
         } catch (e: ClockSkew) {
             e.message ?: ""
         } catch (e: DescriptorRefused) {
@@ -199,7 +205,7 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
             HostKeys.delete("host", host.hostId)
             registry.remove(host.hostId)
         } else {
-            registry.put(host.copy(revocationPending = true))
+            registry.update(host.hostId) { it.copy(revocationPending = true) }  // as stored now, not this older copy
         }
         activity.runOnUiThread {
             onChanged()
