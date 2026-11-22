@@ -180,6 +180,9 @@ class Devices:
 
 
 
+TTS_CHANGED = threading.Event()  # the phone just offered or dropped its voice: the call's speaker loop re-reads at once
+
+
 def silent_while_phone_speaks(data: bytes, phone_renders: bool) -> bool:
     """A chunk of the speaker monitor that is all zeros, while the phone speaks talkback itself: not sent, so the
     phone's queue isn't kept full of the laptop's silence (2026-11-22: the phone voice stalled after one piece)."""
@@ -196,6 +199,8 @@ class Ear:
         self.clip = ""  # the clip playing at the last report
         self.said = ""  # the last trouble logged: said once, not every 2 s
         self.flushed_at = 0.0  # the phone was told to drop its queued talkback (the user cut in)
+        self.clip_loud = 0  # loud ms the phone played during the clip now playing
+        self.output = ""  # where the phone's speaker plays and at what volume, as last logged
 
     def flushed(self) -> None:
         """The phone dropped what it had queued: its next report's quiet is that, not sound lost."""
@@ -203,8 +208,17 @@ class Ear:
 
     def report(self, stats: dict) -> None:
         self.loud_ms += stats.get("loud_ms", 0)
+        output = f"{stats.get('route', '?')}, volume {stats.get('volume', '?')}/{stats.get('volume_max', '?')}"
+        if "route" in stats and output != self.output:  # a clip lost after the speaker loop shows up here
+            log(HANDSFREE_LOG, f"call: the phone plays to {output}")
+            self.output = output
         playing = Playing.now()
         clip, self.clip = self.clip, playing.clip if playing else ""
+        if clip and clip != self.clip:  # a clip ended (or the next began): how much of it the phone played aloud
+            log(HANDSFREE_LOG, f"call: clip {clip}: the phone played {self.clip_loud} ms out loud")
+            self.clip_loud = 0
+        if self.clip:
+            self.clip_loud += stats.get("loud_ms", 0)
         # Judged only once the same clip was playing a report ago: its first seconds are still being
         # rendered, silent on the laptop too (every "silent" span of the first test call, 2026-11-15)
         if not playing or playing.clip != clip:
@@ -382,6 +396,7 @@ async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None) ->
     """The talk button held or let go, a switch, or a typed chat message; a note for the page, if any."""
     if "tts" in message:  # the phone can speak talkback itself, or can't keep up any more (voice/phonevoice.py)
         await asyncio.get_running_loop().run_in_executor(None, phonevoice.offer, message)
+        TTS_CHANGED.set()  # the speaker loop's cached "the phone renders" is stale now (a fallback's first second)
         log(HANDSFREE_LOG, f"call: the phone {'renders talkback' if phonevoice.phone_renders() else 'leaves talkback to the laptop'}"
                            f"{' (' + str(message.get('reason'))[:120] + ')' if message.get('reason') else ''}")
         return ""
@@ -2459,7 +2474,8 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                 data = await speaker.stdout.read(CHUNK)
                 if not data:
                     return
-                if time.monotonic() - asked > 0.5:
+                if TTS_CHANGED.is_set() or time.monotonic() - asked > 0.5:
+                    TTS_CHANGED.clear()
                     renders, asked = phonevoice.phone_renders(), time.monotonic()
                 if silent_while_phone_speaks(data, renders):
                     continue  # the idle monitor: it would only queue silence ahead of the phone's own voice

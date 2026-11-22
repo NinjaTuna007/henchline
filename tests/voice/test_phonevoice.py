@@ -35,6 +35,31 @@ class Offer(unittest.TestCase):
         self.assertEqual(phonevoice.outgoing(), [])
 
 
+class RenderSpeed(unittest.TestCase):
+    """The phone's measured render speed sets how small the laptop cuts its pieces (2026-11-22: 0.94-1.55 in a call)."""
+
+    def tearDown(self):
+        phonevoice.call_over()
+
+    def test_without_a_measure_the_default(self):
+        self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
+        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
+
+    def test_the_offer_and_acks_carry_it_with_a_margin(self):
+        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION, "rtf": 1.2}})
+        self.assertAlmostEqual(phonevoice.plan_rtf(), 1.44)
+        phonevoice.send("c1", "claude", "af_heart", 3, ["Hello."], set(), [0])
+        phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 0.5}})
+        self.assertEqual(phonevoice.plan_rtf(), 0.9)  # never planned faster than 0.9
+
+    def test_nonsense_is_ignored(self):
+        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION, "rtf": "fast"}})
+        self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
+        phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 99}})
+        self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
+
+
 class Clips(unittest.TestCase):
     def tearDown(self):
         phonevoice.call_over()

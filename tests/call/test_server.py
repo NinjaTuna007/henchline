@@ -196,6 +196,24 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class EarLogsWhereAndHowMuch(unittest.TestCase):
+    """Audio lost after the phone's speaker loop: its route and volume, and each clip's loud total, are logged."""
+
+    def test_route_once_and_a_clip_total_when_it_ends(self):
+        ear = server.Ear()
+        lines = []
+        playing = [server.Playing("c1", "claude-x", "claude", "Hi there.")]
+        with mock.patch.object(server, "log", lambda _f, line: lines.append(line)), \
+             mock.patch.object(server.Playing, "now", classmethod(lambda cls: playing[0])):
+            ear.report({"loud_ms": 900, "route": "speaker", "volume": 7, "volume_max": 15})
+            ear.report({"loud_ms": 1100, "route": "speaker", "volume": 7, "volume_max": 15})
+            playing[0] = None
+            ear.report({"loud_ms": 0, "route": "bluetooth (call)", "volume": 3, "volume_max": 15})
+        self.assertEqual(sum("plays to speaker, volume 7/15" in line for line in lines), 1)
+        self.assertTrue(any("plays to bluetooth (call), volume 3/15" in line for line in lines))
+        self.assertIn("call: clip c1: the phone played 2000 ms out loud", lines)
+
+
 class SilentWhilePhoneSpeaks(unittest.TestCase):
     """The speaker monitor's idle silence isn't sent while the phone speaks talkback itself (2026-11-22 stall)."""
 

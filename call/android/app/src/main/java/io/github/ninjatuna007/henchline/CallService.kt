@@ -761,7 +761,27 @@ class CallService : Service() {
         socket?.send(org.json.JSONObject().put("stats", org.json.JSONObject()
             .put("got", got.getAndSet(0)).put("dropped", dropped.getAndSet(0)).put("loud_ms", loudMs.getAndSet(0))
             .put("audio", if (track.playState == AudioTrack.PLAYSTATE_PLAYING) "running" else "stopped")
-            .put("hidden", !screenOn)).toString())
+            .put("hidden", !screenOn)
+            // Where the sound goes and how loud: audio lost after the speaker loop (a route, a muted stream) shows here
+            .put("route", routeName(track.routedDevice?.type))
+            .put("volume", audio.getStreamVolume(streamOf(track)))
+            .put("volume_max", audio.getStreamMaxVolume(streamOf(track)))).toString())
+    }
+
+    private fun streamOf(track: AudioTrack): Int =
+        if (track.audioAttributes.usage == android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION) AudioManager.STREAM_VOICE_CALL
+        else AudioManager.STREAM_MUSIC
+
+    private fun routeName(type: Int?): String = when (type) {
+        null -> "none"
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "speaker"
+        AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "earpiece"
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "bluetooth (call)"
+        AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "bluetooth (media)"
+        AudioDeviceInfo.TYPE_BLE_HEADSET -> "bluetooth LE"
+        AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "wired"
+        AudioDeviceInfo.TYPE_USB_HEADSET -> "usb"
+        else -> "device $type"
     }
 
     /** The call ended: its length in the history, and a line in the chat it ended on, as a messaging app shows one. */

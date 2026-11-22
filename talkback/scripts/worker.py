@@ -441,7 +441,7 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
     """A clip spoken by the phone (voice/phonevoice.py): the laptop cuts it into pieces as it would for itself, at the
     phone's own render speed, sends the words, and follows the phone's acks for the echo check and for a cut. If the
     phone falls back (behind, hot, low battery), what's left goes back to the spool and the laptop says it."""
-    plan = pieces(list(clip.sentences), intro, rtf=phonevoice.PHONE_RTF)
+    plan = pieces(list(clip.sentences), intro, rtf=phonevoice.plan_rtf())
     name = clip.voice or (VOICES[clip.agent] if clip.agent in SYSTEM else chosen_voice(clip.agent))
     sid = phonevoice.voice_id(name)
     if sid is None:  # a voice the shared file lacks: said by the laptop

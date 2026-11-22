@@ -30,7 +30,7 @@ object PhoneVoice {
     const val ENGINE = "sherpa-kokoro"
     private const val PREF = "phone_voice"  // the user's switch: speak on the phone
     private const val PREF_MOBILE = "phone_voice_mobile"  // download over mobile data too
-    private const val THREADS = 4  // measured best on this phone (RTF 0.68; 2 threads 0.92, 6 no better)
+    private const val FALLBACK_THREADS = 4  // when the phone's core speeds can't be read
     const val RATE = 24000
     private const val PAUSE = 0.25f  // as the laptop's talkback (talkback/scripts/worker.py): between sentences
     private const val JOIN = 0.05f  // between pieces of one sentence
@@ -38,7 +38,10 @@ object PhoneVoice {
     private const val QUIET = 0.005f  // below this share of the piece's peak counts as quiet
     private const val CHUNK = RATE / 50  // 20 ms, as the laptop streams
     private const val AHEAD_CHUNKS = 25  // at most half a second queued at the speaker: a cut stops it soon
-    private const val STARVED_MS = 1000L  // the speaker ran dry this long waiting for a piece: the phone falls back
+    private const val STARVED_MS = 1000L  // the speaker ran dry this long waiting for a piece: a starve
+    private const val STARVED_EARLY_MS = 2500L  // … within a clip's first 2 pieces or 5 s (the engine warming up)
+    private const val STARVES = 2  // starves in one clip before the phone falls back (one is waited out)
+    private const val SPEECH_CPS = 17.5f  // characters of text per second of speech, as the laptop estimates
     private const val LOW_BATTERY = 15
 
     fun enabled(context: Context) = prefs(context).getBoolean(PREF, false)
@@ -147,6 +150,27 @@ object PhoneVoice {
 
     // --- the engine -----------------------------------------------------------------------------------------
 
+    /** Threads for the engine: the phone's fastest cores (the top two clock tiers; ONNX waits for its slowest
+     *  thread, so a slow core holds every render back), else FALLBACK_THREADS. */
+    val threads: Int by lazy {
+        try {
+            val speeds = (0 until 16).mapNotNull { File("/sys/devices/system/cpu/cpu$it/cpufreq/cpuinfo_max_freq")
+                .takeIf { f -> f.canRead() }?.readText()?.trim()?.toLongOrNull() }
+            val tiers = speeds.distinct().sortedDescending().take(2)
+            speeds.count { it in tiers }.takeIf { it in 2..8 && it < speeds.size } ?: FALLBACK_THREADS
+        } catch (_: Exception) { FALLBACK_THREADS }
+    }
+
+    /** Running render speed on this phone (render s per audio s), told to the laptop so it cuts pieces to fit. */
+    @Volatile var rtf = 0f
+        private set
+
+    private fun measured(renderMs: Long, samples: Int) {
+        if (samples <= 0) return
+        val now = renderMs / 1000f / (samples.toFloat() / RATE)
+        rtf = if (rtf == 0f) now else rtf * 0.7f + now * 0.3f
+    }
+
     @Volatile private var tts: com.k2fsa.sherpa.onnx.OfflineTts? = null
     private val loadLock = Any()
 
@@ -154,14 +178,22 @@ object PhoneVoice {
     fun load(context: Context): Boolean = synchronized(loadLock) {
         if (tts != null) return true
         if (!ready(context)) return false
+        // ONNX's worker threads are made here and take this thread's priority: audio priority, a step under the call's mic and speaker so its network threads keep up
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
         val folder = dir(context).absolutePath
         return try {
             val kokoro = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
                 model = "$folder/model.onnx", voices = "$folder/voices.bin", tokens = "$folder/tokens.txt",
                 lexicon = "$folder/lexicon-us-en.txt", lang = "en-us")
             val config = com.k2fsa.sherpa.onnx.OfflineTtsConfig(
-                model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(kokoro = kokoro, numThreads = THREADS, provider = "cpu"))
-            tts = com.k2fsa.sherpa.onnx.OfflineTts(null, config)
+                model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(kokoro = kokoro, numThreads = threads, provider = "cpu"))
+            val engine = com.k2fsa.sherpa.onnx.OfflineTts(null, config)
+            // A first render is slow (1.55 vs about 1.0 later, 2026-11-22): done here, not on the first reply
+            val began = System.currentTimeMillis()
+            val warm = engine.generate("Hi.", 3, 1.0f).samples
+            measured(System.currentTimeMillis() - began, warm.size)
+            log("loaded with $threads threads, warm-up rtf ${"%.2f".format(rtf)}")
+            tts = engine
             true
         } catch (e: Throwable) {
             android.util.Log.w("Henchline", "phone voice: couldn't load the model: $e")
@@ -173,7 +205,8 @@ object PhoneVoice {
 
     /** What the phone tells the laptop on connecting: it can speak talkback (only when switched on and here). */
     fun offer(context: Context): JSONObject? =
-        if (enabled(context) && ready(context)) JSONObject().put("tts", JSONObject().put("engine", ENGINE).put("model", MODEL))
+        if (enabled(context) && ready(context)) JSONObject().put("tts", JSONObject().put("engine", ENGINE).put("model", MODEL)
+            .apply { if (rtf > 0f) put("rtf", rtf.toDouble()) })
         else null
 
     /** Why the phone shouldn't take a clip now, or null. */
@@ -201,7 +234,10 @@ object PhoneVoice {
         private val stopped = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
         @Volatile private var running = true
         @Volatile private var fellBack = false
-        private val thread = Thread({ loop() }, "henchline-phone-voice").apply { isDaemon = true; start() }
+        private val thread = Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+            loop()
+        }, "henchline-phone-voice").apply { isDaemon = true; start() }
 
         // The last ack of each recent clip: sent again when a dropped line comes back, so the laptop learns how far the
         // phone got while it couldn't hear (the phone goes on speaking through a drop: it has the words)
@@ -211,6 +247,7 @@ object PhoneVoice {
             val said = JSONObject().put("id", id)
             if (piece != null) said.put("piece", piece)
             if (done) said.put("done", true)
+            if (rtf > 0f) said.put("rtf", rtf.toDouble())
             synchronized(acks) {
                 acks.remove(id); acks[id] = said
                 while (acks.size > 8) acks.remove(acks.keys.first())
@@ -252,17 +289,21 @@ object PhoneVoice {
             val pieces = clip.optJSONArray("pieces") ?: JSONArray()
             val joined = clip.optJSONArray("joined").toIntSet()
             val sid = clip.optInt("sid", 3)
-            // Rendered one piece ahead of the one playing, on its own thread at normal priority
+            // Rendered ahead of the one playing, on its own thread at audio priority
             val ready = LinkedBlockingQueue<Pair<Int, FloatArray>>(2)
             val over = AtomicBoolean(false)  // this clip is finished, cut or fallen back: the renderer stops
             val renderer = Thread({
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
                 try { for (n in 0 until pieces.length()) {
                     if (over.get() || stopped.contains(id) || !running) break
                     val text = pieces.getString(n)
                     log("render $id #$n start (${text.length} chars)")
                     val began = System.currentTimeMillis()
                     val samples = engine.generate(text, sid, 1.0f).samples
-                    log("render $id #$n done: ${samples.size} samples in ${System.currentTimeMillis() - began} ms")
+                    val took = System.currentTimeMillis() - began
+                    measured(took, samples.size)
+                    log("render $id #$n done: ${samples.size} samples in $took ms, rtf ${"%.2f".format(
+                        if (samples.isEmpty()) 0f else took / 1000f / (samples.size.toFloat() / RATE))} (running ${"%.2f".format(rtf)})")
                     val trimmed = trim(samples, lead = n in joined, tail = (n + 1) in joined)
                     val offered = System.currentTimeMillis()
                     while (!over.get() && running && !ready.offer(n to trimmed, 100, TimeUnit.MILLISECONDS)) Unit
@@ -273,9 +314,12 @@ object PhoneVoice {
                     android.util.Log.w("Henchline", "phone voice: rendering failed: $e")
                 }
             }, "henchline-phone-voice-render").apply { isDaemon = true; start() }
+            val started = System.currentTimeMillis()
+            var starves = 0
             try {
                 for (n in 0 until pieces.length()) {
                     var waited = 0L
+                    var starved = false
                     var next: Pair<Int, FloatArray>? = null
                     while (next == null) {
                         if (stopped.remove(id)) return
@@ -283,8 +327,29 @@ object PhoneVoice {
                         if (next == null && !renderer.isAlive && ready.isEmpty()) return fallback(id, "rendering stopped")
                         if (next == null && n > 0 && queued() == 0) {  // the speaker ran dry waiting for this piece
                             waited += 50
-                            if (waited >= STARVED_MS) return fallback(id, "fell behind by over a second")
+                            val early = n < 2 || System.currentTimeMillis() - started < 5000
+                            if (!starved && waited >= (if (early) STARVED_EARLY_MS else STARVED_MS)) {
+                                starved = true
+                                starves += 1
+                                log("$id #$n starved ${waited} ms (${starves} of $STARVES)")
+                                if (starves >= STARVES) return fallback(id, "fell behind by over a second, twice")
+                            }
                         }
+                    }
+                    if (n == 0 && pieces.length() > 1) {
+                        // Start only once what's ready covers rendering the next piece (or it's ready): a short first
+                        // piece would otherwise run dry before the second is made
+                        val first = next.second.size.toFloat() / RATE
+                        val nextText = pieces.getString(1)
+                        val needed = (if (rtf > 0f) rtf else 1f) * nextText.length / SPEECH_CPS
+                        val gate = System.currentTimeMillis()
+                        while (first < needed && ready.isEmpty() && renderer.isAlive &&
+                               System.currentTimeMillis() - gate < minOf(((needed - first) * 1000).toLong(), 2000L)) {
+                            if (stopped.remove(id)) return
+                            Thread.sleep(20)
+                        }
+                        val held = System.currentTimeMillis() - gate
+                        if (held > 50) log("$id #0 held $held ms for #1 to be ready")
                     }
                     val gap = if (n == 0) 0f else if (n in joined) JOIN else PAUSE
                     val audio = pcm(next.second, gap)

@@ -39,7 +39,7 @@ LAPTOP_VOICES = Path.home() / ".local/share/talkback/voices-v1.0.bin"
 
 CALL_TTS = STATE / "call.tts"
 PHONE_SAY = STATE / "phone-say"
-PHONE_RTF = 0.7  # the phone renders a second of speech in about 0.68 s (measured on it, 2026-11-22)
+PHONE_RTF = 1.0  # until the phone reports its own: in a call it rendered at 0.94-1.55 (adb shell said 0.68), 2026-11-22
 ID = re.compile(r"[A-Za-z0-9._-]{1,120}")
 
 
@@ -118,7 +118,10 @@ def offer(message: dict) -> None:
     tts = message.get("tts")
     if isinstance(tts, dict):
         if tts.get("model") == VERSION and tts.get("engine") == "sherpa-kokoro":
-            write_json(CALL_TTS, {"engine": tts["engine"], "model": tts["model"], "fallback": ""})
+            state = {"engine": tts["engine"], "model": tts["model"], "fallback": ""}
+            if _rtf(tts.get("rtf")):
+                state["rtf"] = _rtf(tts.get("rtf"))
+            write_json(CALL_TTS, state)
         else:
             CALL_TTS.unlink(missing_ok=True)
     elif tts == "fallback":
@@ -129,6 +132,19 @@ def offer(message: dict) -> None:
         clip = str(message.get("id") or "")
         if ID.fullmatch(clip):
             _progress(clip, fallback=state.get("fallback") or "the phone asked")
+
+
+def _rtf(value) -> float | None:
+    """A render speed the phone reported (render s per audio s), or None when it isn't a sane number."""
+    return float(value) if isinstance(value, (int, float)) and 0.05 <= value <= 10 else None
+
+
+def plan_rtf() -> float:
+    """The speed the laptop cuts the phone's pieces for: the phone's own measured speed with a margin
+    (max(1.2 x measured, 0.9)), else PHONE_RTF."""
+    state = read_json(CALL_TTS) if CALL_TTS.exists() else {}
+    measured = _rtf(state.get("rtf"))
+    return max(1.2 * measured, 0.9) if measured else PHONE_RTF
 
 
 def phone_renders() -> bool:
@@ -223,6 +239,12 @@ def said(message: dict) -> None:
     ack = message.get("said")
     if not isinstance(ack, dict) or not ID.fullmatch(str(ack.get("id") or "")):
         return
+    rtf = _rtf(ack.get("rtf"))
+    if rtf and CALL_TTS.exists():  # the phone's running render speed: the next clip is cut for it
+        state = read_json(CALL_TTS)
+        if state and state.get("rtf") != rtf:
+            state["rtf"] = rtf
+            write_json(CALL_TTS, state)
     piece = ack.get("piece")
     _progress(str(ack["id"]), spoken=piece + 1 if isinstance(piece, int) and piece >= 0 else None,
               done=bool(ack.get("done")))
