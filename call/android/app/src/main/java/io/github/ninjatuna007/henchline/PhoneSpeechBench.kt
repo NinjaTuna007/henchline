@@ -18,6 +18,7 @@ import java.io.RandomAccessFile
  * (/sdcard/Android/data/io.github.ninjatuna007.henchline/files):
  *   asr/<model>/            a streaming transducer: encoder*.onnx, decoder*.onnx, joiner*.onnx (int8 preferred),
  *                           tokens.txt, and bpe.vocab for hint words (as the laptop's Nemotron has)
+ *   (in the app's own files folder, or its external files folder)
  *   asr-set/refs.tsv        one "take.wav<TAB>what was said" per line; the takes beside it: 16 kHz mono 16-bit WAV
  *   asr-set/names.txt       the hint words, one per line (also how names are scored)
  * From the laptop:
@@ -60,7 +61,10 @@ object SpeechBench {
     private class Heard(val text: String, val waitMs: Long, val computeMs: Long)
 
     fun run(context: Context, o: Options) {
-        val base = context.getExternalFilesDir(null) ?: return log("no external files folder")
+        // The app's own files first (filled with `adb exec-in run-as … tar -x`: files adb pushes to the external
+        // folder belong to the shell and are often unreadable to the app), else the external files folder
+        val base = context.filesDir.takeIf { File(it, o.set).isDirectory }
+            ?: context.getExternalFilesDir(null) ?: return log("no external files folder")
         val setDir = File(base, o.set)
         val takes = SpeechScore.refs(File(setDir, "refs.tsv").takeIf { it.exists() }?.readText() ?: return log("no ${o.set}/refs.tsv"))
             .mapNotNull { (file, ref) -> wav16k(File(setDir, file))?.let { Take(file, ref, it) } ?: run { log("skipped $file: not 16 kHz mono 16-bit"); null } }
