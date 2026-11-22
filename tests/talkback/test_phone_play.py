@@ -146,7 +146,7 @@ class Timeout(unittest.TestCase):
         stop.set()
         thread.join(1)
         kinds = [next(iter(m)) for m in sent]
-        self.assertEqual(kinds, ["say", "stop"])  # the stop went out, after the say, before the files went
+        self.assertEqual(kinds, ["say", "stop"])  # the say had gone out: the stop follows before the files go
         self.assertFalse((phonevoice.PHONE_SAY / f"{path.name}.json").exists())
         self.assertEqual(spool.Clip.load(path).sentences, ["First sentence here.", "Second sentence here."])
         self.assertFalse(phonevoice.phone_renders())  # the laptop speaks the rest of the call
@@ -204,3 +204,71 @@ class DroppedLine(unittest.TestCase):
         kept = spool.Clip.load(path)
         self.assertTrue(kept.for_call)  # texted, not said at the laptop
         self.assertEqual(kept.sentences, ["Second sentence here.", "Third one too."])
+
+
+class Cap(unittest.TestCase):
+    """A phone that started a clip but never says done (a resumed call that forgot it) doesn't hold talkback back."""
+
+    def setUp(self):
+        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        for p in [mock.patch.object(worker, "in_call", return_value=True),
+                  mock.patch.object(worker, "mic_busy", return_value=False),
+                  mock.patch.object(worker, "PHONE_SLACK", 0.2),
+                  mock.patch.object(worker, "speech", return_value=0.05),
+                  mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        phonevoice.call_over()
+        for path in SPOOL.glob("*.json"):
+            path.unlink()
+
+    def test_no_report_after_the_last_ack_is_taken_as_said_in_time(self):
+        clip, path = clip_file("First sentence here. Second sentence here.")
+        thread = phone(lambda say: phonevoice.said({"said": {"id": say["id"], "piece": 0}}))  # then silence
+        started = time.time()
+        worker.phone_play(FakeVoice(), clip, path, "")
+        thread.join(2)
+        self.assertLess(time.time() - started, 3)  # 2 x 2 x 0.05 + 0.2 s, not the whole call
+        self.assertFalse(path.exists())  # taken as said: not repeated
+
+
+class DropWindowText(unittest.TestCase):
+    def setUp(self):
+        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        self.calling, self.dropped = threading.Event(), threading.Event()
+        self.calling.set()
+        for p in [mock.patch.object(worker, "in_call", side_effect=lambda: self.calling.is_set()),
+                  mock.patch.object(worker, "line_dropped",
+                                    side_effect=lambda: {"until": time.time() + 30} if self.dropped.is_set() else None),
+                  mock.patch.object(worker, "mic_busy", return_value=False),
+                  mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        phonevoice.call_over()
+        for path in SPOOL.glob("*.json"):
+            path.unlink()
+
+    def test_the_text_starts_at_the_beginning_of_the_sentence_it_reached(self):
+        long = ("The reviewer passed the round, so I committed it and pushed, then started the next piece of work "
+                "while you were away from the laptop.")
+        clip, path = clip_file("Okay. " + long)
+
+        def lift(say):
+            self.assertGreater(len(say["pieces"]), 2)  # the long sentence went in pieces
+            last = len(say["pieces"]) - 1
+            phonevoice.said({"said": {"id": say["id"], "piece": last}})  # the phone reached its last piece
+            self.calling.clear(); self.dropped.set()
+            time.sleep(0.3)
+            self.dropped.clear()  # never back
+
+        with mock.patch.object(worker.phonevoice, "PHONE_RTF", 5.0):  # slow: the long sentence is cut
+            thread = phone(lift)
+            worker.phone_play(FakeVoice(), clip, path, "")
+            thread.join(3)
+        kept = spool.Clip.load(path)
+        self.assertTrue(kept.for_call)
+        self.assertEqual(kept.sentences, [long])  # the whole sentence, not its last piece

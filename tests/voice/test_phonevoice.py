@@ -41,13 +41,19 @@ class Clips(unittest.TestCase):
 
     def test_a_clip_is_sent_once_and_a_cut_after_it(self):
         phonevoice.send("c1", "claude", "af_heart", 3, ["Done.", "Here is more,", "and the rest."], {2}, [0, 1, 1])
-        phonevoice.stop("c1")  # cut before it went out: the stop follows the say, never alone
         first = phonevoice.outgoing()
         self.assertEqual(first[0]["say"]["pieces"], ["Done.", "Here is more,", "and the rest."])
         self.assertEqual(first[0]["say"]["joined"], [2])
         self.assertEqual(first[0]["say"]["sid"], 3)
-        self.assertEqual(first[1], {"stop": "c1"})
+        phonevoice.stop("c1")
+        self.assertEqual(phonevoice.outgoing(), [{"stop": "c1"}])
         self.assertEqual(phonevoice.outgoing(), [])  # each once
+
+    def test_a_clip_taken_back_before_it_went_out_is_never_sent(self):
+        phonevoice.send("c6", "claude", "af_heart", 3, ["One."], set(), [0])
+        phonevoice.stop("c6")
+        self.assertEqual(phonevoice.outgoing(), [])  # no say, and no stop for something the phone never had
+        self.assertFalse((phonevoice.PHONE_SAY / "c6.stop").exists())  # consumed: cancel() stops waiting
 
     def test_acks_move_progress_forward_only(self):
         phonevoice.send("c2", "claude", "af_heart", 3, ["One.", "Two.", "Three."], set(), [0, 1, 2])

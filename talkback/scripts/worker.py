@@ -46,6 +46,7 @@ RENDER_RTF = 0.6  # render seconds per audio second the plan assumes (0.3 idle, 
 RENDER_RTF_BUSY = 0.9  # ... when the laptop is busy: the same limit hands-free's load guard uses (0.55 x cores)
 BUSY_PER_CORE = 0.55
 LOOKAHEAD = 4  # pieces made ahead of the one playing
+PHONE_SLACK = 10.0  # beyond twice a clip's speaking time, the wait for a phone that started it but never said done
 PHONE_TIMEOUT = 8.0  # a clip the phone hasn't started by then (model loading takes ~2.4 s) is said by the laptop
 HOLD = 1.0  # at most this long, the first piece waits for a late second one: a pause before speaking, not in it
 EDGE = 0.035  # seconds kept beyond the first and last sound where pieces of one sentence join
@@ -451,9 +452,15 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
     path.unlink(missing_ok=True)
     phonevoice.send(path.name, clip.agent, name, sid, plan.pieces, plan.joined, plan.sentence)
     began, cut, fell_back, spoken, ended = time.time(), False, "", 0, False
+    # A cap once the phone has started it: a report that never comes (a resumed call that forgot the clip) must not
+    # hold talkback back until the call ends: twice the clip's speaking time after the last ack, plus 10 s
+    cap = 2 * sum(speech(p) for p in plan.pieces) + PHONE_SLACK
+    last_ack, capped = time.time(), False
     try:
         while True:
             state = phonevoice.progress(path.name)
+            if state["spoken"] != spoken:
+                last_ack = time.time()
             if state["spoken"] and not marker.sounding:
                 marker.sounding = time.time()
                 marker.save()
@@ -466,14 +473,14 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
                 break
             calling = in_call()
             if not calling and line_dropped():  # a lift: the phone has the words and goes on speaking them; it
-                began = time.time()  # says how far it got when the line is back, so nothing is said twice
+                began = last_ack = time.time()  # says how far it got when the line is back: nothing said twice
                 time.sleep(0.1)
                 continue
             if not calling:  # hung up, or the dropped line didn't come back in time
                 ended = True
                 break
             if CALL_SILENT.exists():  # the line went quiet but hasn't dropped yet: the phone may still be speaking
-                began = time.time()
+                began = last_ack = time.time()
                 time.sleep(0.05)
                 continue
             if mic_busy() or voice.skip:  # the user talked over it
@@ -481,6 +488,9 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
                 break
             if time.time() - began > PHONE_TIMEOUT and not spoken:  # never started: the phone is gone or stuck
                 fell_back = "the phone didn't start it"
+                break
+            if spoken and time.time() - last_ack > cap:  # started long ago, never reported done: taken as said
+                capped = True
                 break
             time.sleep(0.05)
     finally:
@@ -491,14 +501,16 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
             phonevoice.finished(path.name)
     if fell_back == "the phone didn't start it":
         phonevoice.offer({"tts": "fallback", "reason": fell_back})  # the rest of this call: the laptop's audio
+    if capped:
+        log(TALKBACK_LOG, f"{clip.agent} on the phone: no word after piece {spoken} for {cap:.0f} s, taken as said")
     if ended and clip.agent not in SYSTEM:
-        # The call is over: what the phone didn't confirm goes as a text, from the last piece it said it started
-        rest = plan.pieces[max(spoken - 1, 0):]
-        rest = [p for n, p in enumerate(rest, start=max(spoken - 1, 0)) if plan.sentence[n] >= 0]  # not the intro
+        # The call is over: what the phone didn't confirm goes as a text, from the start of the sentence of the last
+        # piece it said it started (a text starting mid-sentence reads badly)
+        rest = plan.left(max(spoken - 1, 0), list(clip.sentences))
         if rest:
             clip.sentences, clip.for_call = rest, True
             clip.save(path)
-        log(TALKBACK_LOG, f"{clip.agent} on the phone: the call ended, {len(rest)} pieces left to text")
+        log(TALKBACK_LOG, f"{clip.agent} on the phone: the call ended, {len(rest)} sentences left to text")
     elif fell_back or (cut and not voice.skip and clip.agent not in SYSTEM):
         # Said again from the start of the sentence it reached, by whoever speaks next (the laptop, after a fallback)
         clip.sentences = plan.left(max(spoken - 1, 0), list(clip.sentences))

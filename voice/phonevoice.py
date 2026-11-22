@@ -202,12 +202,16 @@ def outgoing() -> list[dict]:
         if not ID.fullmatch(clip):
             continue
         sent = PHONE_SAY / f"{clip}.sent"
+        cut = PHONE_SAY / f"{clip}.stop"
+        if not sent.exists() and cut.exists():  # taken back before it went out: never sent at all
+            sent.touch()
+            cut.unlink(missing_ok=True)
+            continue
         if not sent.exists():
             say = read_json(path)
             if say:
                 found.append({"say": say})
                 sent.touch()
-        cut = PHONE_SAY / f"{clip}.stop"
         if cut.exists() and sent.exists():
             found.append({"stop": clip})
             cut.unlink(missing_ok=True)
