@@ -75,8 +75,24 @@ class PhonePlay(unittest.TestCase):
         thread.join(2)
         self.assertEqual(" ".join(seen[0]["pieces"]), "Done. The tests pass now.")
         self.assertEqual(seen[0]["sid"], 3)
+        self.assertEqual(len(seen[0]["ph"]), len(seen[0]["pieces"]))  # each piece's phonemes, said in its place
+        self.assertTrue(all(seen[0]["ph"]))
         self.assertFalse(path.exists())  # spoken: nothing kept
         self.assertFalse(worker.PLAYING.exists())
+
+    def test_tags_are_left_out_of_the_phonemes(self):
+        clip, path = clip_file("[laugh] Sure.")
+        seen = []
+
+        def acks(say):
+            seen.append(say)
+            phonevoice.said({"said": {"id": say["id"], "done": True}})
+
+        thread = phone(acks)
+        worker.phone_play(FakeVoice(), clip, path, "")
+        thread.join(2)
+        self.assertNotIn("laf", seen[0]["ph"][0])
+        self.assertEqual(seen[0]["ph"], [phonevoice.phonemes(["Sure."])[0]])
 
     def test_a_fallback_puts_the_rest_back_for_the_laptop(self):
         clip, path = clip_file("First sentence here. Second sentence here. Third one too.")

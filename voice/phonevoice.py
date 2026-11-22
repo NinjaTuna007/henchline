@@ -8,7 +8,8 @@ in the sorted list of names.
 
 The pieces travel through files, so the talkback worker and the call server stay separate processes:
   CALL_TTS                 the phone's offer for this call: {"engine", "model", "fallback": reason or ""}
-  PHONE_SAY/<id>.json      a clip for the phone, written by the worker, sent by the call server
+  PHONE_SAY/<id>.json      a clip for the phone, written by the worker, sent by the call server: {"id", "pieces",
+                           "ph" (each piece's phonemes, spoken in place of its words), "joined", "sentence_map", …}
   PHONE_SAY/<id>.sent      the server sent it
   PHONE_SAY/<id>.progress  the phone's acks: {"spoken": pieces started, "done": bool, "fallback": reason}
   PHONE_SAY/<id>.stop      the worker cut the clip (the user talked over it): the server tells the phone
@@ -24,6 +25,7 @@ import json
 import os
 import re
 import tarfile
+import threading
 import time
 from pathlib import Path
 
@@ -34,8 +36,9 @@ ARCHIVE_URL = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-mode
 ARCHIVE_SHA256 = "60703707bc05ccd48d60e1eb723f38b07d6e474795a0b6a588d7220400e0f7a4"
 ROOT = Path.home() / ".local/share/henchline/phone-voice"
 MODEL_DIR = ROOT / VERSION
-# espeak-ng's English data: Kokoro falls back to it for words the lexicon lacks (without it sherpa skipped "Here's"
-# and "lived" outright, 2026-11-22). Only these exact relative paths are ever served, never anything else
+# espeak-ng's English data, still served (the phone requires it before it counts as ready) though sherpa-onnx 2.0
+# ignores it: words the lexicon lacks are spoken from the phonemes sent with each piece (phonemes()). Only these exact
+# relative paths are ever served, never anything else
 ESPEAK = ("espeak-ng-data/phontab", "espeak-ng-data/phonindex", "espeak-ng-data/phondata", "espeak-ng-data/intonations",
           "espeak-ng-data/en_dict", "espeak-ng-data/lang/gmw/en", "espeak-ng-data/lang/gmw/en-US",
           "espeak-ng-data/lang/gmw/en-GB-x-rp")
@@ -173,15 +176,39 @@ def call_over() -> None:
 
 # --- the worker's side -----------------------------------------------------------------------------------------
 
+_tokenizer = None
+_tokenizer_lock = threading.Lock()
+
+
+def phonemes(texts: list[str]) -> list[str] | None:
+    """Each text as Kokoro's phonemes, made by the same espeak step the laptop's own talkback uses, or None when that
+    step isn't available here. The phone speaks these instead of the words: its engine (sherpa-onnx 2.0) dropped the
+    espeak fallback, so every word missing from its lexicon was skipped ("Here's", "lived", 2026-11-22). About 0.4 ms
+    a piece (7 ms at most), 150 ms to load once."""
+    global _tokenizer
+    try:
+        with _tokenizer_lock:
+            if _tokenizer is None:
+                from kokoro_onnx.tokenizer import Tokenizer
+                _tokenizer = Tokenizer()
+        return [_tokenizer.phonemize(text, "en-us") if text.strip() else "" for text in texts]
+    except Exception:  # no espeak or no kokoro_onnx: the phone gets the words alone, as before
+        return None
+
+
 def send(clip: str, agent: str, voice: str, sid: int, pieces: list[str], joined: set[int],
-         sentence_map: list[int]) -> None:
-    """A clip for the phone: its pieces as the laptop cut them, which join the one before, which sentence each is."""
+         sentence_map: list[int], ph: list[str] | None = None) -> None:
+    """A clip for the phone: its pieces as the laptop cut them, which join the one before, which sentence each is,
+    and, when given (one per piece), each piece's phonemes ("ph"), which the phone speaks in place of the words (the
+    words stay for its log); an older phone ignores them."""
     PHONE_SAY.mkdir(parents=True, exist_ok=True)
     for suffix in (".sent", ".progress", ".stop"):
         (PHONE_SAY / f"{clip}{suffix}").unlink(missing_ok=True)
-    write_json(PHONE_SAY / f"{clip}.json", {"id": clip, "agent": agent, "voice": voice, "sid": sid,
-                                             "pieces": pieces, "joined": sorted(joined),
-                                             "sentence_map": sentence_map, "at": time.time()}, private=True)
+    say = {"id": clip, "agent": agent, "voice": voice, "sid": sid, "pieces": pieces, "joined": sorted(joined),
+           "sentence_map": sentence_map, "at": time.time()}
+    if ph is not None and len(ph) == len(pieces):
+        say["ph"] = ph
+    write_json(PHONE_SAY / f"{clip}.json", say, private=True)
 
 
 def progress(clip: str) -> dict:

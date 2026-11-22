@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.BatteryManager
+import android.os.Build
+import android.os.PerformanceHintManager
 import android.os.PowerManager
 import org.json.JSONArray
 import org.json.JSONObject
@@ -43,8 +45,10 @@ object PhoneVoice {
     private const val STARVES = 2  // starves in one clip before the phone falls back (one is waited out)
     private const val SPEECH_CPS = 17.5f  // characters of text per second of speech, as the laptop estimates
     private const val LOW_BATTERY = 15
-    // espeak-ng's English data under the model folder: Kokoro's fallback for words the lexicon lacks (without it
-    // sherpa skipped "Here's" and "lived" outright, 2026-11-22). Exact relative paths, the only ones with a "/"
+    private const val TARGET_RTF = 0.5f  // what the render threads' hint session asks for: render twice as fast as speech
+    // espeak-ng's English data under the model folder, still fetched (and required, so a phone and laptop agree on
+    // what "ready" means) though sherpa-onnx 2.0 ignores dataDir: words the lexicon lacks are spoken from the laptop's
+    // phonemes ("ph") instead. Exact relative paths, the only ones with a "/"
     val ESPEAK = listOf("espeak-ng-data/phontab", "espeak-ng-data/phonindex", "espeak-ng-data/phondata",
         "espeak-ng-data/intonations", "espeak-ng-data/en_dict", "espeak-ng-data/lang/gmw/en",
         "espeak-ng-data/lang/gmw/en-US", "espeak-ng-data/lang/gmw/en-GB-x-rp")
@@ -196,11 +200,12 @@ object PhoneVoice {
         // ONNX's worker threads are made here and take this thread's priority: audio priority, a step under the call's mic and speaker so its network threads keep up
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
         val folder = dir(context).absolutePath
+        val before = tasks()
         return try {
             val kokoro = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
                 model = "$folder/model.onnx", voices = "$folder/voices.bin", tokens = "$folder/tokens.txt",
                 lexicon = "$folder/lexicon-us-en.txt", lang = "en-us",
-                dataDir = "$folder/espeak-ng-data")  // words the lexicon lacks are spoken through espeak, not skipped
+                dataDir = "$folder/espeak-ng-data")  // ignored by sherpa-onnx 2.0: the laptop's phonemes cover missing words
             val config = com.k2fsa.sherpa.onnx.OfflineTtsConfig(
                 model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(kokoro = kokoro, numThreads = threads, provider = "cpu"))
             val engine = com.k2fsa.sherpa.onnx.OfflineTts(null, config)
@@ -208,7 +213,9 @@ object PhoneVoice {
             val began = System.currentTimeMillis()
             val warm = engine.generate("Hi.", 3, 1.0f).samples
             measured(System.currentTimeMillis() - began, warm.size)
-            log("loaded with $threads threads, warm-up rtf ${"%.2f".format(rtf)}")
+            engineThreads = spawned(before)
+            log("loaded with $threads threads, warm-up rtf ${"%.2f".format(rtf)}, engine threads ${engineThreads.joinToString(",")}; " +
+                placement(intArrayOf(android.os.Process.myTid()) + engineThreads))
             tts = engine
             true
         } catch (e: Throwable) {
@@ -217,7 +224,108 @@ object PhoneVoice {
         }
     }
 
-    fun release() = synchronized(loadLock) { tts?.release(); tts = null }
+    fun release() = synchronized(loadLock) { tts?.release(); tts = null; engineThreads = IntArray(0) }
+
+    // --- the render threads' cores ----------------------------------------------------------------------------
+    // In the background Android keeps an app to the little cores unless something says its work matters: a call's
+    // foreground service moves the process to the foreground cpuset, and a performance hint session (below) asks the
+    // scheduler to place and clock the render threads for a deadline. The log shows which held (adb logcat -s Henchline).
+
+    /** ONNX's own worker threads, made inside the engine when it loads: they do most of a render's work. */
+    @Volatile private var engineThreads = IntArray(0)
+
+    private fun tasks(): Set<Int> =
+        try { File("/proc/self/task").list()?.mapNotNull { it.toIntOrNull() }?.toSet() ?: emptySet() } catch (_: Exception) { emptySet() }
+
+    private fun comm(tid: Int): String? = try { File("/proc/self/task/$tid/comm").readText().trim() } catch (_: Exception) { null }
+
+    /** Threads made since `before` by this thread: a native thread starts with its maker's name, so other threads the
+     *  app made meanwhile are left out. */
+    private fun spawned(before: Set<Int>): IntArray {
+        val mine = comm(android.os.Process.myTid()) ?: return IntArray(0)
+        return (tasks() - before).filter { comm(it) == mine }.sorted().toIntArray()
+    }
+
+    /** The CPU a thread last ran on, from /proc/<pid>/task/<tid>/stat (field 39, counted after the name's ")"). */
+    fun cpuOf(stat: String): Int? {
+        val fields = stat.substringAfterLast(')').trim().split(' ')
+        return fields.getOrNull(36)?.toIntOrNull()  // fields from the 3rd (state) on: the 39th is index 36
+    }
+
+    /** The cpuset in a /proc/…/cgroup listing ("4:cpuset:/foreground" → "/foreground"), or null. */
+    fun cpusetOf(cgroup: String): String? =
+        cgroup.lineSequence().map { it.split(':', limit = 3) }.firstOrNull { it.size == 3 && it[1].split(',').contains("cpuset") }?.get(2)
+
+    /** Where these threads may and did run: the first one's cpuset and allowed CPUs, the process's importance (100 in
+     *  front, 125 a foreground service), and the CPU each last ran on. Never throws. */
+    fun placement(tids: IntArray): String = try {
+        val first = tids.firstOrNull() ?: android.os.Process.myTid()
+        val cpuset = try { cpusetOf(File("/proc/self/task/$first/cgroup").readText()) } catch (_: Exception) { null }
+        val allowed = try { File("/proc/self/task/$first/status").readLines()
+            .firstOrNull { it.startsWith("Cpus_allowed_list:") }?.substringAfter(':')?.trim() } catch (_: Exception) { null }
+        val info = android.app.ActivityManager.RunningAppProcessInfo()
+        android.app.ActivityManager.getMyMemoryState(info)
+        val cpus = tids.joinToString(",") { tid ->
+            (try { cpuOf(File("/proc/self/task/$tid/stat").readText()) } catch (_: Exception) { null })?.toString() ?: "?" }
+        "cpuset=${cpuset ?: "?"} allowed=${allowed ?: "?"} importance=${info.importance} cpus=$cpus"
+    } catch (e: Throwable) { "placement unknown (${e.javaClass.simpleName})" }
+
+    /** A performance hint session (Android 12+) over the render threads: each piece's render time is reported against
+     *  a target of TARGET_RTF times its expected speech, and the scheduler raises those threads' clocks and cores to
+     *  meet it. Every call is a no-op where unsupported and never throws: the call goes on without it. */
+    class Boost(private val context: Context) {
+        private var session: PerformanceHintManager.Session? = null
+        private var tids = IntArray(0)
+        private var unsupported = false
+        @Volatile private var closed = false
+
+        /** What the last `start` left: "on", "off" (unsupported or refused) or "closed". */
+        @Volatile var state = "off"
+            private set
+
+        /** Before a render on this thread, with ONNX's `workers`: (re)binds the session and sets the target. */
+        @Synchronized fun start(expectedAudioS: Float, workers: IntArray = engineThreads) {
+            if (closed || unsupported || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+            try {
+                val want = intArrayOf(android.os.Process.myTid()) + workers
+                val target = maxOf((expectedAudioS * TARGET_RTF * 1e9).toLong(), 20_000_000L)
+                val current = session
+                if (current != null && !want.contentEquals(tids)) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) current.setThreads(want)
+                    else { current.close(); session = null }  // Android 12–13 can't change a session's threads
+                    tids = want
+                }
+                if (session == null) {
+                    val manager = context.getSystemService(PerformanceHintManager::class.java)
+                    val made = manager?.createHintSession(want, target)
+                    if (made == null) { unsupported = true; state = "off"; return }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) made.setPreferPowerEfficiency(false)
+                    session = made
+                    tids = want
+                } else session?.updateTargetWorkDuration(target)
+                state = "on"
+            } catch (e: Throwable) {  // a thread that ended, a refused session: speak unboosted
+                try { session?.close() } catch (_: Throwable) {}
+                session = null
+                state = "off"
+                log("hint session failed: $e")
+            }
+        }
+
+        /** After the render: how long it took. */
+        @Synchronized fun done(tookMs: Long) {
+            if (closed || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+            try { if (tookMs > 0) session?.reportActualWorkDuration(tookMs * 1_000_000L) } catch (_: Throwable) {}
+        }
+
+        @Synchronized fun close() {
+            closed = true
+            state = "closed"
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+            try { session?.close() } catch (_: Throwable) {}
+            session = null
+        }
+    }
 
     /** What the phone tells the laptop on connecting: it can speak talkback (only when switched on and here). */
     fun offer(context: Context): JSONObject? =
@@ -238,27 +346,52 @@ object PhoneVoice {
 
     // --- speaking clips ---------------------------------------------------------------------------------------
 
+    /** One piece's audio. With the laptop's phonemes (`ph`) it speaks those: this engine skips every word its
+     *  lexicon lacks ("Here's", "lived", 2026-11-22), the laptop's espeak doesn't. Without them (an older laptop),
+     *  the words. A piece with nothing to say (a bare tag) is silence. */
+    fun render(engine: com.k2fsa.sherpa.onnx.OfflineTts, text: String, ph: String?, sid: Int): FloatArray {
+        if (ph == null) return engine.generate(text, sid, 1.0f).samples
+        if (ph.isBlank()) return FloatArray(0)
+        return engine.generateWithConfig("", com.k2fsa.sherpa.onnx.GenerationConfig(
+            sid = sid, speed = 1.0f, phonemeCodepoints = arrayOf(ph.codePoints().toArray()))).samples
+    }
+
+    /** The phonemes for piece `n`, or null when the laptop sent none (an older laptop) or a list that doesn't match. */
+    fun phonemesOf(clip: JSONObject, n: Int, pieces: Int): String? {
+        val ph = clip.optJSONArray("ph") ?: return null
+        if (ph.length() != pieces) return null
+        return ph.opt(n) as? String
+    }
+
     /** Debug builds only (PhoneVoiceBench): a separate engine with `threads`, `text` rendered 3 times, each run's
-     *  render speed logged, so the app's speed can be compared with sherpa-onnx's own command-line build. */
-    fun bench(context: Context, threads: Int, text: String) {
+     *  render speed logged, so the app's speed can be compared with sherpa-onnx's own command-line build. With `ph`
+     *  (the laptop's phonemes for it) those are rendered instead, as in a call. */
+    fun bench(context: Context, threads: Int, text: String, ph: String? = null, hint: Boolean = false) {
         if (!ready(context)) return log("bench: the voice isn't downloaded")
         val folder = dir(context).absolutePath
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+        val before = tasks()
         val kokoro = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
             model = "$folder/model.onnx", voices = "$folder/voices.bin", tokens = "$folder/tokens.txt",
             lexicon = "$folder/lexicon-us-en.txt", lang = "en-us", dataDir = "$folder/espeak-ng-data")
         val engine = com.k2fsa.sherpa.onnx.OfflineTts(null, com.k2fsa.sherpa.onnx.OfflineTtsConfig(
             model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(kokoro = kokoro, numThreads = threads, provider = "cpu")))
+        // The bench's engine, not the call's: its threads are the ones to hint and watch
+        val mine = spawned(before)
+        val boost = if (hint) Boost(context) else null
         try {
             for (run in 1..3) {
+                boost?.start(text.length / SPEECH_CPS, mine)
                 val began = System.currentTimeMillis()
-                val samples = engine.generate(text, 3, 1.0f).samples
+                val samples = render(engine, text, ph, 3)
                 val ms = System.currentTimeMillis() - began
+                boost?.done(ms)
                 val audio = samples.size.toDouble() / RATE
-                log("bench threads=$threads chars=${text.length} run=$run render_ms=$ms audio_s=${"%.2f".format(audio)} " +
-                    "rtf=${"%.2f".format(if (audio > 0) ms / 1000.0 / audio else 0.0)}")
+                log("bench threads=$threads chars=${text.length} ph=${ph?.length ?: "none"} hint=${boost?.state ?: "no"} run=$run " +
+                    "render_ms=$ms audio_s=${"%.2f".format(audio)} rtf=${"%.2f".format(if (audio > 0) ms / 1000.0 / audio else 0.0)} " +
+                    placement(intArrayOf(android.os.Process.myTid()) + mine))
             }
-        } finally { engine.release() }
+        } finally { boost?.close(); engine.release() }
     }
 
     /** One call's speaker: clips come from the laptop, audio goes to the call's own playback queue. */
@@ -286,6 +419,7 @@ object PhoneVoice {
         private val stopped = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
         @Volatile private var running = true
         @Volatile private var fellBack = false
+        private val boost = Boost(context)  // the render threads' hint session, for this call
         private val thread = Thread({
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
             loop()
@@ -313,7 +447,7 @@ object PhoneVoice {
         fun say(clip: JSONObject) { if (!fellBack) clips.offer(clip) else fallback(clip.optString("id"), "fell back earlier") }
         fun stop(id: String) { stopped.add(id) }
         fun stopAll() { clips.clear(); if (current.isNotEmpty()) stopped.add(current) }
-        fun close() { running = false; stopAll(); thread.interrupt() }
+        fun close() { running = false; stopAll(); thread.interrupt(); boost.close() }
 
         private fun fallback(id: String, reason: String) {
             fellBack = true
@@ -355,13 +489,17 @@ object PhoneVoice {
                 try { for (n in 0 until pieces.length()) {
                     if (over.get() || stopped.contains(id) || !running) break
                     val text = pieces.getString(n)
-                    log("render $id #$n start (${text.length} chars)")
+                    val ph = phonemesOf(clip, n, pieces.length())
+                    log("render $id #$n start (${text.length} chars${if (ph != null) ", ${ph.length} phonemes" else ""})")
+                    boost.start(text.length / SPEECH_CPS)
                     val began = System.currentTimeMillis()
-                    val samples = engine.generate(text, sid, 1.0f).samples
+                    val samples = render(engine, text, ph, sid)
                     val took = System.currentTimeMillis() - began
+                    boost.done(took)
                     measured(took, samples.size)
                     log("render $id #$n done: ${samples.size} samples in $took ms, rtf ${"%.2f".format(
-                        if (samples.isEmpty()) 0f else took / 1000f / (samples.size.toFloat() / RATE))} (running ${"%.2f".format(rtf)})")
+                        if (samples.isEmpty()) 0f else took / 1000f / (samples.size.toFloat() / RATE))} (running ${"%.2f".format(rtf)}) " +
+                        "hint=${boost.state} ${placement(intArrayOf(android.os.Process.myTid()) + engineThreads)}")
                     val trimmed = trim(samples, lead = n in joined, tail = (n + 1) in joined)
                     val offered = System.currentTimeMillis()
                     while (!over.get() && running && !ready.offer(n to trimmed, 100, TimeUnit.MILLISECONDS)) Unit

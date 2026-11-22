@@ -471,7 +471,9 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
     marker = Playing(path.name, clip.session, clip.agent, " ".join(plan.pieces))
     marker.save()
     path.unlink(missing_ok=True)
-    phonevoice.send(path.name, clip.agent, name, sid, plan.pieces, plan.joined, plan.sentence)
+    # Phonemes made here, as the laptop's own talkback makes them: the phone's engine skips words its lexicon lacks
+    ph = phonevoice.phonemes([TAGS.sub("", piece).strip() for piece in plan.pieces])
+    phonevoice.send(path.name, clip.agent, name, sid, plan.pieces, plan.joined, plan.sentence, ph)
     began, cut, fell_back, spoken, ended, heard = time.time(), False, "", 0, False, None
     # A cap once the phone has started it: a report that never comes (a resumed call that forgot the clip) must not
     # hold talkback back until the call ends: twice the clip's speaking time after the last ack, plus 10 s

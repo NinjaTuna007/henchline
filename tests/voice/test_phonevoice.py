@@ -2,6 +2,7 @@
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from tests import sandbox  # first: a throwaway HOME
@@ -73,6 +74,31 @@ class Clips(unittest.TestCase):
         phonevoice.stop("c1")
         self.assertEqual(phonevoice.outgoing(), [{"stop": "c1"}])
         self.assertEqual(phonevoice.outgoing(), [])  # each once
+
+    def test_phonemes_go_with_the_pieces_one_each(self):
+        phonevoice.send("c7", "claude", "af_heart", 3, ["Here's one,", "and more."], {1}, [0, 0],
+                        ph=["hˈɪɹz wˈʌn,", "ænd mˈɔːɹ."])
+        say = phonevoice.outgoing()[0]["say"]
+        self.assertEqual(say["ph"], ["hˈɪɹz wˈʌn,", "ænd mˈɔːɹ."])
+        self.assertEqual(say["pieces"], ["Here's one,", "and more."])  # the words stay, for the phone's log
+
+    def test_no_phonemes_or_a_mismatched_list_sends_the_words_alone(self):
+        phonevoice.send("c8", "claude", "af_heart", 3, ["One.", "Two."], set(), [0, 1])
+        phonevoice.send("c9", "claude", "af_heart", 3, ["One.", "Two."], set(), [0, 1], ph=["wˈʌn."])
+        for message in phonevoice.outgoing():
+            self.assertNotIn("ph", message["say"])
+
+    def test_phonemes_are_the_laptops_own_espeak_step(self):
+        ph = phonevoice.phonemes(["Here's the thing: it lived.", ""])
+        self.assertIsNotNone(ph)
+        self.assertEqual(len(ph), 2)
+        self.assertIn("lˈɪvd", ph[0])  # a word the phone's lexicon lacks, spoken all the same
+        self.assertEqual(ph[1], "")
+
+    def test_without_the_phonemizer_none(self):
+        with mock.patch.object(phonevoice, "_tokenizer", None), \
+                mock.patch.dict("sys.modules", {"kokoro_onnx.tokenizer": None}):
+            self.assertIsNone(phonevoice.phonemes(["Hello."]))
 
     def test_a_clip_taken_back_before_it_went_out_is_never_sent(self):
         phonevoice.send("c6", "claude", "af_heart", 3, ["One."], set(), [0])

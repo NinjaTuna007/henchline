@@ -4,6 +4,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -50,7 +51,7 @@ class PhoneVoiceTest {
     }
 
     @Test fun onlyTheEspeakDataMayHaveAPath() {
-        // Kokoro's fallback for words the lexicon lacks ("Here's", "lived" were skipped without it, 2026-11-22)
+        // Still required, though sherpa-onnx 2.0 ignores it (the laptop's phonemes cover missing words)
         assertTrue("espeak-ng-data/en_dict" in PhoneVoice.REQUIRED)
         assertTrue(PhoneVoice.safeName("espeak-ng-data/lang/gmw/en-US"))
         assertTrue(PhoneVoice.safeName("model.onnx"))
@@ -59,5 +60,30 @@ class PhoneVoiceTest {
         assertFalse(PhoneVoice.safeName("../secret"))
         assertFalse(PhoneVoice.safeName(".verified"))
         assertFalse(PhoneVoice.safeName(""))
+    }
+
+    @Test fun eachPieceTakesItsOwnPhonemesWhenTheLaptopSentThem() {
+        val clip = JSONObject("""{"pieces": ["Here's one,", "and more."], "ph": ["hˈɪɹz wˈʌn,", "ænd mˈɔːɹ."]}""")
+        assertEquals("hˈɪɹz wˈʌn,", PhoneVoice.phonemesOf(clip, 0, 2))
+        assertEquals("ænd mˈɔːɹ.", PhoneVoice.phonemesOf(clip, 1, 2))
+    }
+
+    @Test fun anOlderLaptopOrAMismatchedListMeansTheWords() {
+        assertNull(PhoneVoice.phonemesOf(JSONObject("""{"pieces": ["One."]}"""), 0, 1))
+        assertNull(PhoneVoice.phonemesOf(JSONObject("""{"pieces": ["One.", "Two."], "ph": ["wˈʌn."]}"""), 0, 2))
+        assertNull(PhoneVoice.phonemesOf(JSONObject("""{"pieces": ["One."], "ph": [3]}"""), 0, 1))
+    }
+
+    @Test fun readsTheCpuAThreadLastRanOn() {
+        // a name with spaces and a ")" must not shift the fields
+        val stat = "1234 (render) x) S 1 1 0 0 -1 4194624 10 0 0 0 5 3 0 0 16 -4 9 0 100 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 6 0 0 0 0 0"
+        assertEquals(6, PhoneVoice.cpuOf(stat))
+        assertNull(PhoneVoice.cpuOf("1234 (short) S 1"))
+    }
+
+    @Test fun readsTheCpuset() {
+        assertEquals("/background", PhoneVoice.cpusetOf("5:schedtune:/\n4:cpuset:/background\n0::/uid_10234/pid_99"))
+        assertEquals("/top-app", PhoneVoice.cpusetOf("3:cpu,cpuset:/top-app"))
+        assertNull(PhoneVoice.cpusetOf("0::/uid_10234/pid_99"))
     }
 }
