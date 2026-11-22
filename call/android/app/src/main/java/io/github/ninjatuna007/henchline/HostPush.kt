@@ -156,7 +156,8 @@ object HostPush {
             else -> {  // a ring: a real one, whose Answer calls this computer (RingService.answerIntent)
                 val reply = Reply.valid(push.optString("reply"))
                 Reply.send(reply, "rang")
-                if (CallService.Bus.service != null || !ChatKey.validSession(session)) {  // on a call, or no agent to call: said
+                // On a call, another ring sounding (it keeps its record and its screen's Answer), or no agent to call: said
+                if (CallService.Bus.service != null || Ringing.now(context) != null || !ChatKey.validSession(session)) {
                     notify(context, "$agent on ${host.label} wants you", push.optString("why").ifEmpty { "Open the chat to answer." },
                         chat(context, host, session), Messages.CHANNEL)
                 } else {
