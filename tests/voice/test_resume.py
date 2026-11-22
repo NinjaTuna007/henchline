@@ -38,5 +38,49 @@ class Identity(unittest.TestCase):
         self.assertFalse(resume.resumed(b"--resume=" + chat.encode() + b"-extra", chat))
 
 
+class ClaudeRecord(unittest.TestCase):
+    """A Claude chat picked with /resume is named only by Claude's own record of the process."""
+    CHAT = "13388111-493f-41d1-9791-11259dab5a68"
+    OTHER = "edb146cd-f9c9-463a-94e7-19c6818a1bed"
+
+    def setUp(self):
+        import json
+        import os
+        from pathlib import Path
+        self.pid = os.getpid()
+        self.started = Path(f"/proc/{self.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        folder = Path.home() / ".claude/sessions"
+        folder.mkdir(parents=True, exist_ok=True)
+        self.record = folder / f"{self.pid}.json"
+        self.write = lambda **kw: self.record.write_text(json.dumps(
+            {"pid": self.pid, "sessionId": self.CHAT, "procStart": self.started, **kw}))
+        self.addCleanup(lambda: self.record.unlink(missing_ok=True))
+
+    def test_the_record_names_the_chat_the_process_is_on(self):
+        self.write()
+        self.assertEqual(resume.claude_record(self.pid), self.CHAT)
+        env = b"CLAUDE_CODE_SESSION_ID=" + self.OTHER.encode()  # the chat it started with, before /resume
+        self.assertTrue(resume._is_chat("claude", self.CHAT, self.pid, env, b"claude"))
+        self.assertFalse(resume._is_chat("claude", self.OTHER, self.pid, env, b"claude"))
+
+    def test_a_record_left_by_an_earlier_process_with_this_pid_is_not_it(self):
+        self.write(procStart="1")
+        self.assertIsNone(resume.claude_record(self.pid))
+        env = b"CLAUDE_CODE_SESSION_ID=" + self.OTHER.encode()
+        self.assertFalse(resume._is_chat("claude", self.CHAT, self.pid, env, b"claude"))
+        resumed = b"claude\0--resume\0" + self.OTHER.encode()
+        self.assertTrue(resume._is_chat("claude", self.OTHER, self.pid, env, resumed))
+
+    def test_without_a_record_only_the_command_line_names_it(self):
+        self.assertIsNone(resume.claude_record(self.pid))
+        command = b"claude\0--resume\0" + self.CHAT.encode()
+        self.assertTrue(resume._is_chat("claude", self.CHAT, self.pid, b"", command))
+        self.assertFalse(resume._is_chat("claude", self.CHAT, self.pid, b"", b"claude"))
+
+    def test_an_inherited_environment_without_a_record_is_not_this_chat(self):
+        inherited = b"CLAUDE_CODE_SESSION_ID=" + self.CHAT.encode()  # the chat that opened the editor
+        self.assertFalse(resume._is_chat("claude", self.CHAT, self.pid, inherited, b"claude"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,36 @@ def carries(agent: str, chat: str, environ: bytes) -> bool:
     return marked(environ).get(MARK.get(agent, ""), "") == chat
 
 
+def claude_record(pid: int) -> str | None:
+    """The chat a Claude process is on now, from Claude's own record of it (`~/.claude/sessions/<pid>.json`).
+    None when there is no record for this process (an older pid's record is not its). Its environment keeps the
+    chat it started with, and a chat picked with `claude --resume` or `/resume` is in neither the environment
+    nor the command line: without this, Henchline started a second copy of a chat that was running."""
+    import json
+    try:
+        record = json.loads((Path.home() / f".claude/sessions/{pid}.json").read_text())
+        started = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+    if not isinstance(record, dict) or record.get("pid") != pid or str(record.get("procStart", "")) != started:
+        return None
+    chat = record.get("sessionId")
+    return chat if isinstance(chat, str) and chat else None
+
+
+def _is_chat(agent: str, chat: str, pid: int, environ: bytes, command: bytes) -> bool:
+    if agent == "claude":
+        current = claude_record(pid)
+        if current is not None:
+            return current == chat  # the record follows /resume; the environment doesn't
+        # Not the environment: a claude never starts with its own id there (Henchline unsets it), so an id there
+        # is the parent's, inherited (a claude in an editor's terminal carries the chat that opened the editor)
+        return resumed(command, chat)
+    if environ and carries(agent, chat, environ):
+        return True
+    return agent == "cursor" and (holds_store(pid, chat) or resumed(command, chat))
+
+
 def folder_of(agent: str, chat: str) -> Path | None:
     """The folder that chat was working in, from the agent's own record. None when it isn't there."""
     if agent == "claude":
@@ -123,14 +153,11 @@ def find_running(agent: str, chat: str) -> list:
             raw = (entry / "environ").read_bytes()
         except OSError:
             raw = b""  # hidden environment: the command line can still name the chat
-        named = bool(raw) and carries(agent, chat, raw)
-        if not named and agent == "cursor":
-            try:
-                command = (entry / "cmdline").read_bytes()
-            except OSError:
-                command = b""
-            named = holds_store(pid, chat) or resumed(command, chat)
-        if not named:
+        try:
+            command = (entry / "cmdline").read_bytes()
+        except OSError:
+            command = b""
+        if not _is_chat(agent, chat, pid, raw, command):
             continue
         running = process(pid)
         if not running or running.agent != agent or running.is_editor:
