@@ -62,6 +62,31 @@ class PhoneVoiceTest {
         assertFalse(PhoneVoice.safeName(""))
     }
 
+    @Test fun theLaptopsManifestMustOfferJenny() {
+        assertNull(PhoneVoice.offered(JSONObject("""{"version": "vits-piper-en_GB-jenny_dioco-medium", "files": []}""")))
+        // a laptop not yet updated still offers Kokoro: told to update it, nothing fetched
+        assertTrue(PhoneVoice.offered(JSONObject("""{"version": "kokoro-multi-lang-v1_0"}"""))!!.contains("laptop"))
+        assertTrue(PhoneVoice.offered(JSONObject("""{"version": "something-newer"}"""))!!.contains("update the app"))
+        assertTrue(PhoneVoice.offered(JSONObject("{}")) != null)
+    }
+
+    @Test fun jennysFilesAreWhatReadyNeeds() {
+        assertTrue(PhoneVoice.ONNX in PhoneVoice.REQUIRED)
+        assertTrue("tokens.txt" in PhoneVoice.REQUIRED)
+        assertFalse("voices.bin" in PhoneVoice.REQUIRED)  // Kokoro's
+        assertTrue(PhoneVoice.safeName(PhoneVoice.ONNX))
+    }
+
+    @Test fun anEarlierModelsFolderIsStaleOnceJennyIsHere() {
+        val root = java.nio.file.Files.createTempDirectory("phone-voice").toFile()
+        try {
+            assertTrue(PhoneVoice.stale(java.io.File(root, "missing")).isEmpty())
+            java.io.File(root, PhoneVoice.MODEL).mkdirs()
+            java.io.File(root, "kokoro-multi-lang-v1_0").mkdirs()
+            assertEquals(listOf("kokoro-multi-lang-v1_0"), PhoneVoice.stale(root).map { it.name })
+        } finally { root.deleteRecursively() }
+    }
+
     @Test fun eachPieceTakesItsOwnPhonemesWhenTheLaptopSentThem() {
         val clip = JSONObject("""{"pieces": ["Here's one,", "and more."], "ph": ["hˈɪɹz wˈʌn,", "ænd mˈɔːɹ."]}""")
         assertEquals("hˈɪɹz wˈʌn,", PhoneVoice.phonemesOf(clip, 0, 2))

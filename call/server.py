@@ -1120,7 +1120,7 @@ async def chat_workflows(request: web.Request) -> web.Response:
 
 
 async def phone_voice_manifest(request: web.Request) -> web.Response:
-    """The Kokoro files the phone downloads to speak talkback itself (voice/phonevoice.py): names, sizes, SHA-256."""
+    """The voice files the phone downloads to speak talkback itself (voice/phonevoice.py): names, sizes, SHA-256."""
     trusted(request)
     found = await asyncio.get_running_loop().run_in_executor(None, phonevoice.manifest)
     if found is None:

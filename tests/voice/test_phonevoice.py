@@ -17,19 +17,20 @@ class Offer(unittest.TestCase):
 
     def test_a_capable_phone_renders_until_it_falls_back(self):
         self.assertFalse(phonevoice.phone_renders())  # no offer: the laptop streams, as before
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         self.assertTrue(phonevoice.phone_renders())
         phonevoice.offer({"tts": "fallback", "reason": "battery 12%"})
         self.assertFalse(phonevoice.phone_renders())
 
     def test_another_model_or_engine_is_not_taken(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": "kokoro-v0_19"}})
+        # a phone still holding Kokoro (before 2026-11-22) offers it: the laptop streams its own audio instead
+        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": "kokoro-multi-lang-v1_0"}})
         self.assertFalse(phonevoice.phone_renders())
         phonevoice.offer({"tts": {"engine": "piper", "model": phonevoice.VERSION}})
         self.assertFalse(phonevoice.phone_renders())
 
     def test_the_call_ending_clears_the_offer_and_clips(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         phonevoice.send("c1", "claude", "af_heart", 3, ["Hello."], set(), [0])
         phonevoice.call_over()
         self.assertFalse(phonevoice.phone_renders())
@@ -37,25 +38,27 @@ class Offer(unittest.TestCase):
 
 
 class RenderSpeed(unittest.TestCase):
-    """The phone's measured render speed sets how small the laptop cuts its pieces (2026-11-22: 0.94-1.55 in a call)."""
+    """The phone's measured render speed sets how small the laptop cuts its pieces (Jenny: 0.14, 2026-11-22)."""
 
     def tearDown(self):
         phonevoice.call_over()
 
     def test_without_a_measure_the_default(self):
         self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
 
     def test_the_offer_and_acks_carry_it_with_a_margin(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION, "rtf": 1.2}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION, "rtf": 1.2}})
         self.assertAlmostEqual(phonevoice.plan_rtf(), 1.44)
         phonevoice.send("c1", "claude", "af_heart", 3, ["Hello."], set(), [0])
-        phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 0.5}})
-        self.assertEqual(phonevoice.plan_rtf(), 0.9)  # never planned faster than 0.9
+        phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 0.1}})
+        self.assertEqual(phonevoice.plan_rtf(), phonevoice.PLAN_RTF_MIN)  # never planned faster than this
+        phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 0.4}})
+        self.assertAlmostEqual(phonevoice.plan_rtf(), 0.48)
 
     def test_nonsense_is_ignored(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION, "rtf": "fast"}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION, "rtf": "fast"}})
         self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
         phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 99}})
         self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
@@ -88,15 +91,40 @@ class Clips(unittest.TestCase):
         for message in phonevoice.outgoing():
             self.assertNotIn("ph", message["say"])
 
-    def test_phonemes_are_the_laptops_own_espeak_step(self):
-        ph = phonevoice.phonemes(["Here's the thing: it lived.", ""])
+    def test_phonemes_are_espeaks_british_ipa_as_jenny_learnt_it(self):
+        ph = phonevoice.phonemes(["Here's the thing: it lived in a laptop.", ""])
         self.assertIsNotNone(ph)
         self.assertEqual(len(ph), 2)
-        self.assertIn("lˈɪvd", ph[0])  # a word the phone's lexicon lacks, spoken all the same
+        self.assertIn("lˈɪvd", ph[0])
+        self.assertIn("lˈæptɒp", ph[0])  # en-gb-x-rp as espeak gives it (Kokoro's British spelling made it "laptɒp")
+        self.assertIn(":", ph[0])  # punctuation kept: the voice pauses at it
+        self.assertTrue(ph[0].endswith("."))
         self.assertEqual(ph[1], "")
+        self.assertNotIn("^", ph[0])  # the engine adds its own start and end marks
+
+    def test_no_language_switch_flags_and_dashes_become_pauses(self):
+        ph = phonevoice.phonemes(["The café's résumé — done… mostly."])[0]
+        self.assertNotIn("(", ph)  # espeak's "(fr)" flags would be read out as symbols
+        self.assertNotIn("\u2014", ph)
+        self.assertNotIn("\u2026", ph)
+        self.assertIn(", ", ph)
+
+    def test_symbols_the_voice_lacks_are_left_out_and_named(self):
+        self.assertIsNotNone(phonevoice.phonemes(["Warm."]))  # loaded once
+        dropped = set()
+        with mock.patch.object(phonevoice, "_symbols", set("hˈɛlo ")):
+            ph = phonevoice.phonemes(["Hello there."], dropped)[0]
+        self.assertTrue(set(ph) <= set("hˈɛlo "))
+        self.assertIn(".", dropped)
+
+    def test_the_voices_symbols_come_from_its_tokens_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(phonevoice.symbols(Path(tmp)))  # not prepared: nothing left out
+            (Path(tmp) / "tokens.txt").write_text("_ 0\n^ 1\n$ 2\n  3\nˈ 120\næ 39\n", encoding="utf-8")
+            self.assertEqual(phonevoice.symbols(Path(tmp)), {"_", "^", "$", " ", "ˈ", "æ"})
 
     def test_without_the_phonemizer_none(self):
-        with mock.patch.object(phonevoice, "_tokenizer", None), \
+        with mock.patch.object(phonevoice, "_backend", None), \
                 mock.patch.dict("sys.modules", {"kokoro_onnx.tokenizer": None}):
             self.assertIsNone(phonevoice.phonemes(["Hello."]))
 
@@ -116,14 +144,14 @@ class Clips(unittest.TestCase):
         self.assertTrue(phonevoice.progress("c2")["done"])
 
     def test_a_fallback_names_the_clip_it_stopped(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         phonevoice.send("c3", "claude", "af_heart", 3, ["One."], set(), [0])
         phonevoice.offer({"tts": "fallback", "reason": "fell behind 1.2 s", "id": "c3"})
         self.assertEqual(phonevoice.progress("c3")["fallback"], "fell behind 1.2 s")
         self.assertIsNone(phonevoice.progress("c3")["heard"])  # an older phone that doesn't say how far it played
 
     def test_a_fallback_keeps_how_far_the_phone_had_played(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         phonevoice.send("c5", "claude", "af_heart", 3, ["One.", "Two.", "Three."], set(), [0, 1, 2])
         phonevoice.said({"said": {"id": "c5", "piece": 2}})
         phonevoice.offer({"tts": "fallback", "reason": "fell behind", "id": "c5", "heard": 1})
@@ -173,7 +201,7 @@ class Model(unittest.TestCase):
             self.assertIsNone(phonevoice.model_file("secret.txt", root))
             self.assertIsNone(phonevoice.model_file("../model.onnx", root))
             self.assertEqual(phonevoice.model_file("tokens.txt", root), root / "tokens.txt")
-            # espeak-ng's English data: Kokoro's fallback for words the lexicon lacks ("Here's", "lived")
+            # espeak-ng's English data: still listed (sherpa-onnx 2.0 ignores it), at fixed relative paths only
             data = "espeak-ng-data/en_dict"
             self.assertIn(data, [f["name"] for f in found["files"]])
             self.assertEqual(phonevoice.model_file(data, root), root / data)
@@ -181,12 +209,26 @@ class Model(unittest.TestCase):
             (root / "espeak-ng-data/other").write_text("x")
             self.assertIsNone(phonevoice.model_file("espeak-ng-data/other", root))  # only the listed paths
 
-    def test_voice_ids_are_places_in_the_sorted_names(self):
-        import numpy as np
+    def test_the_manifest_is_jennys_and_names_its_version(self):
+        self.assertEqual(phonevoice.VERSION, "vits-piper-en_GB-jenny_dioco-medium")
+        self.assertIn("en_GB-jenny_dioco-medium.onnx", phonevoice.FILES)
+        self.assertIn("tokens.txt", phonevoice.FILES)
+        self.assertNotIn("voices.bin", phonevoice.FILES)  # Kokoro's
         with tempfile.TemporaryDirectory() as tmp:
-            voices = Path(tmp) / "voices.npz"
-            np.savez(voices, bf_alice=np.zeros(2), af_heart=np.zeros(2), af_bella=np.zeros(2))
-            self.assertEqual(phonevoice.voice_id("af_bella", voices), 0)
-            self.assertEqual(phonevoice.voice_id("af_heart", voices), 1)
-            self.assertEqual(phonevoice.voice_id("bf_alice", voices), 2)
-            self.assertIsNone(phonevoice.voice_id("nobody", voices))
+            for name in phonevoice.FILES:
+                (Path(tmp) / name).parent.mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / name).write_bytes(b"x")
+            self.assertEqual(phonevoice.manifest(Path(tmp))["version"], phonevoice.VERSION)
+
+    def test_every_agent_is_jennys_one_speaker(self):
+        self.assertEqual(phonevoice.voice_id("af_heart"), 0)
+        self.assertEqual(phonevoice.voice_id("bm_george"), 0)
+
+    def test_an_earlier_models_folder_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(phonevoice.stale(root / "none"), [])
+            (root / phonevoice.VERSION).mkdir()
+            (root / "kokoro-multi-lang-v1_0").mkdir()
+            (root / "kokoro-multi-lang-v1_0.tar.bz2").write_bytes(b"x")
+            self.assertEqual(phonevoice.stale(root), [root / "kokoro-multi-lang-v1_0"])

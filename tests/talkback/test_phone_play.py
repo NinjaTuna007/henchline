@@ -47,7 +47,7 @@ def phone(script):
 
 class PhonePlay(unittest.TestCase):
     def setUp(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         patches = [mock.patch.object(worker, "in_call", return_value=True),
                    mock.patch.object(worker, "mic_busy", return_value=False),
                    mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]
@@ -93,6 +93,27 @@ class PhonePlay(unittest.TestCase):
         thread.join(2)
         self.assertNotIn("laf", seen[0]["ph"][0])
         self.assertEqual(seen[0]["ph"], [phonevoice.phonemes(["Sure."])[0]])
+
+    def test_without_phonemes_the_laptop_says_it(self):
+        clip, path = clip_file("Done. The tests pass now.")
+        with mock.patch.object(worker.phonevoice, "phonemes", return_value=None):
+            worker.phone_play(FakeVoice(), clip, path, "")
+        self.assertEqual(phonevoice.outgoing(), [])  # nothing sent: the phone's voice can't read words
+        self.assertTrue(path.exists())  # kept for the laptop
+        self.assertFalse(phonevoice.phone_renders())  # and the rest of the call is the laptop's
+
+    def test_the_phonemes_are_jennys_british_ones(self):
+        clip, path = clip_file("The laptop.")
+        seen = []
+
+        def acks(say):
+            seen.append(say)
+            phonevoice.said({"said": {"id": say["id"], "done": True}})
+
+        thread = phone(acks)
+        worker.phone_play(FakeVoice(), clip, path, "")
+        thread.join(2)
+        self.assertIn("lˈæptɒp", seen[0]["ph"][0])
 
     def test_a_fallback_puts_the_rest_back_for_the_laptop(self):
         clip, path = clip_file("First sentence here. Second sentence here. Third one too.")
@@ -146,7 +167,7 @@ class Timeout(unittest.TestCase):
     """The phone never starts a clip: the laptop takes it back, but tells the phone to stop first."""
 
     def setUp(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         for p in [mock.patch.object(worker, "in_call", return_value=True),
                   mock.patch.object(worker, "mic_busy", return_value=False),
                   mock.patch.object(worker, "PHONE_TIMEOUT", 0.3),
@@ -185,7 +206,7 @@ class DroppedLine(unittest.TestCase):
     """A lift: the phone has the words and goes on speaking; the laptop waits for its report instead of replaying."""
 
     def setUp(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         self.calling, self.dropped = threading.Event(), threading.Event()
         self.calling.set()
         for p in [mock.patch.object(worker, "in_call", side_effect=lambda: self.calling.is_set()),
@@ -239,7 +260,7 @@ class Cap(unittest.TestCase):
     """A phone that started a clip but never says done (a resumed call that forgot it) doesn't hold talkback back."""
 
     def setUp(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         for p in [mock.patch.object(worker, "in_call", return_value=True),
                   mock.patch.object(worker, "mic_busy", return_value=False),
                   mock.patch.object(worker, "PHONE_SLACK", 0.2),
@@ -265,7 +286,7 @@ class Cap(unittest.TestCase):
 
 class DropWindowText(unittest.TestCase):
     def setUp(self):
-        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         self.calling, self.dropped = threading.Event(), threading.Event()
         self.calling.set()
         for p in [mock.patch.object(worker, "in_call", side_effect=lambda: self.calling.is_set()),

@@ -16,7 +16,7 @@ class PhoneVoiceSheet(activity: Activity, private val changed: () -> Unit = {}) 
     private var body: LinearLayout? = null
 
     fun show() {
-        val sheet = open("Speak on the phone", "Talkback in the same voices, made on this phone")
+        val sheet = open("Speak on the phone", "Talkback in ${PhoneVoice.NAME}'s voice, made on this phone")
         val content = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         body = content
         sheet.addView(content, flexible(4))
@@ -31,15 +31,18 @@ class PhoneVoiceSheet(activity: Activity, private val changed: () -> Unit = {}) 
         content.removeAllViews()
         val ready = PhoneVoice.ready(activity)
         content.addView(TextView(activity).apply {
-            text = "On a call, the laptop sends the words and the phone says them itself, so a weak signal (a lift, " +
+            text = "On a call, the laptop sends the words and the phone says them itself, in one British voice for " +
+                "every agent (not the laptop's voices), so a weak signal (a lift, " +
                 "a train) cuts no words off. It uses this phone's processor while it speaks; if the phone falls " +
                 "behind, gets hot or runs low on battery, the laptop's audio takes over by itself."
             textSize = 13f; setTextColor(colour(R.color.muted))
         }, wide(0))
         status = TextView(activity).apply {
             textSize = 14f; setTextColor(colour(R.color.text))
-            text = if (ready) "Ready · ${PhoneVoice.sizeOnPhone(activity) / 1_000_000} MB on this phone"
-                   else "Not downloaded yet · about 360 MB, from your laptop"
+            val old = PhoneVoice.staleSize(activity) / 1_000_000
+            text = if (ready) "${PhoneVoice.NAME} · ready · ${PhoneVoice.sizeOnPhone(activity) / 1_000_000} MB on this phone"
+                   else "${PhoneVoice.NAME} · not downloaded yet · about 64 MB, from your laptop" +
+                       if (old > 0) " (the earlier voice's $old MB go once it's here)" else ""
         }
         content.addView(status, wide(14))
         content.addView(LinearLayout(activity).apply {

@@ -17,19 +17,26 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Talkback spoken by the phone itself (the laptop's side: voice/phonevoice.py). Over a call the laptop sends a
- * clip's words, already cut into pieces the way its own talkback cuts them (punctuation only), and the phone renders
- * them with the same Kokoro voices: sherpa-onnx's Kokoro v1.0 export carries the laptop's very voices file, a voice's
- * id is its place in the sorted names. Only words cross the network, so a dropped line in a lift loses nothing that
+ * clip's words, already cut into pieces the way its own talkback cuts them (punctuation only), with each piece's
+ * phonemes, and the phone renders them with Piper's British English "Jenny" voice (VITS, one speaker, 22.05 kHz,
+ * resampled to the call's 24 kHz): Kokoro was too slow here (1.12-1.34 s per second of speech on the cores a locked
+ * call gets, Jenny 0.14, 2026-11-22). Only words cross the network, so a dropped line in a lift loses nothing that
  * was already here, and a lost clip is simply sent again.
  *
- * Off unless the user turns "Speak on the phone" on and the model is here (about 360 MB, fetched from the laptop,
+ * Off unless the user turns "Speak on the phone" on and the model is here (about 64 MB, fetched from the laptop,
  * every file checked against the laptop's SHA-256). When the phone can't keep up (a piece late by more than a
  * second while the speaker ran dry), the battery is low or the phone is hot, it says so ({"tts": "fallback"}) and
  * the laptop streams its own audio for the rest of the call, as before.
  */
 object PhoneVoice {
-    const val MODEL = "kokoro-multi-lang-v1_0"
-    const val ENGINE = "sherpa-kokoro"
+    // The model's name is the download's version: a phone holding an earlier model (Kokoro's folder) fetches this one
+    // afresh into its own folder, the earlier one is deleted once this one is whole (Download.run)
+    const val MODEL = "vits-piper-en_GB-jenny_dioco-medium"
+    const val ENGINE = "sherpa-vits"
+    const val NAME = "Jenny (British English)"
+    const val ONNX = "en_GB-jenny_dioco-medium.onnx"
+    private const val SPEAKER = 0  // the model's one speaker
+    private const val WARM_PH = "hˈaɪ."  // "Hi.", for the first render on loading
     private const val PREF = "phone_voice"  // the user's switch: speak on the phone
     private const val PREF_MOBILE = "phone_voice_mobile"  // download over mobile data too
     private const val FALLBACK_THREADS = 4  // when the phone's core speeds can't be read
@@ -43,18 +50,18 @@ object PhoneVoice {
     private const val STARVED_MS = 1000L  // the speaker ran dry this long waiting for a piece: a starve
     private const val STARVED_EARLY_MS = 2500L  // … within a clip's first 2 pieces or 5 s (the engine warming up)
     private const val STARVES = 2  // starves in one clip before the phone falls back (one is waited out)
+    private const val HOLD_MS = 1000L  // at most this before a clip's first piece plays, waiting for its second (Kokoro needed 2 s)
     private const val SPEECH_CPS = 17.5f  // characters of text per second of speech, as the laptop estimates
     private const val LOW_BATTERY = 15
     private const val TARGET_RTF = 0.5f  // what the render threads' hint session asks for: render twice as fast as speech
     // espeak-ng's English data under the model folder, still fetched (and required, so a phone and laptop agree on
-    // what "ready" means) though sherpa-onnx 2.0 ignores dataDir: words the lexicon lacks are spoken from the laptop's
-    // phonemes ("ph") instead. Exact relative paths, the only ones with a "/"
+    // what "ready" means) though sherpa-onnx 2.0 ignores dataDir: the phone speaks the laptop's phonemes ("ph").
+    // Exact relative paths, the only ones with a "/"
     val ESPEAK = listOf("espeak-ng-data/phontab", "espeak-ng-data/phonindex", "espeak-ng-data/phondata",
         "espeak-ng-data/intonations", "espeak-ng-data/en_dict", "espeak-ng-data/lang/gmw/en",
         "espeak-ng-data/lang/gmw/en-US", "espeak-ng-data/lang/gmw/en-GB-x-rp")
-    // What a phone must have before it counts as ready: one that downloaded before the espeak data was offered fetches
-    // just those files the next time (the others are kept, checked by size and hash)
-    val REQUIRED = listOf("model.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt") + ESPEAK
+    // What a phone must have before it counts as ready
+    val REQUIRED = listOf(ONNX, "tokens.txt") + ESPEAK
 
     /** A name the laptop's manifest may use: a plain file name, or one of the espeak data's fixed relative paths. */
     fun safeName(name: String): Boolean =
@@ -68,8 +75,21 @@ object PhoneVoice {
 
     // --- the model files --------------------------------------------------------------------------------------
 
-    fun dir(context: Context) = File(context.filesDir, "phone-voice/$MODEL")
+    private fun root(context: Context) = File(context.filesDir, "phone-voice")
+    fun dir(context: Context) = File(root(context), MODEL)
     private fun marker(context: Context) = File(dir(context), ".verified")
+
+    /** Folders of models this app no longer speaks with (Kokoro's, about 360 MB). */
+    fun stale(context: Context): List<File> = stale(root(context))
+    fun stale(root: File): List<File> = root.listFiles()?.filter { it.isDirectory && it.name != MODEL } ?: emptyList()
+    fun staleSize(context: Context): Long = stale(context).sumOf { d -> d.walkTopDown().filter { it.isFile }.sumOf { it.length() } }
+
+    /** Whether the laptop's manifest offers the model this app speaks with; else why not. */
+    fun offered(manifest: JSONObject): String? = when {
+        manifest.optString("version") == MODEL -> null
+        manifest.optString("version").startsWith("kokoro") -> "The laptop still offers the earlier voice: update Henchline on the laptop."
+        else -> "The laptop offers another voice model: update the app."
+    }
 
     /** Downloaded and every file checked: the manifest it was checked against is kept as the marker. */
     fun ready(context: Context): Boolean {
@@ -87,7 +107,7 @@ object PhoneVoice {
 
     fun delete(context: Context) {
         release()
-        dir(context).deleteRecursively()
+        root(context).deleteRecursively()  // an earlier model's folder with it
     }
 
     /** May the download start on this network: Wi-Fi (unmetered) unless the user allowed mobile data. */
@@ -112,7 +132,7 @@ object PhoneVoice {
                     JSONObject(it.body!!.string())
                 }
             } catch (e: Exception) { return "Couldn't reach the laptop (is Tailscale on?)" }
-            if (manifest.optString("version") != MODEL) return "The laptop offers another voice model: update the app."
+            offered(manifest)?.let { return it }
             val files = manifest.getJSONArray("files")
             val total = (0 until files.length()).sumOf { files.getJSONObject(it).getLong("size") }
             val folder = dir(context).apply { mkdirs() }
@@ -154,6 +174,9 @@ object PhoneVoice {
                 done += size
             }
             marker(context).writeText(manifest.toString())
+            // The earlier voice's files go once this one is whole: not before, so a cut download leaves the phone
+            // no worse off than it was (though that voice no longer speaks, the laptop's audio takes its place)
+            stale(context).forEach { it.deleteRecursively() }
             return null
         }
     }
@@ -184,6 +207,9 @@ object PhoneVoice {
     @Volatile var rtf = 0f
         private set
 
+    /** The call's rate from the engine's own (Jenny: 22.05 kHz), set when the model loads. */
+    @Volatile private var resampler = Resampler(RATE, RATE)
+
     private fun measured(renderMs: Long, samples: Int) {
         if (samples <= 0) return
         val now = renderMs / 1000f / (samples.toFloat() / RATE)
@@ -193,7 +219,7 @@ object PhoneVoice {
     @Volatile private var tts: com.k2fsa.sherpa.onnx.OfflineTts? = null
     private val loadLock = Any()
 
-    /** The model in memory (about 2.4 s the first time); held for the call. */
+    /** The model in memory; held for the call. */
     fun load(context: Context): Boolean = synchronized(loadLock) {
         if (tts != null) return true
         if (!ready(context)) return false
@@ -202,19 +228,15 @@ object PhoneVoice {
         val folder = dir(context).absolutePath
         val before = tasks()
         return try {
-            val kokoro = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
-                model = "$folder/model.onnx", voices = "$folder/voices.bin", tokens = "$folder/tokens.txt",
-                lexicon = "$folder/lexicon-us-en.txt", lang = "en-us",
-                dataDir = "$folder/espeak-ng-data")  // ignored by sherpa-onnx 2.0: the laptop's phonemes cover missing words
-            val config = com.k2fsa.sherpa.onnx.OfflineTtsConfig(
-                model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(kokoro = kokoro, numThreads = threads, provider = "cpu"))
-            val engine = com.k2fsa.sherpa.onnx.OfflineTts(null, config)
-            // A first render is slow (1.55 vs about 1.0 later, 2026-11-22): done here, not on the first reply
+            val engine = com.k2fsa.sherpa.onnx.OfflineTts(null, config(folder, threads))
+            resampler = Resampler(engine.sampleRate(), RATE)
+            // A first render is slow (Kokoro's: 1.55 vs about 1.0 later, 2026-11-22): done here, not on the first reply
             val began = System.currentTimeMillis()
-            val warm = engine.generate("Hi.", 3, 1.0f).samples
+            val warm = resampler.of(render(engine, "Hi.", WARM_PH, SPEAKER))
             measured(System.currentTimeMillis() - began, warm.size)
             engineThreads = spawned(before)
-            log("loaded with $threads threads, warm-up rtf ${"%.2f".format(rtf)}, engine threads ${engineThreads.joinToString(",")}; " +
+            log("loaded $MODEL (${engine.sampleRate()} Hz to $RATE) with $threads threads, warm-up rtf ${"%.2f".format(rtf)}, " +
+                "engine threads ${engineThreads.joinToString(",")}; " +
                 placement(intArrayOf(android.os.Process.myTid()) + engineThreads))
             tts = engine
             true
@@ -225,6 +247,15 @@ object PhoneVoice {
     }
 
     fun release() = synchronized(loadLock) { tts?.release(); tts = null; engineThreads = IntArray(0) }
+
+    /** Jenny's engine over the files in `folder`: the model, its symbols, and espeak's data (ignored by sherpa-onnx 2.0,
+     *  which speaks only the phonemes it's given). */
+    private fun config(folder: String, threads: Int): com.k2fsa.sherpa.onnx.OfflineTtsConfig {
+        val vits = com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig(
+            model = "$folder/$ONNX", tokens = "$folder/tokens.txt", dataDir = "$folder/espeak-ng-data")
+        return com.k2fsa.sherpa.onnx.OfflineTtsConfig(
+            model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(vits = vits, numThreads = threads, provider = "cpu"))
+    }
 
     // --- the render threads' cores ----------------------------------------------------------------------------
     // In the background Android keeps an app to the little cores unless something says its work matters: a call's
@@ -346,9 +377,10 @@ object PhoneVoice {
 
     // --- speaking clips ---------------------------------------------------------------------------------------
 
-    /** One piece's audio. With the laptop's phonemes (`ph`) it speaks those: this engine skips every word its
-     *  lexicon lacks ("Here's", "lived", 2026-11-22), the laptop's espeak doesn't. Without them (an older laptop),
-     *  the words. A piece with nothing to say (a bare tag) is silence. */
+    /** One piece's audio, at the engine's own rate. With the laptop's phonemes (`ph`: espeak-ng's IPA, as Piper makes
+     *  it; the engine adds its start, end and padding marks, and skips, logging, any symbol the voice lacks) it speaks
+     *  those: this engine has no text front end for a Piper voice. Without them, the words, which give it nothing to
+     *  say. A piece with nothing to say (a bare tag) is silence. */
     fun render(engine: com.k2fsa.sherpa.onnx.OfflineTts, text: String, ph: String?, sid: Int): FloatArray {
         if (ph == null) return engine.generate(text, sid, 1.0f).samples
         if (ph.isBlank()) return FloatArray(0)
@@ -363,19 +395,16 @@ object PhoneVoice {
         return ph.opt(n) as? String
     }
 
-    /** Debug builds only (PhoneVoiceBench): a separate engine with `threads`, `text` rendered 3 times, each run's
-     *  render speed logged, so the app's speed can be compared with sherpa-onnx's own command-line build. With `ph`
-     *  (the laptop's phonemes for it) those are rendered instead, as in a call. */
-    fun bench(context: Context, threads: Int, text: String, ph: String? = null, hint: Boolean = false) {
-        if (!ready(context)) return log("bench: the voice isn't downloaded")
-        val folder = dir(context).absolutePath
+    /** Debug builds only (PhoneVoiceBench): a separate engine with `threads`, the laptop's phonemes `ph` for `text`
+     *  rendered 3 times, each run's render speed logged, so the app's speed can be compared with sherpa-onnx's own
+     *  command-line build. The downloaded voice, or the one in `folder` (its .onnx as ONNX, tokens.txt). */
+    fun bench(context: Context, threads: Int, text: String, ph: String, hint: Boolean = false, folder: String? = null) {
+        if (folder == null && !ready(context)) return log("bench: the voice isn't downloaded")
+        val config = config(folder ?: dir(context).absolutePath, threads)
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
         val before = tasks()
-        val kokoro = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
-            model = "$folder/model.onnx", voices = "$folder/voices.bin", tokens = "$folder/tokens.txt",
-            lexicon = "$folder/lexicon-us-en.txt", lang = "en-us", dataDir = "$folder/espeak-ng-data")
-        val engine = com.k2fsa.sherpa.onnx.OfflineTts(null, com.k2fsa.sherpa.onnx.OfflineTtsConfig(
-            model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(kokoro = kokoro, numThreads = threads, provider = "cpu")))
+        val engine = com.k2fsa.sherpa.onnx.OfflineTts(null, config)
+        val rate = engine.sampleRate()
         // The bench's engine, not the call's: its threads are the ones to hint and watch
         val mine = spawned(before)
         val boost = if (hint) Boost(context) else null
@@ -383,11 +412,11 @@ object PhoneVoice {
             for (run in 1..3) {
                 boost?.start(text.length / SPEECH_CPS, mine)
                 val began = System.currentTimeMillis()
-                val samples = render(engine, text, ph, 3)
+                val samples = render(engine, text, ph, SPEAKER)
                 val ms = System.currentTimeMillis() - began
                 boost?.done(ms)
-                val audio = samples.size.toDouble() / RATE
-                log("bench threads=$threads chars=${text.length} ph=${ph?.length ?: "none"} hint=${boost?.state ?: "no"} run=$run " +
+                val audio = samples.size.toDouble() / rate
+                log("bench model=$MODEL threads=$threads chars=${text.length} ph=${ph.length} hint=${boost?.state ?: "no"} run=$run " +
                     "render_ms=$ms audio_s=${"%.2f".format(audio)} rtf=${"%.2f".format(if (audio > 0) ms / 1000.0 / audio else 0.0)} " +
                     placement(intArrayOf(android.os.Process.myTid()) + mine))
             }
@@ -480,7 +509,7 @@ object PhoneVoice {
             ends.clear()
             val pieces = clip.optJSONArray("pieces") ?: JSONArray()
             val joined = clip.optJSONArray("joined").toIntSet()
-            val sid = clip.optInt("sid", 3)
+            val sid = clip.optInt("sid", SPEAKER).takeIf { it in 0 until engine.numSpeakers() } ?: SPEAKER
             // Rendered ahead of the one playing, on its own thread at audio priority
             val ready = LinkedBlockingQueue<Pair<Int, FloatArray>>(2)
             val over = AtomicBoolean(false)  // this clip is finished, cut or fallen back: the renderer stops
@@ -493,8 +522,10 @@ object PhoneVoice {
                     log("render $id #$n start (${text.length} chars${if (ph != null) ", ${ph.length} phonemes" else ""})")
                     boost.start(text.length / SPEECH_CPS)
                     val began = System.currentTimeMillis()
-                    val samples = render(engine, text, ph, sid)
+                    val samples = resampler.of(render(engine, text, ph, sid))
                     val took = System.currentTimeMillis() - began
+                    // Words alone (no phonemes from the laptop) give this voice nothing to say: the laptop says it
+                    if (samples.isEmpty() && ph == null && text.any { it.isLetterOrDigit() }) error("no phonemes for #$n")
                     boost.done(took)
                     measured(took, samples.size)
                     log("render $id #$n done: ${samples.size} samples in $took ms, rtf ${"%.2f".format(
@@ -540,7 +571,7 @@ object PhoneVoice {
                         val needed = (if (rtf > 0f) rtf else 1f) * nextText.length / SPEECH_CPS
                         val gate = System.currentTimeMillis()
                         while (first < needed && ready.isEmpty() && renderer.isAlive &&
-                               System.currentTimeMillis() - gate < minOf(((needed - first) * 1000).toLong(), 2000L)) {
+                               System.currentTimeMillis() - gate < minOf(((needed - first) * 1000).toLong(), HOLD_MS)) {
                             if (stopped.remove(id)) return
                             Thread.sleep(20)
                         }
@@ -587,7 +618,7 @@ object PhoneVoice {
 
     // --- shared with the laptop's rules (tests/fixtures/phone-voice-trim.json) ---------------------------------
 
-    /** Kokoro's quiet lead-in and tail cut (to EDGE) where pieces of one sentence join, as the laptop's trim(). */
+    /** The voice's quiet lead-in and tail cut (to EDGE) where pieces of one sentence join, as the laptop's trim(). */
     fun trim(samples: FloatArray, lead: Boolean, tail: Boolean): FloatArray {
         if (samples.isEmpty() || !(lead || tail)) return samples
         var peak = 0f

@@ -1,10 +1,10 @@
-"""Talkback rendered on the phone: the laptop sends a clip's words, the phone speaks them with Kokoro itself.
+"""Talkback rendered on the phone: the laptop sends a clip's words and their phonemes, the phone speaks them itself.
 
 Over a call the laptop normally streams its own Kokoro audio. When the phone has the model and the user turned
 "Speak on the phone" on, only text crosses the network (a dropped line in a lift loses no words), and the phone
-renders the same voice: sherpa-onnx's Kokoro v1.0 export carries the very same voices file (checked 2026-11-22:
-af_heart, af_bella, bf_alice, af_sky, bm_george equal to the laptop's to the last float), a voice's id is its place
-in the sorted list of names.
+renders it with its own voice: Piper's British English "Jenny" (a VITS model, one speaker, 22.05 kHz). Kokoro
+rendered too slowly there (1.12-1.34 s per second of speech on the cores a locked call gets, Jenny 0.14, measured
+2026-11-22), so every agent's talkback is Jenny's voice on the phone.
 
 The pieces travel through files, so the talkback worker and the call server stay separate processes:
   CALL_TTS                 the phone's offer for this call: {"engine", "model", "fallback": reason or ""}
@@ -31,23 +31,29 @@ from pathlib import Path
 
 from voice.state import STATE, read_json, write_json
 
-VERSION = "kokoro-multi-lang-v1_0"
+# The model's name is the format's version: a phone holding another model (Kokoro, before 2026-11-22) isn't offered
+# this one's files under its old folder, it downloads these afresh, and the laptop takes only this model's offers
+VERSION = "vits-piper-en_GB-jenny_dioco-medium"
+ENGINE = "sherpa-vits"
 ARCHIVE_URL = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/{VERSION}.tar.bz2"
-ARCHIVE_SHA256 = "60703707bc05ccd48d60e1eb723f38b07d6e474795a0b6a588d7220400e0f7a4"
+ARCHIVE_SHA256 = "a0888024569bafbefc05a4b48ddf8419d8dbbf3205f4af37cf7c6f1a87cc20c5"
 ROOT = Path.home() / ".local/share/henchline/phone-voice"
 MODEL_DIR = ROOT / VERSION
+ONNX = "en_GB-jenny_dioco-medium.onnx"
+ESPEAK_VOICE = "en-gb-x-rp"  # the espeak-ng voice Jenny was trained on (espeak.voice in the model's .onnx.json)
 # espeak-ng's English data, still served (the phone requires it before it counts as ready) though sherpa-onnx 2.0
-# ignores it: words the lexicon lacks are spoken from the phonemes sent with each piece (phonemes()). Only these exact
-# relative paths are ever served, never anything else
+# ignores it: the phone speaks the phonemes sent with each piece (phonemes()). Only these exact relative paths are
+# ever served, never anything else
 ESPEAK = ("espeak-ng-data/phontab", "espeak-ng-data/phonindex", "espeak-ng-data/phondata", "espeak-ng-data/intonations",
           "espeak-ng-data/en_dict", "espeak-ng-data/lang/gmw/en", "espeak-ng-data/lang/gmw/en-US",
           "espeak-ng-data/lang/gmw/en-GB-x-rp")
-FILES = ("model.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt", "LICENSE") + ESPEAK  # all the phone loads
-LAPTOP_VOICES = Path.home() / ".local/share/talkback/voices-v1.0.bin"
+FILES = (ONNX, "tokens.txt", "MODEL_CARD") + ESPEAK  # all the phone loads (MODEL_CARD: the voice's source and terms)
+SPEAKER = 0  # Jenny is the model's only speaker
 
 CALL_TTS = STATE / "call.tts"
 PHONE_SAY = STATE / "phone-say"
-PHONE_RTF = 1.0  # until the phone reports its own: in a call it rendered at 0.94-1.55 (adb shell said 0.68), 2026-11-22
+PHONE_RTF = 0.5  # until the phone reports its own: Jenny rendered at 0.14 on the phone's little cores, 2026-11-22
+PLAN_RTF_MIN = 0.3  # never planned faster than this: a render also waits for the call's own threads
 ID = re.compile(r"[A-Za-z0-9._-]{1,120}")
 
 
@@ -55,7 +61,7 @@ ID = re.compile(r"[A-Za-z0-9._-]{1,120}")
 
 def manifest(root: Path = MODEL_DIR) -> dict | None:
     """{"version", "files": [{name, size, sha256}]}, or None while the files aren't there. Hashes are kept beside
-    the files and worked out again only when a file's size or time changed (the model is 325 MB)."""
+    the files and worked out again only when a file's size or time changed (the model is 63 MB)."""
     cache_path = root / ".manifest.json"
     cache = read_json(cache_path) if cache_path.exists() else {}
     files, changed = [], False
@@ -91,7 +97,8 @@ def _sha256(path: Path) -> str:
 
 
 def prepare(root: Path = ROOT) -> Path:
-    """Fetch sherpa-onnx's Kokoro archive (once, checked against its pinned hash) and keep only FILES."""
+    """Fetch sherpa-onnx's Jenny archive (once, checked against its pinned hash) and keep only FILES. An earlier
+    model's folder beside it (Kokoro's, 325 MB) is left for the user to delete: python -m voice.phonevoice clean."""
     import urllib.request
     target = root / VERSION
     if all((target / name).is_file() for name in FILES):
@@ -111,14 +118,14 @@ def prepare(root: Path = ROOT) -> Path:
     return target
 
 
-def voice_id(name: str, voices: Path = LAPTOP_VOICES) -> int | None:
-    """A voice's id on the phone: its place among the sorted names of the shared voices file."""
-    try:
-        import numpy as np
-        names = sorted(np.load(voices).files)
-    except (OSError, ValueError, ImportError):
-        return None
-    return names.index(name) if name in names else None
+def voice_id(name: str) -> int | None:
+    """A voice's id on the phone: Jenny is its one speaker, whichever agent's voice the laptop would use."""
+    return SPEAKER
+
+
+def stale(root: Path = ROOT) -> list[Path]:
+    """Folders of models the phone no longer uses (Kokoro's), left by an earlier prepare."""
+    return [p for p in root.iterdir() if p.is_dir() and p.name != VERSION] if root.is_dir() else []
 
 
 # --- the call: the phone's offer, and its fallback ------------------------------------------------------------
@@ -128,7 +135,7 @@ def offer(message: dict) -> None:
     ({"tts": "fallback", "reason"}): from then on, this call streams the laptop's audio again."""
     tts = message.get("tts")
     if isinstance(tts, dict):
-        if tts.get("model") == VERSION and tts.get("engine") == "sherpa-kokoro":
+        if tts.get("model") == VERSION and tts.get("engine") == ENGINE:
             state = {"engine": tts["engine"], "model": tts["model"], "fallback": ""}
             if _rtf(tts.get("rtf")):
                 state["rtf"] = _rtf(tts.get("rtf"))
@@ -154,10 +161,10 @@ def _rtf(value) -> float | None:
 
 def plan_rtf() -> float:
     """The speed the laptop cuts the phone's pieces for: the phone's own measured speed with a margin
-    (max(1.2 x measured, 0.9)), else PHONE_RTF."""
+    (max(1.2 x measured, PLAN_RTF_MIN)), else PHONE_RTF."""
     state = read_json(CALL_TTS) if CALL_TTS.exists() else {}
     measured = _rtf(state.get("rtf"))
-    return max(1.2 * measured, 0.9) if measured else PHONE_RTF
+    return max(1.2 * measured, PLAN_RTF_MIN) if measured else PHONE_RTF
 
 
 def phone_renders() -> bool:
@@ -176,23 +183,60 @@ def call_over() -> None:
 
 # --- the worker's side -----------------------------------------------------------------------------------------
 
-_tokenizer = None
-_tokenizer_lock = threading.Lock()
+_backend = None
+_symbols: set[str] | None = None
+_backend_lock = threading.Lock()
+# Punctuation espeak passes through that Jenny has no symbol for, as the pause a reader makes there
+DASH = re.compile(r"\s*[\u2013\u2014]\s*")
+ELLIPSIS = re.compile(r"\s*\u2026")
 
 
-def phonemes(texts: list[str]) -> list[str] | None:
-    """Each text as Kokoro's phonemes, made by the same espeak step the laptop's own talkback uses, or None when that
-    step isn't available here. The phone speaks these instead of the words: its engine (sherpa-onnx 2.0) dropped the
-    espeak fallback, so every word missing from its lexicon was skipped ("Here's", "lived", 2026-11-22). About 0.4 ms
-    a piece (7 ms at most), 150 ms to load once."""
-    global _tokenizer
+def symbols(root: Path = MODEL_DIR) -> set[str] | None:
+    """The phonemes Jenny knows (its tokens.txt: a symbol and its id per line), or None before prepare."""
     try:
-        with _tokenizer_lock:
-            if _tokenizer is None:
+        lines = (root / "tokens.txt").read_text(encoding="utf-8").split("\n")
+    except OSError:
+        return None
+    return {line.rsplit(" ", 1)[0] for line in lines if " " in line} or None
+
+
+def phonemes(texts: list[str], dropped: set[str] | None = None) -> list[str] | None:
+    """Each text as Jenny's phonemes: espeak-ng's IPA in the voice she was trained on (en-gb-x-rp), stress marks
+    and punctuation kept, language-switch flags removed, as Piper makes them; sherpa-onnx adds the start, end and
+    padding marks itself. None when espeak isn't available here. The phone speaks these, not the words: its engine
+    (sherpa-onnx 2.0) has no text front end for this model. A symbol Jenny lacks is left out (the phone's engine
+    would skip it anyway) and added to `dropped`, so the caller can log it."""
+    global _backend, _symbols
+    try:
+        with _backend_lock:
+            if _backend is None:
                 from kokoro_onnx.tokenizer import Tokenizer
-                _tokenizer = Tokenizer()
-        return [_tokenizer.phonemize(text, "en-us") if text.strip() else "" for text in texts]
-    except Exception:  # no espeak or no kokoro_onnx: the phone gets the words alone, as before
+                Tokenizer()  # points phonemizer at the espeak-ng library and data the laptop's talkback uses
+                from phonemizer.backend import EspeakBackend
+                _backend = EspeakBackend(ESPEAK_VOICE, preserve_punctuation=True, with_stress=True,
+                                         language_switch="remove-flags")
+                _symbols = symbols()
+            try:
+                from kokoro_onnx.tokenizer import _espeak_lock as lock  # espeak's state is the process's
+            except ImportError:
+                lock = threading.Lock()
+            out = []
+            for text in texts:
+                if not text.strip():
+                    out.append("")
+                    continue
+                with lock:
+                    ph = _backend.phonemize([text], strip=True)[0]
+                ph = ELLIPSIS.sub(".", DASH.sub(", ", ph)).strip()
+                if _symbols is not None:
+                    lost = {c for c in ph if c not in _symbols}
+                    if lost:
+                        ph = "".join(c for c in ph if c in _symbols)
+                        if dropped is not None:
+                            dropped |= lost
+                out.append(ph)
+            return out
+    except Exception:  # no espeak or no phonemizer: the phone can't speak these, the laptop says them
         return None
 
 
@@ -305,7 +349,20 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["prepare"]:
         print(prepare())
         print(json.dumps(manifest(), indent=1))
+        for old in stale():
+            print(f"no longer used: {old} (python -m voice.phonevoice clean)")
+    elif sys.argv[1:2] == ["phonemes"] and len(sys.argv) > 2:  # what the phone is sent for a text, for its bench
+        print(phonemes([" ".join(sys.argv[2:])])[0])
+    elif sys.argv[1:] == ["clean"]:
+        import shutil
+        for old in stale():
+            shutil.rmtree(old)
+            print(f"deleted {old}")
+        for archive in ROOT.glob("*.tar.bz2") if ROOT.is_dir() else []:
+            if archive.name != f"{VERSION}.tar.bz2":
+                archive.unlink()
+                print(f"deleted {archive}")
     else:
-        print("usage: python -m voice.phonevoice prepare", file=sys.stderr)
+        print("usage: python -m voice.phonevoice prepare|clean|phonemes TEXT", file=sys.stderr)
         sys.exit(2)
     os._exit(0)

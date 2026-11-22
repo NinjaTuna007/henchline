@@ -455,7 +455,7 @@ class Voice:
             log(TALKBACK_LOG, f"{clip.agent} cut by {why}, {len(clip.sentences)} sentences kept")
 
 
-PHONE_MIN_CHARS = 80  # no piece for the phone shorter than this but at a sentence end: each render costs a lot
+PHONE_MIN_CHARS = 30  # no piece for the phone shorter than this but at a sentence end: each render has a set cost
 
 
 def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
@@ -465,14 +465,20 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
     plan = pieces(list(clip.sentences), intro, rtf=phonevoice.plan_rtf(), min_chars=PHONE_MIN_CHARS)
     name = clip.voice or (VOICES[clip.agent] if clip.agent in SYSTEM else chosen_voice(clip.agent))
     sid = phonevoice.voice_id(name)
-    if sid is None:  # a voice the shared file lacks: said by the laptop
+    if sid is None:  # a voice the phone lacks: said by the laptop
         phonevoice.offer({"tts": "fallback", "reason": f"no voice {name} on the phone"})
         return
+    # Phonemes made here: the phone's engine has no text front end for its voice, it speaks only these
+    dropped: set[str] = set()
+    ph = phonevoice.phonemes([TAGS.sub("", piece).strip() for piece in plan.pieces], dropped)
+    if ph is None:  # no espeak here: the phone couldn't say a word of it, the laptop says it (this call on)
+        phonevoice.offer({"tts": "fallback", "reason": "no phonemizer on the laptop"})
+        return
+    if dropped:
+        log(TALKBACK_LOG, f"{clip.agent} on the phone: phonemes the voice lacks left out: {''.join(sorted(dropped))!r}")
     marker = Playing(path.name, clip.session, clip.agent, " ".join(plan.pieces))
     marker.save()
     path.unlink(missing_ok=True)
-    # Phonemes made here, as the laptop's own talkback makes them: the phone's engine skips words its lexicon lacks
-    ph = phonevoice.phonemes([TAGS.sub("", piece).strip() for piece in plan.pieces])
     phonevoice.send(path.name, clip.agent, name, sid, plan.pieces, plan.joined, plan.sentence, ph)
     began, cut, fell_back, spoken, ended, heard = time.time(), False, "", 0, False, None
     # A cap once the phone has started it: a report that never comes (a resumed call that forgot the clip) must not
