@@ -170,6 +170,14 @@ class Chains(unittest.TestCase):
         chains.append(chain, "ended", session="codex-_home_me_project", pane="%1", pid=1)
         self.assertEqual(chains.ended(), [])  # would hide every later Codex chat in that folder
 
+    def test_launched_where_names_a_helper_by_the_folder_it_was_started_in(self):
+        boss, kid = "claude-80000000-0000-4000-8000-000000000000", "claude-90000000-0000-4000-8000-000000000000"
+        chain = chains.open(boss)
+        chains.append(chain, "launch", parent=boss, pane="%1", pid=1, depth=2, agent="claude", where="pc_diagnostics")
+        chains.bind(kid, "%1", 1)
+        chains.append(chain, "launch", parent=boss, session="claude-x", pane="%2", pid=2, depth=2)  # no folder: none
+        self.assertEqual(chains.launched_where(), {kid: "pc_diagnostics"})  # under its own key, once bound
+
     def test_the_ninth_start_is_refused(self):
         chain = chains.open("boss")
         for i in range(8):
@@ -774,6 +782,21 @@ class AskSubmitted(unittest.TestCase):
             self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
         self.assertEqual(pressed, [("send-keys", "-t", "%7", "Enter")] * 2)
 
+    def test_the_cursor_cli_box_is_read_too(self):
+        from voice.desktop import tmux
+        top, bottom = " " + "▄" * 40, " " + "▀" * 40
+        stuck = ["  Earlier.", top, "  → [henchline · deploy] You were started by another agent.", bottom,
+                 "  Auto · 3%                    Run Everything", "  ~/website"]
+        sent = ["  [henchline · deploy] You were started by another agent.", top, "  → Add a follow-up", bottom,
+                "  Auto · 3%                    Run Everything", "  ~/website"]
+        here = threading.current_thread()
+        screens = iter(["\n".join(stuck), "\n".join(sent)])
+        pressed = []
+        with mock.patch.object(tmux, "out", side_effect=lambda *a: next(screens) if threading.current_thread() is here else ""), \
+                mock.patch.object(tmux, "tmux", side_effect=lambda *a: pressed.append(a) if threading.current_thread() is here else None):
+            self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
+        self.assertEqual(pressed, [("send-keys", "-t", "%7", "Enter")])
+
     def test_a_box_that_never_empties_is_a_failure(self):
         from voice.desktop import tmux
         with mock.patch.object(tmux, "out", return_value="\n".join(self.STUCK)), mock.patch.object(tmux, "tmux"):
@@ -825,7 +848,7 @@ class AskSubmitted(unittest.TestCase):
             self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
         keys.assert_not_called()
 
-    def test_a_cursor_or_codex_child_gets_no_extra_enter(self):
+    def test_only_a_codex_child_gets_no_extra_enter(self):
         folder = Path.home() / "workproj"
         folder.mkdir(exist_ok=True)
         terms = mock.Mock()
@@ -847,8 +870,12 @@ class AskSubmitted(unittest.TestCase):
                     mock.patch("voice.minions._server", return_value=server):
                 code = deploy(["--agent", agent, "--folder", str(folder), "--ask", "look"], lambda: boss)
             self.assertEqual(code, 0, agent)
-            pending.assert_not_called()
-            ready.assert_not_called()
+            if agent == "cursor":  # the Cursor CLI's box is read like Claude's: an ask typed early sat unsent
+                pending.assert_called_once()
+                ready.assert_called_once()
+            else:
+                pending.assert_not_called()
+                ready.assert_not_called()
             if agent == "codex":
                 self.assertIn('approvals_reviewer="user"', start.call_args.kwargs["flags"])
             else:

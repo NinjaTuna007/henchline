@@ -171,7 +171,7 @@ def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder
     # Never answered here: a folder the agent trusts asks nothing. If its question shows anyway, the ask would be
     # typed into it (Codex's default answer is yes), so the child is closed instead. Claude's is looked for once
     # its box is drawn; Codex's may take a moment to come.
-    if agent == "claude":  # the layout read here is Claude's; the others would only wait out the timeout
+    if agent in ("claude", "cursor"):  # the layouts read here; Codex would only wait out the timeout
         tmux.composer_ready(tab)
     if _trust_question_up(tab, agent, 4.0 if agent == "codex" else 0.0):
         tmux.end(tab)
@@ -179,7 +179,7 @@ def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder
         return 1
     # The box was drawn first, and the ask must actually leave it: a multi-line paste can keep its Enter
     typed = desktop().terminals.type_line(tab, ASK_PREFIX + ask) and (
-        agent != "claude" or tmux.submit_pending(tab, ASK_MARK))
+        agent not in ("claude", "cursor") or tmux.submit_pending(tab, ASK_MARK))
     if not typed:
         tmux.end(tab)
         print(f"{agent} started in {match.name} (tmux {tab.address}), but the ask was not typed")
@@ -190,8 +190,12 @@ def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder
     server.notice(f"{agent.capitalize()} started in {match.name}",
                   f"From a deploy, in {match.name}. {permissions.child_runs(agent, boss_level)} "
                   "`tmux attach -t henchline` to watch or answer.")
+    # The boss's own pane, from the tree: a Cursor CLI's chat can only be told by its pane (agents.vouched), and a
+    # helper's pane must never pass for it
+    from voice.agents import tree_pane
+    boss_pane, boss_pid = tree_pane()
     chains.append(chain, "launch", parent=boss.session, pane=tab.address, pid=pid, depth=depth + 1,
-                  agent=agent, where=match.name, ask=ask, reservation=slot)
+                  agent=agent, where=match.name, ask=ask, reservation=slot, parent_pane=boss_pane, parent_pid=boss_pid)
     log(HANDSFREE_LOG, f"deployed {agent} in {match.name} (tmux {tab.address})")
     print(f"deployed {agent} in {match.name} (tmux {tab.address})")
     return 0

@@ -190,6 +190,11 @@ def caller(register: bool = False) -> Speaker | None:
         here = desktop().terminals.tab_of_caller()
         moved = bool(here) and here != known.tab
         if moved:
+            from voice.agents import vouched
+            # Only the chat itself may move its own record: a process claiming another chat's id (a helper setting
+            # its boss's) must not repoint where that chat's replies and rings are typed, refused or not
+            moved = vouched(agent, session) == ""
+        if moved:
             known.tab, known.pid, known.born = here, 0, 0
         if known.pin() or moved:
             known.save(SPEAKERS / f"{session}.json")
@@ -202,8 +207,10 @@ def caller(register: bool = False) -> Speaker | None:
     # Never heard through talkback: found now, as talkback would (its workspace, its terminal tab), and kept, so an
     # answered ring can be put through to it (a Cursor ring was routed to Claude, 2026-11-15). Not made the one
     # spoken words go to: that is still whoever spoke last, until the ring is answered
-    from voice.agents import agent_where
+    from voice.agents import agent_where, vouched
     from voice.desktop import current as desktop
+    if vouched(agent, session):  # a claimed id the process tree doesn't back: not written down as that chat
+        return Speaker(session, agent)
     speaker = Speaker(session, agent, agent_where(), desktop().terminals.tab_of_caller())
     speaker.pin()
     speaker.save(SPEAKERS / f"{session}.json")

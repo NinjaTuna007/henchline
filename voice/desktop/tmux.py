@@ -222,13 +222,17 @@ def resume(agent: str, folder: Path, chat: str) -> Tab:
     return _window(folder, f"{agent}:{chat[:8]}", argv) if argv else Tab()
 
 
+RULES = set("─━▄▀")  # Claude draws its box with lines, the Cursor CLI with half blocks (▄ above, ▀ below)
+PROMPTS = ("❯", "→")  # the prompt mark at the box's first line: Claude's, the Cursor CLI's
+
+
 def _composer(lines: list[str]) -> list[str] | None:
-    """Claude's prompt box: the lines between the last two rules drawn across the pane, the last rule near the
-    bottom (only its footer below). None when the pane doesn't look like that, so the box can't be told apart
-    from the transcript."""
+    """Claude's (or the Cursor CLI's) prompt box: the lines between the last two rules drawn across the pane, the
+    last rule near the bottom (only its footer below). None when the pane doesn't look like that, so the box can't
+    be told apart from the transcript."""
     while lines and not lines[-1].strip():
         lines = lines[:-1]
-    rules = [i for i, line in enumerate(lines) if len(line.strip()) >= 20 and set(line.strip()) <= set("─━")]
+    rules = [i for i, line in enumerate(lines) if len(line.strip()) >= 20 and set(line.strip()) <= RULES]
     if len(rules) < 2 or len(lines) - 1 - rules[-1] > 3:
         return None
     return lines[rules[-2] + 1:rules[-1]]
@@ -243,7 +247,7 @@ def _dialog(lines: list[str]) -> bool:
     while lines and not lines[-1].strip():
         lines = lines[:-1]
     if _composer(lines) is not None:
-        rules = [i for i, line in enumerate(lines) if len(line.strip()) >= 20 and set(line.strip()) <= set("─━")]
+        rules = [i for i, line in enumerate(lines) if len(line.strip()) >= 20 and set(line.strip()) <= RULES]
         lines = lines[rules[-1] + 1:]  # the footer: Claude's own questions are drawn there, not in the transcript
     return any(DIALOG.search(line) for line in lines)
 
@@ -251,7 +255,8 @@ def _dialog(lines: list[str]) -> bool:
 def _pending(box: list[str], marker: str) -> bool:
     """The words are still in the box: its first line is the prompt mark and the marker, or a paste placeholder."""
     first = next((line.strip() for line in box if line.strip()), "")
-    if first.startswith("❯") and first.removeprefix("❯").lstrip().startswith(marker):
+    mark = next((m for m in PROMPTS if first.startswith(m)), "")
+    if mark and first.removeprefix(mark).lstrip().startswith(marker):
         return True
     return any("[Pasted text" in line for line in box)
 
@@ -261,7 +266,7 @@ def composer_ready(tab: Tab, wait: float = 15.0) -> bool:
     until = time.monotonic() + wait
     while time.monotonic() < until:
         box = _composer(out("capture-pane", "-p", "-t", tab.address).splitlines())
-        if box is not None and any(line.lstrip().startswith(("❯", ">", "›")) for line in box):
+        if box is not None and any(line.lstrip().startswith((*PROMPTS, ">", "›")) for line in box):
             return True
         time.sleep(0.3)
     return False
@@ -270,7 +275,7 @@ def composer_ready(tab: Tab, wait: float = 15.0) -> bool:
 def submit_pending(tab: Tab, marker: str, tries: int = 3, pause: float = 1.0) -> bool:
     """After typing, the words must have left the prompt box. A multi-line paste can swallow the Enter that
     follows it (a deploy's ask sat unsent, 2026-11-21), so Enter is pressed again while the box still holds the
-    marker. Claude's layout only. True when the box no longer holds it, or the box can't be found (nothing to
+    marker. Claude's and the Cursor CLI's layouts. True when the box no longer holds it, or the box can't be found (nothing to
     check against). Also True, with no press, when a question is waiting below the transcript: Enter would answer
     it, and what happened to the ask is unknown, so the pane is left for the user rather than ended."""
     for attempt in range(tries + 1):

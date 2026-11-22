@@ -223,12 +223,46 @@ def vouched(agent: str, session: str) -> str:
             command = Path(f"/proc/{mine.pid}/cmdline").read_bytes()
         except OSError:
             command = b""
-        return "" if resume._is_chat(agent, chat, mine.pid, environ, command) else wrong
+        if resume._is_chat(agent, chat, mine.pid, environ, command):
+            return ""
+        return "" if agent == "cursor" and _pane_vouches(mine, session) else wrong
     try:
         folder = mine.folder
-    except OSError:
-        return wrong
-    return "" if session == _key(agent, str(folder)) else wrong
+    except OSError:  # the Cursor CLI hides its folder like its environment
+        folder = None
+    if folder is not None and session == _key(agent, str(folder)):
+        return ""
+    return "" if agent == "cursor" and _pane_vouches(mine, session) else wrong
+
+
+def tree_pane(pid: int | None = None) -> tuple[str, int]:
+    """The tmux pane this process runs in, from the tree, never the environment: (pane id, the pane's first
+    process), the nearest ancestor (or pid itself) that tmux started a pane with. ("", 0) outside tmux."""
+    from voice.desktop import tmux
+    panes = tmux.pane_pids() or {}
+    by_pid = {first: pane for pane, first in panes.items()}
+    for up in ancestors(pid):
+        if up.pid in by_pid:
+            return by_pid[up.pid], up.pid
+    return "", 0
+
+
+def _pane_vouches(mine: Process, session: str) -> bool:
+    """A Cursor CLI keeps its environment and open files from us (it is not dumpable), so a fresh one, not started
+    with --resume, can't show its chat id. Its tmux pane, found from the tree, stands in: the pane must be the one
+    the chains recorded for that session (its launch, its bound line, or the pane it deployed from), and, when
+    nothing is recorded for it yet, must be neither a helper's pane started by that session nor a pane another
+    session is bound to. Outside tmux nothing backs it."""
+    from voice import chains
+    pane, first = tree_pane(mine.pid)
+    if not pane:
+        return False
+    recorded = chains.places(session)
+    if recorded:
+        return any(p == pane and (not pid or pid == first) for p, pid in recorded)
+    parents, owners = chains.launched_at(pane, first)
+    names = chains.aliases(session)
+    return not (names & parents) and not (owners - names)
 
 
 def _key(agent: str, session: str) -> str:

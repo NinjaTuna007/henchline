@@ -45,6 +45,47 @@ class Vouched(unittest.TestCase):
             self.assertEqual(agents.vouched("codex", agents._key("codex", str(sandbox.REPO))), "")
             self.assertTrue(agents.vouched("codex", agents._key("codex", "/elsewhere")))
 
+    def test_a_fresh_cursor_cli_is_known_by_its_pane(self):
+        # Not dumpable: no environment, no open store.db, no --resume. A deployed one reports from its own pane
+        for path in chains.CHAINS.glob("*.jsonl") if chains.CHAINS.is_dir() else []:
+            path.unlink()
+        boss, child = "cursor-44444444-4444-4444-8444-444444444444", "cursor-55555555-5555-4555-8555-555555555555"
+        sibling = "cursor-66666666-6666-4666-8666-666666666666"
+        chain = chains.open(boss)
+        chains.append(chain, "launch", parent=boss, pane="%14", pid=392791, depth=2, agent="cursor", where="site",
+                      parent_pane="%3", parent_pid=300)
+        chains.append(chain, "launch", parent=boss, pane="%15", pid=392800, depth=2, agent="cursor", where="site",
+                      parent_pane="%3", parent_pid=300)
+        panes = {"%3": 300, "%14": 392791, "%15": 392800}
+
+        def run_in(pid):
+            me = Process(pid, ["/home/u/.local/bin/cursor-agent", "--force"])
+            return mock.patch.object(agents, "nearest_agent", return_value=me), \
+                mock.patch.object(agents, "ancestors", return_value=[me, Process(1000, ["tmux"])])
+
+        with mock.patch.object(agents, "in_cursor_sandbox", return_value=False), \
+                mock.patch("voice.desktop.tmux.pane_pids", return_value=panes):
+            first, second = run_in(392791)
+            with first, second:
+                self.assertEqual(agents.vouched("cursor", child), "")  # nothing recorded for it yet
+                self.assertIn("another cursor session", agents.vouched("cursor", boss))  # its boss's pane is %3
+            chains.bind(child, "%14", 392791)  # its first report
+            first, second = run_in(392800)
+            with first, second:
+                self.assertIn("another cursor session", agents.vouched("cursor", child))  # bound to %14
+                self.assertIn("another cursor session", agents.vouched("cursor", boss))
+                self.assertEqual(agents.vouched("cursor", sibling), "")
+            first, second = run_in(300)
+            with first, second:
+                self.assertEqual(agents.vouched("cursor", boss), "")
+                self.assertIn("another cursor session", agents.vouched("cursor", child))
+            first, second = run_in(392791)
+            with first, second:
+                self.assertEqual(agents.vouched("cursor", child), "")
+                self.assertIn("another cursor session", agents.vouched("cursor", sibling))  # %14 is the child's
+            with mock.patch("voice.desktop.tmux.pane_pids", return_value={}), first, second:
+                self.assertIn("another cursor session", agents.vouched("cursor", child))  # outside tmux: nothing
+
     def test_the_cli_refuses_an_unbacked_caller(self):
         with mock.patch.object(handsfree, "caller", return_value=Speaker(BOSS, "claude")), \
                 mock.patch("voice.agents.vouched", return_value="nope"):
@@ -113,6 +154,32 @@ class AgentsReminder(unittest.TestCase):
         self.assertTrue(reminders.Reminder.of({"id": "1", "by": "phone"}).users)
         self.assertFalse(reminders.Reminder.of({"id": "1", "by": "agent", "sender": "x"}).users)
         self.assertFalse(reminders.Reminder.of({"id": "1", "by": "user"}).users)  # an older --to record
+
+
+class RecordStaysPut(unittest.TestCase):
+    """A process claiming another chat's id never repoints where that chat's replies go, refused or not."""
+
+    def setUp(self):
+        SPEAKERS.mkdir(parents=True, exist_ok=True)
+        self.path = SPEAKERS / f"{BOSS}.json"
+        Speaker(BOSS, "claude", "henchline", Tab("tmux", "%1")).save(self.path)
+        self.addCleanup(lambda: self.path.unlink(missing_ok=True))
+
+    def _call(self, verdict: str):
+        desk = mock.Mock()
+        desk.terminals.tab_of_caller.return_value = Tab("tmux", "%7")
+        with mock.patch.object(handsfree, "identity", return_value=("claude", BOSS)), \
+                mock.patch("voice.desktop.current", return_value=desk), \
+                mock.patch("voice.agents.vouched", return_value=verdict), \
+                mock.patch.object(Speaker, "pin", return_value=False):
+            handsfree.caller()
+        return Speaker.load(self.path).tab
+
+    def test_an_unbacked_claim_leaves_the_tab(self):
+        self.assertEqual(self._call("this command runs under another claude session"), Tab("tmux", "%1"))
+
+    def test_the_chat_itself_moves_its_tab(self):
+        self.assertEqual(self._call(""), Tab("tmux", "%7"))
 
 
 if __name__ == "__main__":

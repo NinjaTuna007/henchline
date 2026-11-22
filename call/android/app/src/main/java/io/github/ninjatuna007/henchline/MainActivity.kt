@@ -167,6 +167,7 @@ class MainActivity : Activity() {
             val list = org.json.JSONArray(prefs().getString("crew", "[]"))
             (0 until list.length()).associate { list.getJSONObject(it).getString("session") to list.getJSONObject(it).getString("name") }
         } catch (_: Exception) { emptyMap() }
+        others = Strays.load(prefs().getString("others", "[]"))
         showCrew()
 
         findViewById<ImageButton>(R.id.menu).setOnClickListener { show(listScreen) }
@@ -745,6 +746,7 @@ class MainActivity : Activity() {
     private fun showAgents(status: JSONObject) {
         followRenames(status)
         takeEnded(status)
+        takeOthers(status)
         val list = status.getJSONArray("agents")
         names = (0 until list.length()).associate {
             list.getJSONObject(it).getString("session") to list.getJSONObject(it).getString("name")
@@ -783,25 +785,26 @@ class MainActivity : Activity() {
                 setPadding(dp(20), dp(24), dp(20), dp(24))
             })
         }
-        class Chat(val session: String, val agent: String, val project: String, val last: JSONObject?, val found: String)
-        fun project(name: String) =
-            name.substringAfter(", ", "").removePrefix("in ").substringBefore(" · ").ifEmpty { "home" }
-        var chats = names.map { (session, name) -> Chat(session, name.substringBefore(","), project(name), Chats.last(this, session), "") }
+        class Chat(val session: String, val agent: String, val project: String, val last: JSONObject?, val found: String, val state: String = "")
+        var chats = names.map { (session, name) -> Chat(session, name.substringBefore(","), Strays.projectOf(name), Chats.last(this, session), "") }
         // Chats an agent texted lately that the laptop's crew list doesn't name: named from the session ("cursor-_tmp");
         // older ones stay out of the list (long-press clears one that's in it). Not hands-free's own: it is the
         // switchboard, not an agent (its "Now talking to …" notices from calls, 2026-11-16)
         // A helper whose work is over (ended from its boss or here, or its terminal gone) leaves the list: hidden when
         // idle (the user's screenshot, 2026-11-21: an ended helper lingered). A search still finds it.
-        chats = chats + Chats.sessions(this).filter { s -> s !in names && !s.startsWith("handsfree-") && (query.isNotEmpty() || s !in ended) && (Chats.last(this, s)?.optLong("at") ?: 0) > System.currentTimeMillis() - 3 * 86_400_000L }.map { session ->
-            val agent = session.substringBefore("-").replaceFirstChar { it.uppercase() }
+        // The laptop names the ones that aren't running and says why (Strays): its project, greyed when its agent is
+        // gone, and off the list when its work is over; only one it can't name says "agent not running"
+        chats = chats + Chats.sessions(this).filter { s -> s !in names && !s.startsWith("handsfree-") &&
+                Strays.listed(others[s]?.optString("state") ?: "", s in ended, query.isNotEmpty()) &&
+                (Chats.last(this, s)?.optLong("at") ?: 0) > System.currentTimeMillis() - 3 * 86_400_000L }.map { session ->
             // A timer's or a script's texts have their own group: no agent is behind them to put on the crew list
             if (isReminders(session)) Chat(session, "Reminders", "reminders", Chats.last(this, session), "")
-            else Chat(session, agent, "not on the crew list", Chats.last(this, session), "")  // its key can't say its folder
+            else Strays.describe(session, others[session]).let { Chat(session, it.agent, it.project, Chats.last(this, session), "", it.state) }
         }
         // One that texted since the crew was last asked: likely an agent just started from a new chat, under its own
-        // key now (the user's catch, 2026-11-16: "not on the crew list" until the app was reopened): asked at once,
-        // which also moves the new chat to it
-        val strays = chats.filter { it.project == "not on the crew list" }
+        // key now (the user's catch, 2026-11-16: unnamed until the app was reopened): asked at once, which also moves
+        // the new chat to it. One the laptop named as not running isn't asked after again.
+        val strays = chats.filter { it.project == Strays.UNKNOWN && it.session !in others }
         if (strays.any { (it.last?.optLong("at") ?: 0L) > crewAsked }) { crewAsked = 0L; refreshCrewQuietly() }
         if (query.isNotEmpty()) {
             val q = query.lowercase()
@@ -825,7 +828,7 @@ class MainActivity : Activity() {
                     })
                     return
                 }
-                chats = chats.mapNotNull { c -> done[c.session]?.let { Chat(c.session, c.agent, c.project, c.last, it) } }
+                chats = chats.mapNotNull { c -> done[c.session]?.let { Chat(c.session, c.agent, c.project, c.last, it, c.state) } }
             } else chats = byName
             if (chats.isEmpty()) crew.addView(TextView(this).apply {
                 text = "Nothing matches \"$query\"."; setTextColor(getColor(R.color.muted)); setPadding(dp(20), dp(24), dp(20), dp(24))
@@ -853,11 +856,11 @@ class MainActivity : Activity() {
             })
             for (chat in members) {
                 if (nestedUnder(chat.session, shown) != null) continue  // drawn under its manager, wherever that is
-                crew.addView(chatRow(chat.session, chat.agent, chat.project, chat.last, chat.found))
+                crew.addView(chatRow(chat.session, chat.agent, chat.project, chat.last, chat.found, state = chat.state))
                 // Its crew right under it, indented (the user's pick, 2026-11-21: the hard-hat mock-up's nested list),
                 // even a helper working in another project. Not in a search: results stay flat.
                 if (query.isEmpty()) for (helper in byRecent.filter { bosses[it.session] == chat.session && it.session !in pins })
-                    crew.addView(chatRow(helper.session, helper.agent, helper.project, helper.last, helper.found, nested = true))
+                    crew.addView(chatRow(helper.session, helper.agent, helper.project, helper.last, helper.found, nested = true, state = helper.state))
             }
         }
         crew.addView(TextView(this).apply {
@@ -2428,7 +2431,8 @@ class MainActivity : Activity() {
 
     /** A chat in the list: henchman, project, the agent's name and the last line (or the line a search found). A crew
      *  chat under its manager is indented, and says whose crew it is. */
-    private fun chatRow(session: String, agent: String, project: String, last: JSONObject?, found: String, nested: Boolean = false): View {
+    private fun chatRow(session: String, agent: String, project: String, last: JSONObject?, found: String, nested: Boolean = false,
+                        state: String = ""): View {
         val unread = unread(session, last)
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -2438,7 +2442,10 @@ class MainActivity : Activity() {
             setOnClickListener { open(session) }
             setOnLongClickListener { chatMenu(session, project, agent); true }
         }
-        row.addView(ImageView(this).apply { setImageResource(avatarOf(session, teams[session] ?: "")) }, LinearLayout.LayoutParams(dp(52), dp(52)))
+        row.addView(ImageView(this).apply {
+            setImageResource(avatarOf(session, teams[session] ?: ""))
+            if (state.isNotEmpty()) alpha = 0.45f  // its agent isn't running: greyed, as an ended helper
+        }, LinearLayout.LayoutParams(dp(52), dp(52)))
         val words = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, 0, 0) }
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         top.addView(TextView(this).apply {
@@ -2461,7 +2468,7 @@ class MainActivity : Activity() {
                     ?: last?.let { (if (it.optBoolean("mine")) "You: " else "") + it.optString("text").ifEmpty { "📎 file" } } ?: ""
             }
             val crewOf = if (nested) bosses[session]?.let { b -> "Crew of " + (names[b]?.substringBefore(",") ?: b.substringBefore("-").replaceFirstChar { it.uppercase() }) } else null
-            text = listOf(crewOf ?: agent, line.replace("\n", " ")).filter { !it.isNullOrEmpty() }.joinToString(" · ")
+            text = listOf(crewOf ?: Strays.label(agent, state), line.replace("\n", " ")).filter { !it.isNullOrEmpty() }.joinToString(" · ")
             setTextColor(getColor(when { found.isNotEmpty() || flow != null -> R.color.cyan; unread > 0 -> R.color.text; else -> R.color.muted }))
             textSize = 14f; maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -3115,6 +3122,7 @@ class MainActivity : Activity() {
         bosses = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
             a.optString("boss").takeIf { it.isNotEmpty() }?.let { a.getString("session") to it } } }.toMap()
         takeEnded(answer)
+        takeOthers(answer)
         flows = (0 until found.length()).mapNotNull { i -> found.getJSONObject(i).let { a ->
             a.optJSONObject("workflow")?.let { a.getString("session") to it } } }.toMap()
         prefs().edit().putString("crew", found.toString()).apply()
@@ -3130,6 +3138,14 @@ class MainActivity : Activity() {
     private fun takeEnded(answer: JSONObject) {
         val list = answer.optJSONArray("ended") ?: return
         ended = (0 until list.length()).map { list.optString(it) }.filter { it.isNotEmpty() }.toSet()
+    }
+
+    private var others: Map<String, JSONObject> = emptyMap()  // chats not running, named by the laptop (Strays)
+
+    /** The laptop's names for chats that aren't running: kept only when the answer carries them (an older laptop). */
+    private fun takeOthers(answer: JSONObject) {
+        others = Strays.parse(answer) ?: return
+        prefs().edit().putString("others", Strays.store(others)).apply()
     }
 
     private fun startedHere(session: String): Boolean = try {

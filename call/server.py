@@ -530,11 +530,84 @@ def agents() -> dict:
                # a workflow running in it: shown in place of the chat's last line on the phone's list
                "workflow": workflows.live(s.session) if s.agent == "claude" else None}
               for s in recent_speakers() if routing.reachable(s)]
+    for entry in listed:
+        entry["state"] = "running"
+    try:
+        gone = others({e["session"] for e in listed}, over)
+    except Exception as e:  # a bad record must not empty the phone's list either
+        print(f"others: {e}", file=sys.stderr)
+        gone = []
     return {"agents": listed,
+            "others": gone,  # chats heard or texted lately that aren't running: named, so the phone can show them
             "away": AWAY.exists(),  # the phone's avatar follows Away set anywhere (the tray, the laptop's /away)
             "current": current.session if current else "",
             "ended": over,
             "renamed": read_json(RENAMED)}  # chats the phone moves to an agent's own key
+
+
+RECENT_CHAT = 3 * 86400  # the phone lists a chat that isn't running for as long as this after its last word
+
+
+def folder_name(folder: Path | None) -> str:
+    return "" if folder is None else "home" if folder == Path.home() else folder.name
+
+
+def where_of(agent: str, session: str) -> str:
+    """The folder name a chat worked in, from its key alone (no talkback record): a chat id from the agent's own
+    record (resume.folder_of: Claude's transcript cwd, Codex's rollout, Cursor's store), a folder key
+    ("codex-_home_me_project") by matching the folders it could be. "" when it can't be said."""
+    rest = session.removeprefix(f"{agent}-")
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", rest):
+        from voice import resume
+        try:
+            return folder_name(resume.folder_of(agent, rest))
+        except Exception:  # noqa: BLE001 - an unreadable record: just not named
+            return ""
+    if rest.startswith("_"):
+        for folder in [Path.home(), *trusted_folders(None)]:
+            if re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{agent}-{folder}")[-120:] == session:
+                return folder_name(folder)
+    return ""
+
+
+def others(listed: set[str], over: list[str], within: float = RECENT_CHAT) -> list[dict]:
+    """The chats that spoke or texted in the last `within` seconds, or ended in that time, but aren't running now
+    (not in `listed`): each with its name ("Claude, in kite designer", as on the crew) and its state, "ended" (a
+    helper whose work is over, or a boss whose job closed: the phone keeps it off its list, still searchable) or
+    "gone" (its agent isn't running: closed, or its terminal went). The phone used to call these "not on the crew
+    list", since a key can't say its folder (the user's catch, 2026-11-22). The switchboard's and timers' own
+    keys are not agents and stay out."""
+    since = time.time() - within
+    speakers = {s.session: s for s in recent_speakers()}
+    found: dict[str, tuple[str, float]] = {}  # session: (agent, last heard)
+    for s in speakers.values():
+        if s.at >= since:
+            found[s.session] = (s.agent, s.at)
+    for path in TEXTS.glob("*.json"):
+        record = read_json(path)
+        session, at = str(record.get("session") or ""), float(record.get("at") or 0)
+        if session and at >= since and at > found.get(session, ("", 0.0))[1]:
+            found[session] = (str(record.get("agent") or session.split("-", 1)[0]), at)
+    for session in over:
+        found.setdefault(session, (session.split("-", 1)[0], 0.0))
+    ended = set(over)
+    try:
+        launched = chains.launched_where()
+    except Exception as e:  # noqa: BLE001 - a bad chain record: named from its own record instead
+        print(f"launched_where: {e}", file=sys.stderr)
+        launched = {}
+    out = []
+    for session, (agent, at) in found.items():
+        if session in listed or session.startswith(("handsfree-", "reminders-")) or not agent:
+            continue
+        speaker = speakers.get(session)
+        where = speaker.where if speaker else launched.get(session) or where_of(agent, session)
+        name = Speaker(session, agent, where).spoken()
+        if speaker:
+            with contextlib.suppress(Exception):
+                name += chat_named(speaker)
+        out.append({"session": session, "name": name, "state": "ended" if session in ended else "gone"})
+    return out
 
 
 def switch(session: str) -> None:

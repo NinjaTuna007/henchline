@@ -496,6 +496,53 @@ def pane_of(session: str) -> str:
     return found
 
 
+def _pid(event: dict, key: str = "pid") -> int:
+    try:
+        return int(event.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def places(session: str) -> list[tuple[str, int]]:
+    """Every (tmux pane, its first process) recorded for this session: launched or bound there, or the pane it
+    deployed from. Written only by deploy and bind, after the tree vouched for the session."""
+    found = []
+    with _locked():
+        names = _renamed_as(session)
+        for chain in _load_all():
+            for event in chain.events:
+                kind = event.get("kind")
+                if kind in ("launch", "bound") and str(event.get("session") or "") in names and event.get("pane"):
+                    found.append((str(event["pane"]), _pid(event)))
+                if kind == "launch" and str(event.get("parent") or "") in names and event.get("parent_pane"):
+                    found.append((str(event["parent_pane"]), _pid(event, "parent_pid")))
+    return found
+
+
+def launched_at(pane: str, pid: int) -> tuple[set[str], set[str]]:
+    """For an open launch in that pane (and process): (its boss and the chain's boss, with their aliases; the
+    sessions bound to it). Both empty when no helper was launched there."""
+    parents: set[str] = set()
+    owners: set[str] = set()
+    with _locked():
+        for chain in _load_all():
+            if chain.closed:
+                continue
+            for index, event in enumerate(chain.events):
+                if event.get("kind") != "launch" or str(event.get("pane") or "") != pane:
+                    continue
+                if _pid(event) and pid and _pid(event) != pid or not _launch_open(chain.events, index):
+                    continue
+                for boss in (str(event.get("parent") or ""), chain.boss):
+                    if boss:
+                        parents |= _renamed_as(boss)
+                if event.get("session"):
+                    owners.add(str(event["session"]))
+                owners |= {str(later.get("session") or "") for later in chain.events[index + 1:]
+                           if later.get("kind") == "bound" and _same_launch_line(later, event)} - {""}
+    return parents, owners
+
+
 def _launch_open(events: list[dict], index: int) -> bool:
     launch = events[index]
     return not any(_closes(later, launch) for later in events[index + 1:])
@@ -673,6 +720,24 @@ def ended(within: float = 3 * 86400) -> list[str]:
     # chat of that agent in that folder from the phone's offline list
     from voice import resume
     return sorted(key for key in over - live if resume.chat_id(key))
+
+
+def launched_where() -> dict[str, str]:
+    """Each helper's folder name as its launch named it, by its current key: the folder it was started in, which
+    names it on the phone after it ended (its own record may say a subfolder it moved into)."""
+    out: dict[str, str] = {}
+    for chain in _load_all():
+        events = chain.events
+        for index, launch in enumerate(events):
+            if launch.get("kind") != "launch" or not launch.get("where"):
+                continue
+            child = str(launch.get("session") or "")
+            for event in events[index + 1:]:
+                if event.get("kind") == "bound" and _same_launch_line(event, launch):
+                    child = str(event.get("session") or child)
+            if child:
+                out[_canonical(child)] = str(launch["where"])
+    return out
 
 
 def pending_end(session: str) -> bool:

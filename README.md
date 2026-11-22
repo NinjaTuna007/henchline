@@ -2,14 +2,18 @@
 
 <p align="center"><b>Henchline 3.0: Minionception.</b> Your henchmen now hire henchmen.</p>
 
-<p align="center"><img src="docs/panels/boss.png" width="900" alt="You're the boss. Claude Code, Cursor and Codex are your crew, and Henchline is your line to all of them."></p>
+<p align="center"><img src="docs/panels/boss.png" width="900" alt="You're the boss. Your crew is Claude Code, Cursor and Codex, and now they run crews of their own."></p>
 
 Talk to them at your desk without touching the keyboard, call them from your phone when you're out, and let them ring or text you when they need a decision. Every henchman has its own voice, its own ringtone, its own chat. And it all runs on your own machine.
 
 <p align="center">
+<img src="docs/panels/minions.png" width="900" alt="They hire their own minions: hard hats show who runs a crew and who is on one; the helpers sheet; handsfree deploy and handsfree report">
 <img src="docs/panels/ring.png" width="900" alt="They ring you: full screen with the henchman, its ringtone and why it's calling; a banner while you use the phone">
+<img src="docs/panels/call.png" width="900" alt="Call them, in their voice or the phone's: a call, and the Voices sheet with laptop voices or Jenny made on the phone">
 <img src="docs/panels/talk.png" width="900" alt="Talk or text, any time: a chat per henchman, and texts you answer from the notification">
-<img src="docs/panels/files.png" width="900" alt="Files both ways, your whole crew: share anything to the henchman you pick; the crew menu">
+<img src="docs/panels/plan.png" width="900" alt="See the plan, mind the limits: an agent's plan beside its chat, and each agent's usage limits">
+<img src="docs/panels/away.png" width="900" alt="Off the clock: set yourself away and agents text instead; send a message later, or let it wait in the outbox">
+<img src="docs/panels/files.png" width="900" alt="Files both ways: share anything to the henchman you pick; agents send files back into their chat">
 </p>
 
 ## What it does
@@ -32,11 +36,13 @@ Talk to them at your desk without touching the keyboard, call them from your pho
 - 📎 **Files both ways.** Share a photo, a voice memo, a zip, a video from any app, or tap the paperclip: it lands on your computer and the agent is told where. An agent runs `handsfree send report.pdf "here you go"` and it shows in its chat. On a call, the camera button snaps a photo that goes with what you say next; say "show me" and the agent runs `handsfree show`, a picture of its terminal (or `--screen`) in the chat.
 - 🗂 **A chat per henchman**, kept on the phone with times and read ticks, your terminal conversation mirrored into it during a call. A call history shows who rang, why, and how long you talked.
 - 🎧 **Earbuds as push-to-talk**: tap to talk, tap to send, the phone stays in your pocket. Talk/Send and Hang up on the lock screen, and a Quick Settings tile if you want one.
+- 🗣 **Their voice or the phone's.** On a call, Voices › Laptop gives each agent its own voice from your computer; Voices › Phone has the phone speak for them itself (Jenny), steady on a weak signal. Switch any time, even mid-call.
+- 📋 **Plans and limits.** A Plan tab shows an agent's plan with its progress, a chip flips Claude or the Cursor CLI into plan mode and back, and a Usage tab shows every agent's limits and when they reset.
+- 🌙 **Off the clock.** Tap your avatar to go Away: agents text you instead of talking or ringing. Write while offline and it waits in the outbox, or pick a time to send it later.
 
 **For your agents**
 
 - 🪆 **Minionception.** An agent can deploy helpers of its own: `handsfree deploy --agent claude|cursor|codex --folder PATH --ask "…"` starts one in its own terminal, and the helper answers with `handsfree report "…"`. On the phone each helper's chat sits under its boss, and hard hats show who runs a crew and who is on one. Only its boss, the helper itself, or you from the phone can end a helper.
-
 - ⏰ **Reminders for later.** An agent can set itself (or its boss or a helper it deployed) a reminder: `handsfree remind 08:30 "check the build"` (or `tomorrow 08:30`, `in 20m`) types the message into that agent when it's due, tagged `[henchline · scheduled · from <agent>]`; `handsfree remind list` and `cancel ID` manage them.
 
 One snippet (`agents/AGENTS-snippet.md`) teaches every agent (Claude Code, Cursor, Codex) how to speak, how your voice messages are tagged, and when to ring, text or send you something. Nothing to install inside the agents: Henchline types into their own terminal tabs and windows.

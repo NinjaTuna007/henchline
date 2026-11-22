@@ -136,6 +136,56 @@ class ToAgent(unittest.TestCase):
             switch.assert_not_called()
 
 
+class Others(unittest.TestCase):
+    """The chats heard or texted lately that aren't running: named, with why they are off the crew (2026-11-22)."""
+
+    def setUp(self):
+        import time
+        self.now = time.time()
+        for path in server.TEXTS.glob("*.json"):
+            path.unlink()
+        server.TEXTS.mkdir(parents=True, exist_ok=True)
+
+    def text(self, tid, session, agent, ago):
+        server.write_json(server.TEXTS / f"{tid}.json", {"id": tid, "session": session, "agent": agent,
+                                                          "at": self.now - ago, "words": "hi"})
+
+    def others(self, speakers, listed=(), over=(), launched=None):
+        with mock.patch.object(server, "recent_speakers", return_value=speakers), \
+                mock.patch.object(server, "chat_named", return_value=""), \
+                mock.patch.object(server.chains, "launched_where", return_value=launched or {}):
+            return {o["session"]: (o["name"], o["state"]) for o in server.others(set(listed), list(over))}
+
+    def test_a_closed_chat_is_named_by_its_folder_and_an_ended_helper_says_so(self):
+        from voice.state import Speaker
+        closed = Speaker("claude-1", "claude", "garden-planner", at=self.now - 3600)
+        helper = Speaker("claude-2", "claude", "kite-designer", at=self.now - 60)
+        running = Speaker("claude-3", "claude", "henchline", at=self.now)
+        old = Speaker("claude-4", "claude", "old", at=self.now - 5 * 86400)
+        found = self.others([closed, helper, running, old], listed={"claude-3"}, over={"claude-2"})
+        self.assertEqual(found, {"claude-1": ("Claude, in garden planner", "gone"),
+                                 "claude-2": ("Claude, in kite designer", "ended")})
+
+    def test_a_chat_known_only_by_its_texts_is_named_from_its_key(self):
+        self.text("a" * 16, "codex-_home_me", "codex", 600)
+        self.text("b" * 16, "reminders-x", "reminders", 600)  # a timer's: not an agent
+        self.text("c" * 16, "claude-9", "claude", 4 * 86400)  # too old
+        with mock.patch.object(server, "trusted_folders", return_value=[]), \
+                mock.patch.object(server.Path, "home", return_value=server.Path("/home/me")):
+            found = self.others([])
+        self.assertEqual(found, {"codex-_home_me": ("Codex, in home", "gone")})
+
+    def test_an_ended_helper_without_a_record_is_named_from_its_launch_or_its_transcript(self):
+        kid = "claude-12345678-1234-4234-8234-123456789abc"
+        found = self.others([], over=[kid], launched={kid: "pc_diagnostics"})
+        self.assertEqual(found, {kid: ("Claude, in pc diagnostics", "ended")})
+        with mock.patch("voice.resume.folder_of", return_value=server.Path("/srv/website")):
+            found = self.others([], over=[kid])
+        self.assertEqual(found, {kid: ("Claude, in website", "ended")})
+        with mock.patch("voice.resume.folder_of", return_value=None):
+            self.assertEqual(self.others([], over=[kid]), {kid: ("Claude", "ended")})  # truly unknown: no folder
+
+
 class Owns(unittest.TestCase):
     def test_a_missing_pid_does_not_own_the_live_pane(self):
         server.write_json(server.SPAWNED, {"panes": [{"pane": "%1", "pid": 9}]}, private=True)

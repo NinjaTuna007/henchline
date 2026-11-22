@@ -1,8 +1,9 @@
 """The README's feature panels: each feature as one finished card (the user's wish, 2026-11-15: no loose pictures
 and empty space). A navy card, the screenshots arranged on it, the henchman, a heading and a few lines.
 
-    python3 docs/panels.py AVATARS_DIR     (needs Pillow and the Inter font; AVATARS_DIR holds <agent>.png and you.png,
-                                            rendered from call/android/avatars.py --svg; writes docs/panels/*.png)
+    python3 docs/panels.py AVATARS_DIR     (needs Pillow and the Inter font; AVATARS_DIR holds <agent>.png, <agent>_manager.png,
+                                            <agent>_crew.png, you.png and you_away.png: avatars.py --svg,
+                                            avatar_ prefix dropped, 420 px wide; writes docs/panels/*.png)
 
 The screenshots are docs/screens/*.png (docs/screens/polish.sh). Panels are drawn at twice the size they show at.
 """
@@ -71,12 +72,15 @@ def flow(image, draw, x: int, width: int, items: list, height: int, measure: boo
     for kind, what in items:
         if kind == "avatar":
             steps.append((kind, what, 130)); total += 130 + 30
+        elif kind == "face":  # a big avatar in its ring, as the boss
+            steps.append((kind, what, 432)); total += 432 + 40
         elif kind == "head":
             lines = wrap(draw, what, head, width); steps.append((kind, lines, len(lines) * 84)); total += len(lines) * 84 + 24
         elif kind == "body":
             lines = wrap(draw, what, small, width); steps.append((kind, lines, len(lines) * 56)); total += len(lines) * 56 + 40
-        elif kind == "code":  # one line, as a terminal shows it: the same size in every card, so the column fits it
-            steps.append((kind, [what], 90)); total += 90 + 40
+        elif kind == "code":  # as a terminal shows it, the same size in every card; a long one goes on two lines
+            lines = what.split("\n"); h = 44 + 46 * len(lines)
+            steps.append((kind, lines, h)); total += h + 40
         elif kind == "row":  # a card screenshot with words and the command beside it: no column left half empty
             name, beside = what
             shot = Image.open(SCREENS / f"{name}.png").convert("RGBA")
@@ -98,6 +102,8 @@ def flow(image, draw, x: int, width: int, items: list, height: int, measure: boo
     for kind, what, h in steps:
         if kind == "avatar":
             image.alpha_composite(Image.open(what).convert("RGBA").resize((130, 130), Image.LANCZOS), (x, y)); y += 160
+        elif kind == "face":
+            ring(image, draw, what, x + (width - 420) // 2, y + 6); y += h + 40 + spread
         elif kind == "head":
             for line in what:
                 draw.text((x, y), line, font=head, fill=TEXT); y += 84
@@ -107,11 +113,11 @@ def flow(image, draw, x: int, width: int, items: list, height: int, measure: boo
                 draw.text((x, y), line, font=small, fill=MUTED); y += 56
             y += 40 + spread
         elif kind == "code":  # what the agent runs, as a terminal line, its box as wide as the command
-            box = min(width, int(draw.textlength(what[0], font=mono)) + 56)
+            box = min(width, max(int(draw.textlength(line, font=mono)) for line in what) + 56)
             draw.rounded_rectangle([x, y, x + box, y + h], 18, fill=CODE)
             ty = y + 22
             for line in what:
-                draw.text((x + 28, ty), line, font=mono, fill=CYAN); ty += 46  # one line: 22 + 46 + 22
+                draw.text((x + 28, ty), line, font=mono, fill=CYAN); ty += 46  # each line 46, 22 above and below
             y += h + 40 + spread
         elif kind == "row":
             shot, beside = what
@@ -138,28 +144,50 @@ def panel(out: str, columns: list[tuple[int, list]]):
     image.save(OUT / out, optimize=True)
 
 
+def ring(image, draw, path: Path, ax: int, ay: int, size: int = 420):
+    """A big avatar on a lighter disc (it lifts the dark circle off the card), with a cyan ring round it."""
+    face = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
+    draw.ellipse([ax - 6, ay - 6, ax + size + 6, ay + size + 6], fill=(28, 44, 96))
+    image.alpha_composite(face, (ax, ay))
+    draw.ellipse([ax - 6, ay - 6, ax + size + 6, ay + size + 6], outline=(0, 229, 255, 160), width=4)
+
+
+def crew_tree(image, draw, avatars: Path, x: int, y: int):
+    """A small org chart: Claude in a white hard hat running Codex and Cursor in yellow ones, and a Cursor
+    working solo beside them, hatless."""
+    size, line = 120, (0, 229, 255)
+    face = lambda name, fx, fy: image.alpha_composite(
+        Image.open(avatars / f"{name}.png").convert("RGBA").resize((size, size), Image.LANCZOS), (fx, fy))
+    left, right, top, low = x, x + 200, y, y + size + 60
+    mid = (left + right) // 2
+    face("claude_manager", mid, top)
+    cx, fork = mid + size // 2, top + size + 30
+    draw.line([(cx, top + size), (cx, fork)], fill=line, width=3)
+    draw.line([(left + size // 2, fork), (right + size // 2, fork)], fill=line, width=3)
+    for fx, name in ((left, "codex_crew"), (right, "cursor_crew")):
+        draw.line([(fx + size // 2, fork), (fx + size // 2, low)], fill=line, width=3)
+        face(name, fx, low)
+    solo = right + 220
+    face("cursor", solo, low)
+    small = font("Medium", 32)
+    draw.text((solo + size // 2, low + size + 12), "solo", font=small, fill=MUTED, anchor="mt")
+
+
 def boss(avatars: Path):
-    """The opening: you, the boss, and your crew lined up."""
-    height = 760
+    """The opening: you, the boss, and your crew, which now runs crews of its own."""
+    height = 820
     image = card(height)
     draw = ImageDraw.Draw(image)
-    you = Image.open(avatars / "you.png").convert("RGBA").resize((420, 420), Image.LANCZOS)
-    ax, ay = PAD + 20, (height - 420) // 2 + 20
-    draw.ellipse([ax - 6, ay - 6, ax + 426, ay + 426], fill=(28, 44, 96))  # lifts the dark circle off the card
-    image.alpha_composite(you, (ax, ay))
-    draw.ellipse([ax - 6, ay - 6, ax + 426, ay + 426], outline=(0, 229, 255, 160), width=4)
+    ring(image, draw, avatars / "you.png", PAD + 20, (height - 420) // 2)
     x = PAD + 560
-    draw.text((x, 170), "You're the boss.", font=font("ExtraBold", 92), fill=TEXT)
-    lines = wrap(draw, "Claude Code, Cursor and Codex are your crew, each busy in its own terminal or window. "
-                       "Henchline is your line to all of them: at your desk, or from anywhere.", font("Regular", 40),
-                 WIDTH - x - PAD)
-    y = 310
+    draw.text((x, 110), "You're the boss.", font=font("ExtraBold", 92), fill=TEXT)
+    lines = wrap(draw, "Your crew is Claude Code, Cursor and Codex. And now they run crews of their own.",
+                 font("Regular", 40), WIDTH - x - PAD)
+    y = 250
     for line in lines:
         draw.text((x, y), line, font=font("Regular", 40), fill=MUTED)
         y += 60
-    for i, agent in enumerate(("claude", "cursor", "codex", "handsfree")):
-        face = Image.open(avatars / f"{agent}.png").convert("RGBA").resize((130, 130), Image.LANCZOS)
-        image.alpha_composite(face, (x + i * 150, y + 40))
+    crew_tree(image, draw, avatars, x, y + 40)
     OUT.mkdir(exist_ok=True)
     image.save(OUT / "boss.png", optimize=True)
 
@@ -168,22 +196,47 @@ def main() -> None:
     avatars = Path(sys.argv[1])
     boss(avatars)
     phone = round(648 * SHOT) - 24  # a phone screenshot's column: its shadow margins left out
+    text = 1640 - phone - 90  # the words beside one phone
+    panel("minions.png", [
+        (text, [("head", "They hire their own minions"),
+                ("body", "White hat: running a crew. Yellow: on one. Tap a face to End or Keep each helper."),
+                ("row", ("crewsheet", [("body", "Only its boss, the helper, or you can end one.")])),
+                ("code", 'handsfree deploy --agent cursor \\\n    --ask "Write the parser tests"'),
+                ("code", 'handsfree report "12 tests, all green"')]),
+        (phone, [("shot", "chats")])])
     panel("ring.png", [
         (phone, [("shot", "ring")]),
-        (1640 - phone - 90, [("head", "They ring you"),
+        (text, [("head", "They ring you"),
                 ("body", "When an agent needs a decision, it rings your phone: full screen, with its henchman, its own "
                          "ringtone, a line of henchman-speak, and why it's calling. Answer, and you're talking to the "
                          "one who rang."),
                 ("row", ("banner", [("body", "Using your phone? It rings as a banner instead.")])),
                 ("code", 'handsfree ring "Shall I deploy the model?"')])])
+    panel("call.png", [
+        (text, [("head", "Call them, in their voice or the phone's"),
+                ("row", ("voices", [("body", "Laptop: each agent in its own voice.")])),
+                ("row", ("voices-phone", [("body", "Phone: one voice for all, steady on a weak signal.")]))]),
+        (phone, [("shot", "call")])])
     panel("talk.png", [
-        (1640 - phone - 90, [("head", "Talk or text, any time"),
+        (phone, [("shot", "chat")]),
+        (text, [("head", "Talk or text, any time"),
                 ("body", "Every henchman has its own chat on your phone, your whole crew a tap away. Talk, hold the "
                          "button, or type; pictures and audio play right in it. Not urgent? The agent texts instead."),
                 ("row", ("text", [("body", "Reply right from the notification. It goes to that agent alone, typed "
                                            "into its terminal.")])),
-                ("code", 'handsfree text "Checkpoint pushed."')]),
-        (phone, [("shot", "files")])])
+                ("code", 'handsfree text "Checkpoint pushed."')])])
+    panel("plan.png", [
+        (1640 - 2 * phone - 100, [("head", "See the plan, mind the limits"),
+                ("body", "Each agent's plan sits beside its chat, steps ticking off as it works. Usage shows how "
+                         "much of every agent's limits is left, and when they reset.")]),
+        (phone, [("shot", "plan")]),
+        (phone, [("shot", "usage")])])
+    panel("away.png", [
+        (440, [("face", avatars / "you_away.png")]),
+        (1640 - 440 - 80, [("head", "Off the clock"),
+                ("body", "Tap your avatar. Agents text instead of talking or ringing."),
+                ("shot", "away"),
+                ("row", ("later", [("body", "Send it later, or offline from the outbox. One tick sent, two picked up.")]))])])
     panel("files.png", [
         (1640 - phone - 120, [("head", "Files both ways"),
                ("body", "Share a photo, a recording, a zip from any app and pick the henchman it's for: it lands on "
@@ -191,8 +244,7 @@ def main() -> None:
                ("row", ("filecard", [("body", "Agents send files back, straight into their chat."),
                                      ("code", "handsfree send map.png")]))]),
         (phone, [("shot", "share")])])
-    for old in ("chat.png", "text.png", "share.png"):
-        (OUT / old).unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     main()
