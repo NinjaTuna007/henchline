@@ -1088,7 +1088,7 @@ async def phone_voice_manifest(request: web.Request) -> web.Response:
 
 
 async def phone_voice_file(request: web.Request) -> web.StreamResponse:
-    """One of those files, by name only; ranges let a broken download carry on."""
+    """One of those files, by its exact listed name only (espeak data: fixed relative paths); ranges resume."""
     trusted(request)
     path = phonevoice.model_file(request.match_info["name"])
     if path is None:
@@ -3020,7 +3020,7 @@ def main() -> int:
     app.router.add_get("/chat/workflows", chat_workflows)
     app.router.add_get("/chat/minions", chat_minions)
     app.router.add_get("/phone-voice/manifest", phone_voice_manifest)
-    app.router.add_get("/phone-voice/file/{name}", phone_voice_file)
+    app.router.add_get("/phone-voice/file/{name:.+}", phone_voice_file)
     app.router.add_post("/chat/minions/view", chat_minion_view)
     app.router.add_post("/chat/minions/decide", chat_minion_decide)
     app.router.add_post("/away", away)

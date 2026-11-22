@@ -36,6 +36,28 @@ class FirstPiece(unittest.TestCase):
 
 
 class Pieces(unittest.TestCase):
+    def test_after_goes_on_from_the_next_piece(self):
+        long = "The reviewer passed the round, so I committed it and pushed, then started the next piece."
+        plan = worker.pieces(["Okay.", long, "Last one."], rtf=50.0)  # slow: the long sentence is cut
+        cut = [n for n, s in enumerate(plan.sentence) if s == 1]
+        self.assertGreater(len(cut), 1)
+        # played through the first piece of the long sentence: the rest of that sentence, then the next
+        rest = plan.after(cut[0], ["Okay.", long, "Last one."])
+        self.assertEqual(rest[1:], ["Last one."])
+        self.assertTrue(long.endswith(rest[0]) and rest[0] != long)
+        # played through the last piece of a sentence: from the next sentence, nothing repeated
+        self.assertEqual(plan.after(cut[-1], ["Okay.", long, "Last one."]), ["Last one."])
+        self.assertEqual(plan.after(len(plan.pieces) - 1, ["Okay.", long, "Last one."]), [])
+        self.assertEqual(plan.after(-1, ["Okay.", long, "Last one."]), ["Okay.", long, "Last one."])
+
+    def test_min_chars_keeps_pieces_long_but_at_a_sentence_end(self):
+        long = "The reviewer passed the round, so I committed it and pushed, then started the next piece of it."
+        plan = worker.pieces(["Okay.", long], rtf=50.0, min_chars=80)
+        self.assertEqual(" ".join(plan.pieces), "Okay. " + long)
+        for n, text in enumerate(plan.pieces):
+            ends_sentence = n == len(plan.pieces) - 1 or plan.sentence[n + 1] != plan.sentence[n]
+            self.assertTrue(ends_sentence or len(text) >= 80, text)
+
     def test_words_are_unchanged_when_joined(self):
         sentences = ["Done.", "Here is a much longer second sentence, that takes a while to render; properly and fully."]
         self.assertEqual(" ".join(worker.pieces(sentences).pieces), " ".join(sentences))  # hands-free's echo match

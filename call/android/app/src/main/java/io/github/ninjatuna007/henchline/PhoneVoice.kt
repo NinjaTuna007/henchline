@@ -43,6 +43,18 @@ object PhoneVoice {
     private const val STARVES = 2  // starves in one clip before the phone falls back (one is waited out)
     private const val SPEECH_CPS = 17.5f  // characters of text per second of speech, as the laptop estimates
     private const val LOW_BATTERY = 15
+    // espeak-ng's English data under the model folder: Kokoro's fallback for words the lexicon lacks (without it
+    // sherpa skipped "Here's" and "lived" outright, 2026-11-22). Exact relative paths, the only ones with a "/"
+    val ESPEAK = listOf("espeak-ng-data/phontab", "espeak-ng-data/phonindex", "espeak-ng-data/phondata",
+        "espeak-ng-data/intonations", "espeak-ng-data/en_dict", "espeak-ng-data/lang/gmw/en",
+        "espeak-ng-data/lang/gmw/en-US", "espeak-ng-data/lang/gmw/en-GB-x-rp")
+    // What a phone must have before it counts as ready: one that downloaded before the espeak data was offered fetches
+    // just those files the next time (the others are kept, checked by size and hash)
+    val REQUIRED = listOf("model.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt") + ESPEAK
+
+    /** A name the laptop's manifest may use: a plain file name, or one of the espeak data's fixed relative paths. */
+    fun safeName(name: String): Boolean =
+        name in ESPEAK || (name.isNotEmpty() && !name.contains('/') && !name.startsWith(".") && !name.contains(".."))
 
     fun enabled(context: Context) = prefs(context).getBoolean(PREF, false)
     fun setEnabled(context: Context, on: Boolean) = prefs(context).edit().putBoolean(PREF, on).apply()
@@ -59,6 +71,8 @@ object PhoneVoice {
     fun ready(context: Context): Boolean {
         val kept = try { JSONObject(marker(context).readText()) } catch (_: Exception) { return false }
         val files = kept.optJSONArray("files") ?: return false
+        val names = (0 until files.length()).map { files.getJSONObject(it).optString("name") }.toSet()
+        if (!names.containsAll(REQUIRED)) return false  // an older download, from before the espeak data
         return (0 until files.length()).all { i ->
             val f = files.getJSONObject(i)
             File(dir(context), f.getString("name")).length() == f.getLong("size")
@@ -103,8 +117,9 @@ object PhoneVoice {
             for (i in 0 until files.length()) {
                 val f = files.getJSONObject(i)
                 val name = f.getString("name")
-                if (name.contains('/') || name.startsWith(".")) return "The laptop named an odd file: stopped."
+                if (!safeName(name)) return "The laptop named an odd file: stopped."
                 val target = File(folder, name)
+                target.parentFile?.mkdirs()
                 val size = f.getLong("size")
                 if (target.length() == size && sha256(target) == f.getString("sha256")) { done += size; continue }
                 val part = File(folder, "$name.part")
@@ -184,7 +199,8 @@ object PhoneVoice {
         return try {
             val kokoro = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
                 model = "$folder/model.onnx", voices = "$folder/voices.bin", tokens = "$folder/tokens.txt",
-                lexicon = "$folder/lexicon-us-en.txt", lang = "en-us")
+                lexicon = "$folder/lexicon-us-en.txt", lang = "en-us",
+                dataDir = "$folder/espeak-ng-data")  // words the lexicon lacks are spoken through espeak, not skipped
             val config = com.k2fsa.sherpa.onnx.OfflineTtsConfig(
                 model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(kokoro = kokoro, numThreads = threads, provider = "cpu"))
             val engine = com.k2fsa.sherpa.onnx.OfflineTts(null, config)
@@ -222,13 +238,49 @@ object PhoneVoice {
 
     // --- speaking clips ---------------------------------------------------------------------------------------
 
+    /** Debug builds only (PhoneVoiceBench): a separate engine with `threads`, `text` rendered 3 times, each run's
+     *  render speed logged, so the app's speed can be compared with sherpa-onnx's own command-line build. */
+    fun bench(context: Context, threads: Int, text: String) {
+        if (!ready(context)) return log("bench: the voice isn't downloaded")
+        val folder = dir(context).absolutePath
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+        val kokoro = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
+            model = "$folder/model.onnx", voices = "$folder/voices.bin", tokens = "$folder/tokens.txt",
+            lexicon = "$folder/lexicon-us-en.txt", lang = "en-us", dataDir = "$folder/espeak-ng-data")
+        val engine = com.k2fsa.sherpa.onnx.OfflineTts(null, com.k2fsa.sherpa.onnx.OfflineTtsConfig(
+            model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(kokoro = kokoro, numThreads = threads, provider = "cpu")))
+        try {
+            for (run in 1..3) {
+                val began = System.currentTimeMillis()
+                val samples = engine.generate(text, 3, 1.0f).samples
+                val ms = System.currentTimeMillis() - began
+                val audio = samples.size.toDouble() / RATE
+                log("bench threads=$threads chars=${text.length} run=$run render_ms=$ms audio_s=${"%.2f".format(audio)} " +
+                    "rtf=${"%.2f".format(if (audio > 0) ms / 1000.0 / audio else 0.0)}")
+            }
+        } finally { engine.release() }
+    }
+
     /** One call's speaker: clips come from the laptop, audio goes to the call's own playback queue. */
     class Speaker(
         private val context: Context,
         private val enqueue: (ByteArray) -> Unit,  // 20 ms of 16-bit mono at 24 kHz into the call's speaker
         private val queued: () -> Int,  // chunks still waiting at the speaker
         private val send: (String) -> Unit,  // a message to the laptop
+        private val played: () -> Long = { 0L },  // this phone's own chunks the speaker has taken, all told
+        private val flush: () -> Unit = {},  // drop what's still queued at the speaker
     ) {
+        // Where each piece of the clip being spoken ends, in chunks enqueued all told: a piece whose end the speaker
+        // has passed has been heard. Said on a fallback, so the laptop goes on from the next piece, not from the
+        // start of a sentence the user heard a moment ago (2026-11-22: a whole sentence was said twice)
+        private val ends = java.util.concurrent.ConcurrentHashMap<Int, Long>()
+        @Volatile private var enqueued = 0L
+
+        /** The last piece of the clip whose audio has all left the speaker's queue; -1 for none. */
+        private fun heard(): Int {
+            val now = played()
+            return ends.filterValues { it <= now }.keys.maxOrNull() ?: -1
+        }
         private val clips = LinkedBlockingQueue<JSONObject>()
         @Volatile private var current = ""
         private val stopped = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
@@ -266,7 +318,12 @@ object PhoneVoice {
         private fun fallback(id: String, reason: String) {
             fellBack = true
             clips.clear()
-            send(JSONObject().put("tts", "fallback").put("reason", reason).put("id", id).toString())
+            val message = JSONObject().put("tts", "fallback").put("reason", reason).put("id", id)
+            if (id == current) {
+                message.put("heard", heard())  // read before the flush: what was really heard
+                flush()  // the laptop says the rest: nothing of the phone's left to play over it
+            }
+            send(message.toString())
             android.util.Log.i("Henchline", "phone voice: falling back to the laptop's audio ($reason)")
         }
 
@@ -286,6 +343,7 @@ object PhoneVoice {
 
         private fun speak(clip: JSONObject, id: String) {
             val engine = tts ?: return fallback(id, "the voice model isn't loaded")
+            ends.clear()
             val pieces = clip.optJSONArray("pieces") ?: JSONArray()
             val joined = clip.optJSONArray("joined").toIntSet()
             val sid = clip.optInt("sid", 3)
@@ -370,8 +428,10 @@ object PhoneVoice {
                         }
                         val end = minOf(audio.size, at + CHUNK * 2)
                         enqueue(audio.copyOfRange(at, end))
+                        enqueued++
                         at = end
                     }
+                    ends[n] = enqueued
                     log("$id #$n queued ${audio.size / (CHUNK * 2)} chunks")
                 }
                 while (queued() > 0 && !stopped.contains(id)) Thread.sleep(20)  // done when it has been heard

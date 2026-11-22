@@ -116,6 +116,21 @@ class Plan:
         at = self.sentence[spoken] if spoken < len(self.pieces) else len(sentences)
         return sentences[max(at, 0):]
 
+    def after(self, heard: int, sentences: list[str]) -> list[str]:
+        """What's left once the phone fell back, having played every piece up to `heard`: from the next piece on, not
+        from the start of its sentence (a sentence heard a moment ago isn't said twice). If that piece starts a
+        sentence, the clip's own sentences from there; else the rest of its sentence, then the following ones."""
+        nxt = heard + 1
+        if nxt >= len(self.pieces):
+            return []
+        at = self.sentence[nxt]
+        if at < 0:  # still in the intro: the whole clip
+            return list(sentences)
+        if nxt not in self.joined:
+            return sentences[at:]
+        rest = [self.pieces[i] for i in range(nxt, len(self.pieces)) if self.sentence[i] == at]
+        return [" ".join(rest)] + sentences[at + 1:]
+
     def ready_in_time(self, text: str, joined: bool) -> bool:
         gap = JOIN if joined else PAUSE
         return not self.pieces or self.made + self.rtf * speech(text) <= self.ends + gap
@@ -158,19 +173,22 @@ def render_rtf() -> float:
     return RENDER_RTF_BUSY if busy else RENDER_RTF
 
 
-def pieces(sentences: list[str], intro: str = "", rtf: float | None = None) -> Plan:
+def pieces(sentences: list[str], intro: str = "", rtf: float | None = None, min_chars: int = 0) -> Plan:
     """The clip in the pieces it is made and said in.
 
     The first sentence splits at its first punctuation when long (speech starts sooner); a later sentence is said
     whole when it would be made before the audio queued ahead of it runs out, else cut at the punctuation that lets
     the longest piece still be ready in time (the earliest one if none does). Joined with spaces the pieces are the
-    clip's words, unchanged: hands-free matches its echo on them."""
+    clip's words, unchanged: hands-free matches its echo on them. `min_chars`: no piece shorter than this except where
+    a sentence ends (the phone's renders cost a lot each, so short ones run slow: 2.47 for "Hello!", 2026-11-22)."""
     plan = Plan(render_rtf() if rtf is None else rtf)
     if intro:
         plan.add(intro, -1, False)
     for n, sentence in enumerate(sentences):
         if n == 0 and not intro:
             head, rest = first_piece(sentence)
+            if rest and len(head) < min_chars:  # too short to be worth a render of its own: said whole
+                head, rest = sentence, ""
             plan.add(head, 0, False)
             words, first = rest.split(), False
         else:
@@ -180,8 +198,8 @@ def pieces(sentences: list[str], intro: str = "", rtf: float | None = None) -> P
             if plan.ready_in_time(text, not first):
                 plan.add(text, n, not first)
                 break
-            found = cuts(words)
-            if not found:  # no punctuation in reach: said whole, the wait accepted
+            found = [c for c in cuts(words) if len(" ".join(words[:c])) >= min_chars]
+            if not found:  # no punctuation in reach (or none leaving a long enough piece): said whole, the wait accepted
                 plan.late.add(len(plan.pieces))
                 plan.add(text, n, not first)
                 break
@@ -437,11 +455,14 @@ class Voice:
             log(TALKBACK_LOG, f"{clip.agent} cut by {why}, {len(clip.sentences)} sentences kept")
 
 
+PHONE_MIN_CHARS = 80  # no piece for the phone shorter than this but at a sentence end: each render costs a lot
+
+
 def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
     """A clip spoken by the phone (voice/phonevoice.py): the laptop cuts it into pieces as it would for itself, at the
     phone's own render speed, sends the words, and follows the phone's acks for the echo check and for a cut. If the
     phone falls back (behind, hot, low battery), what's left goes back to the spool and the laptop says it."""
-    plan = pieces(list(clip.sentences), intro, rtf=phonevoice.plan_rtf())
+    plan = pieces(list(clip.sentences), intro, rtf=phonevoice.plan_rtf(), min_chars=PHONE_MIN_CHARS)
     name = clip.voice or (VOICES[clip.agent] if clip.agent in SYSTEM else chosen_voice(clip.agent))
     sid = phonevoice.voice_id(name)
     if sid is None:  # a voice the shared file lacks: said by the laptop
@@ -451,7 +472,7 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
     marker.save()
     path.unlink(missing_ok=True)
     phonevoice.send(path.name, clip.agent, name, sid, plan.pieces, plan.joined, plan.sentence)
-    began, cut, fell_back, spoken, ended = time.time(), False, "", 0, False
+    began, cut, fell_back, spoken, ended, heard = time.time(), False, "", 0, False, None
     # A cap once the phone has started it: a report that never comes (a resumed call that forgot the clip) must not
     # hold talkback back until the call ends: twice the clip's speaking time after the last ack, plus 10 s
     cap = 2 * sum(speech(p) for p in plan.pieces) + PHONE_SLACK
@@ -467,7 +488,7 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
                 log(TALKBACK_LOG, f"{clip.agent} first_audio={marker.sounding - began:.2f}s on the phone")
             spoken = state["spoken"]
             if state["fallback"]:
-                fell_back = state["fallback"]
+                fell_back, heard = state["fallback"], state["heard"]
                 break
             if state["done"]:
                 break
@@ -512,8 +533,12 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
             clip.save(path)
         log(TALKBACK_LOG, f"{clip.agent} on the phone: the call ended, {len(rest)} sentences left to text")
     elif fell_back or (cut and not voice.skip and clip.agent not in SYSTEM):
-        # Said again from the start of the sentence it reached, by whoever speaks next (the laptop, after a fallback)
-        clip.sentences = plan.left(max(spoken - 1, 0), list(clip.sentences))
+        if fell_back and heard is not None:
+            # The phone said how far its audio had really played: the laptop goes on from the next piece (rewinding
+            # to the sentence start replayed a whole sentence already heard, 2026-11-22)
+            clip.sentences = plan.after(heard, list(clip.sentences))
+        else:  # said again from the start of the sentence it reached, by whoever speaks next
+            clip.sentences = plan.left(max(spoken - 1, 0), list(clip.sentences))
         if clip.sentences:
             clip.save(path)
         log(TALKBACK_LOG, f"{clip.agent} on the phone: {'fell back (' + fell_back + ')' if fell_back else 'cut'}, "

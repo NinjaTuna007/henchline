@@ -92,6 +92,19 @@ class PhonePlay(unittest.TestCase):
         self.assertEqual(kept.sentences, ["Second sentence here.", "Third one too."])  # from the sentence it reached
         self.assertFalse(phonevoice.phone_renders())  # the rest of the call streams the laptop's audio
 
+    def test_a_fallback_goes_on_from_the_piece_after_the_last_one_played(self):
+        clip, path = clip_file("First sentence here. Second sentence here. Third one too.")
+
+        def falls_back(say):
+            phonevoice.said({"said": {"id": say["id"], "piece": 2}})  # started the third piece (rendering ahead)
+            # but only the first two had played: nothing heard is said again
+            phonevoice.offer({"tts": "fallback", "reason": "fell behind", "id": say["id"], "heard": 1})
+
+        thread = phone(falls_back)
+        worker.phone_play(FakeVoice(), clip, path, "")
+        thread.join(2)
+        self.assertEqual(spool.Clip.load(path).sentences, ["Third one too."])
+
     def test_talking_over_it_sends_a_stop(self):
         clip, path = clip_file("One sentence. Another sentence.")
         stops = []
@@ -265,7 +278,8 @@ class DropWindowText(unittest.TestCase):
             time.sleep(0.3)
             self.dropped.clear()  # never back
 
-        with mock.patch.object(worker.phonevoice, "PHONE_RTF", 5.0):  # slow: the long sentence is cut
+        with mock.patch.object(worker.phonevoice, "PHONE_RTF", 5.0), \
+                mock.patch.object(worker, "PHONE_MIN_CHARS", 0):  # slow and no minimum: the long sentence is cut
             thread = phone(lift)
             worker.phone_play(FakeVoice(), clip, path, "")
             thread.join(3)

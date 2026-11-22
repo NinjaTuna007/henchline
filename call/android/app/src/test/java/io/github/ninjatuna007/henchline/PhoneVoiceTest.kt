@@ -3,6 +3,7 @@ package io.github.ninjatuna007.henchline
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -46,5 +47,17 @@ class PhoneVoiceTest {
     @Test fun pcmIsLittleEndianWithTheGapInFront() {
         val bytes = PhoneVoice.pcm(floatArrayOf(1f, -1f, 0.5f), gap = 1f / PhoneVoice.RATE)  // one sample of silence
         assertArrayEquals(byteArrayOf(0, 0, 0xff.toByte(), 0x7f, 0x01, 0x80.toByte(), 0xff.toByte(), 0x3f), bytes)
+    }
+
+    @Test fun onlyTheEspeakDataMayHaveAPath() {
+        // Kokoro's fallback for words the lexicon lacks ("Here's", "lived" were skipped without it, 2026-11-22)
+        assertTrue("espeak-ng-data/en_dict" in PhoneVoice.REQUIRED)
+        assertTrue(PhoneVoice.safeName("espeak-ng-data/lang/gmw/en-US"))
+        assertTrue(PhoneVoice.safeName("model.onnx"))
+        assertFalse(PhoneVoice.safeName("espeak-ng-data/../model.onnx"))
+        assertFalse(PhoneVoice.safeName("espeak-ng-data/other"))
+        assertFalse(PhoneVoice.safeName("../secret"))
+        assertFalse(PhoneVoice.safeName(".verified"))
+        assertFalse(PhoneVoice.safeName(""))
     }
 }

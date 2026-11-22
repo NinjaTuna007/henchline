@@ -34,7 +34,12 @@ ARCHIVE_URL = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-mode
 ARCHIVE_SHA256 = "60703707bc05ccd48d60e1eb723f38b07d6e474795a0b6a588d7220400e0f7a4"
 ROOT = Path.home() / ".local/share/henchline/phone-voice"
 MODEL_DIR = ROOT / VERSION
-FILES = ("model.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt", "LICENSE")  # all the phone loads
+# espeak-ng's English data: Kokoro falls back to it for words the lexicon lacks (without it sherpa skipped "Here's"
+# and "lived" outright, 2026-11-22). Only these exact relative paths are ever served, never anything else
+ESPEAK = ("espeak-ng-data/phontab", "espeak-ng-data/phonindex", "espeak-ng-data/phondata", "espeak-ng-data/intonations",
+          "espeak-ng-data/en_dict", "espeak-ng-data/lang/gmw/en", "espeak-ng-data/lang/gmw/en-US",
+          "espeak-ng-data/lang/gmw/en-GB-x-rp")
+FILES = ("model.onnx", "voices.bin", "tokens.txt", "lexicon-us-en.txt", "LICENSE") + ESPEAK  # all the phone loads
 LAPTOP_VOICES = Path.home() / ".local/share/talkback/voices-v1.0.bin"
 
 CALL_TTS = STATE / "call.tts"
@@ -67,8 +72,11 @@ def manifest(root: Path = MODEL_DIR) -> dict | None:
 
 
 def model_file(name: str, root: Path = MODEL_DIR) -> Path | None:
-    """One of the files the phone may fetch, never anything else (no paths, no other names)."""
-    return root / name if name in FILES and (root / name).is_file() else None
+    """One of the files the phone may fetch, never anything else: an exact name from FILES (the espeak data's fixed
+    relative paths included), nothing with "..", no other names."""
+    if name not in FILES or ".." in name.split("/"):
+        return None
+    return root / name if (root / name).is_file() else None
 
 
 def _sha256(path: Path) -> str:
@@ -131,7 +139,9 @@ def offer(message: dict) -> None:
             write_json(CALL_TTS, state)
         clip = str(message.get("id") or "")
         if ID.fullmatch(clip):
-            _progress(clip, fallback=state.get("fallback") or "the phone asked")
+            heard = message.get("heard")
+            _progress(clip, fallback=state.get("fallback") or "the phone asked",
+                      heard=heard if isinstance(heard, int) and not isinstance(heard, bool) and heard >= -1 else None)
 
 
 def _rtf(value) -> float | None:
@@ -175,11 +185,14 @@ def send(clip: str, agent: str, voice: str, sid: int, pieces: list[str], joined:
 
 
 def progress(clip: str) -> dict:
-    """{"spoken", "done", "fallback"} as the phone last said (pieces it has started)."""
+    """{"spoken", "done", "fallback", "heard"} as the phone last said: pieces it has started, and on a fallback the
+    last piece whose audio had all played (None when the phone didn't say)."""
     path = PHONE_SAY / f"{clip}.progress"
     found = read_json(path) if path.exists() else {}
+    heard = found.get("heard")
     return {"spoken": int(found.get("spoken") or 0), "done": bool(found.get("done")),
-            "fallback": str(found.get("fallback") or "")}
+            "fallback": str(found.get("fallback") or ""),
+            "heard": heard if isinstance(heard, int) and not isinstance(heard, bool) and heard >= -1 else None}
 
 
 def stop(clip: str) -> None:
@@ -250,12 +263,14 @@ def said(message: dict) -> None:
               done=bool(ack.get("done")))
 
 
-def _progress(clip: str, spoken: int | None = None, done: bool = False, fallback: str = "") -> None:
+def _progress(clip: str, spoken: int | None = None, done: bool = False, fallback: str = "",
+              heard: int | None = None) -> None:
     if not (PHONE_SAY / f"{clip}.json").exists():
         return  # a clip already over (or another call's): nothing to record
     now = progress(clip)
     write_json(PHONE_SAY / f"{clip}.progress", {
-        "spoken": max(now["spoken"], spoken or 0), "done": now["done"] or done, "fallback": fallback or now["fallback"]})
+        "spoken": max(now["spoken"], spoken or 0), "done": now["done"] or done, "fallback": fallback or now["fallback"],
+        "heard": heard if heard is not None else now["heard"]})
 
 
 if __name__ == "__main__":

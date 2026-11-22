@@ -149,6 +149,12 @@ class CallService : Service() {
     // The phone's own voice (PhoneVoice), queued apart and played first: PhoneVoice paces itself on this queue alone.
     // Sharing `heard` stalled it after one piece, the laptop's idle monitor keeping that queue full (2026-11-22)
     private val spoken = LinkedBlockingDeque<ByteArray>()
+    // The phone voice's chunks gone from `spoken`, played or dropped, all told: PhoneVoice compares where each piece
+    // ends with it, to tell the laptop on a fallback which pieces were really heard
+    private val spokenTaken = java.util.concurrent.atomic.AtomicLong()
+
+    /** Empty `spoken`, counting what goes as taken (so the pieces' ends stay comparable). */
+    private fun clearSpoken() { val n = spoken.size; spoken.clear(); spokenTaken.addAndGet(n.toLong()) }
     private val audio by lazy { getSystemService(AudioManager::class.java) }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -187,7 +193,7 @@ class CallService : Service() {
         } catch (e: Exception) { null }
         if (PhoneVoice.enabled(this) && PhoneVoice.ready(this)) {
             phoneVoice = PhoneVoice.Speaker(this, enqueue = { spoken.offer(it) }, queued = { spoken.size },
-                send = { socket?.send(it) })
+                send = { socket?.send(it) }, played = { spokenTaken.get() }, flush = { clearSpoken() })
             Thread { PhoneVoice.load(this) }.start()  // about 2.4 s: ready before the first reply
         }
         applySound()
@@ -286,7 +292,7 @@ class CallService : Service() {
         recorder?.interrupt()
         player?.interrupt()
         heard.clear()
-        spoken.clear()
+        clearSpoken()
         synchronized(audioLock) {  // after any sound switch under way, so it can't set call mode again after this
             focus?.let { audio.abandonAudioFocusRequest(it) }
             if (Build.VERSION.SDK_INT >= 31) audio.clearCommunicationDevice()
@@ -712,7 +718,7 @@ class CallService : Service() {
         phoneVoice?.stopAll()  // the user is talking: a clip the phone speaks stops as the laptop's would
         val dropped = heard.size + spoken.size
         heard.clear()
-        spoken.clear()
+        clearSpoken()
         playing?.let { track ->
             try {
                 if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
@@ -739,6 +745,7 @@ class CallService : Service() {
      *  the laptop's goes (its idle monitor would otherwise build up behind); the laptop's loud ones are kept. */
     private fun nextChunk(): ByteArray? {
         spoken.poll()?.let { mine ->
+            spokenTaken.incrementAndGet()
             heard.peek()?.let { theirs -> if (!loud(theirs) && heard.removeFirstOccurrence(theirs)) dropped.incrementAndGet() }
             return mine
         }

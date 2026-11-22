@@ -130,5 +130,12 @@
             android:name=".CallService"
             android:exported="false"
             android:foregroundServiceType="microphone|mediaPlayback" />
+
+        <!-- Debug builds only: the phone voice's render speed (PhoneVoiceBench); disabled in a release -->
+        <receiver
+            android:name=".PhoneVoiceBench"
+            android:enabled="${phoneVoiceBench}"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
     </application>
 </manifest>

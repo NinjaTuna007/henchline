@@ -37,7 +37,11 @@ android {
     }
     buildTypes {
         // A release has the default (generated) henchman phrases: your own voice is in src/debug only
-        getByName("release") { signingConfig = signingConfigs.findByName("release") }
+        getByName("release") {
+            signingConfig = signingConfigs.findByName("release")
+            manifestPlaceholders["phoneVoiceBench"] = "false"  // the speed bench never ships
+        }
+        getByName("debug") { manifestPlaceholders["phoneVoiceBench"] = "true" }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

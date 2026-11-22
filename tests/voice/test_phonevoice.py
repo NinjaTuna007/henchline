@@ -83,7 +83,7 @@ class Clips(unittest.TestCase):
     def test_acks_move_progress_forward_only(self):
         phonevoice.send("c2", "claude", "af_heart", 3, ["One.", "Two.", "Three."], set(), [0, 1, 2])
         phonevoice.said({"said": {"id": "c2", "piece": 1}})
-        self.assertEqual(phonevoice.progress("c2"), {"spoken": 2, "done": False, "fallback": ""})
+        self.assertEqual(phonevoice.progress("c2"), {"spoken": 2, "done": False, "fallback": "", "heard": None})
         phonevoice.said({"said": {"id": "c2", "piece": 0}})  # a late ack doesn't move it back
         self.assertEqual(phonevoice.progress("c2")["spoken"], 2)
         phonevoice.said({"said": {"id": "c2", "done": True}})
@@ -94,6 +94,16 @@ class Clips(unittest.TestCase):
         phonevoice.send("c3", "claude", "af_heart", 3, ["One."], set(), [0])
         phonevoice.offer({"tts": "fallback", "reason": "fell behind 1.2 s", "id": "c3"})
         self.assertEqual(phonevoice.progress("c3")["fallback"], "fell behind 1.2 s")
+        self.assertIsNone(phonevoice.progress("c3")["heard"])  # an older phone that doesn't say how far it played
+
+    def test_a_fallback_keeps_how_far_the_phone_had_played(self):
+        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        phonevoice.send("c5", "claude", "af_heart", 3, ["One.", "Two.", "Three."], set(), [0, 1, 2])
+        phonevoice.said({"said": {"id": "c5", "piece": 2}})
+        phonevoice.offer({"tts": "fallback", "reason": "fell behind", "id": "c5", "heard": 1})
+        self.assertEqual(phonevoice.progress("c5")["heard"], 1)
+        phonevoice.offer({"tts": "fallback", "reason": "x", "id": "c5", "heard": "two"})  # nonsense: kept as it was
+        self.assertEqual(phonevoice.progress("c5")["heard"], 1)
 
     def test_cancel_passes_the_stop_on_before_the_files_go(self):
         import threading
@@ -117,7 +127,7 @@ class Clips(unittest.TestCase):
         phonevoice.said({"said": {"id": "../escape", "piece": 0}})
         phonevoice.said({"said": {"id": "never-sent", "piece": 0}})
         self.assertFalse((phonevoice.PHONE_SAY / "never-sent.progress").exists())
-        self.assertEqual(phonevoice.progress("never-sent"), {"spoken": 0, "done": False, "fallback": ""})
+        self.assertEqual(phonevoice.progress("never-sent"), {"spoken": 0, "done": False, "fallback": "", "heard": None})
 
 
 class Model(unittest.TestCase):
@@ -126,6 +136,7 @@ class Model(unittest.TestCase):
             root = Path(tmp)
             self.assertIsNone(phonevoice.manifest(root))  # not prepared yet
             for name in phonevoice.FILES:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
                 (root / name).write_bytes(name.encode())
             found = phonevoice.manifest(root)
             self.assertEqual([f["name"] for f in found["files"]], list(phonevoice.FILES))
@@ -136,6 +147,13 @@ class Model(unittest.TestCase):
             self.assertIsNone(phonevoice.model_file("secret.txt", root))
             self.assertIsNone(phonevoice.model_file("../model.onnx", root))
             self.assertEqual(phonevoice.model_file("tokens.txt", root), root / "tokens.txt")
+            # espeak-ng's English data: Kokoro's fallback for words the lexicon lacks ("Here's", "lived")
+            data = "espeak-ng-data/en_dict"
+            self.assertIn(data, [f["name"] for f in found["files"]])
+            self.assertEqual(phonevoice.model_file(data, root), root / data)
+            self.assertIsNone(phonevoice.model_file("espeak-ng-data/../model.onnx", root))
+            (root / "espeak-ng-data/other").write_text("x")
+            self.assertIsNone(phonevoice.model_file("espeak-ng-data/other", root))  # only the listed paths
 
     def test_voice_ids_are_places_in_the_sorted_names(self):
         import numpy as np
