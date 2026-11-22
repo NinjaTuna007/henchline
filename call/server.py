@@ -2436,6 +2436,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                 told.unlink(missing_ok=True)
         if not resume:
             snaps.clear()  # photos taken on an earlier call
+            phonevoice.call_over()  # a new call: no clip or offer left from an earlier one (a drop keeps them)
         blank_words()  # words a killed server never blanked
         for stale in CALL_MIRROR.glob("*.json"):  # terminal lines from before this call
             stale.unlink(missing_ok=True)
@@ -2631,7 +2632,9 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             CALL_SILENT.unlink(missing_ok=True)
             CALL_SOUND.unlink(missing_ok=True)
             speaker_text.cancel()
-            phonevoice.call_over()  # the next call offers again, or streams
+            line_lost = dropped_line(ws.close_code, bool(hung_up_here))
+            if not line_lost:  # hung up: no clip is spoken any more. A drop keeps them: the phone may still be
+                phonevoice.call_over()  # speaking one, and says how far it got when it's back
             liner.cancel()
             CALL_HANGUP.unlink(missing_ok=True)  # the phone went first: the hang-up is moot
             sender.cancel()
@@ -2640,7 +2643,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             nudger.cancel()
             for watcher in watchers:
                 watcher.cancel()
-            if dropped_line(ws.close_code, bool(hung_up_here)):  # not a hang-up: the phone may come back
+            if line_lost:  # not a hang-up: the phone may come back
                 write_json(CALL_DROPPED, {"since": round(time.time() - (time.monotonic() - last_audio[0]), 3),
                                           "until": round(time.time() + REJOIN, 3)})
             CALL.unlink(missing_ok=True)  # hands-free and talkback go back to the laptop first

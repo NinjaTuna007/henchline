@@ -203,6 +203,24 @@ object PhoneVoice {
         @Volatile private var fellBack = false
         private val thread = Thread({ loop() }, "henchline-phone-voice").apply { isDaemon = true; start() }
 
+        // The last ack of each recent clip: sent again when a dropped line comes back, so the laptop learns how far the
+        // phone got while it couldn't hear (the phone goes on speaking through a drop: it has the words)
+        private val acks = LinkedHashMap<String, JSONObject>()
+
+        private fun ack(id: String, piece: Int? = null, done: Boolean = false) {
+            val said = JSONObject().put("id", id)
+            if (piece != null) said.put("piece", piece)
+            if (done) said.put("done", true)
+            synchronized(acks) {
+                acks.remove(id); acks[id] = said
+                while (acks.size > 8) acks.remove(acks.keys.first())
+            }
+            send(JSONObject().put("said", said).toString())
+        }
+
+        /** How far each recent clip got, for the laptop after a reconnect. */
+        fun report(): List<String> = synchronized(acks) { acks.values.map { JSONObject().put("said", it).toString() } }
+
         fun say(clip: JSONObject) { if (!fellBack) clips.offer(clip) else fallback(clip.optString("id"), "fell back earlier") }
         fun stop(id: String) { stopped.add(id) }
         fun stopAll() { clips.clear(); if (current.isNotEmpty()) stopped.add(current) }
@@ -263,7 +281,7 @@ object PhoneVoice {
                     }
                     val gap = if (n == 0) 0f else if (n in joined) JOIN else PAUSE
                     val audio = pcm(next.second, gap)
-                    send(JSONObject().put("said", JSONObject().put("id", id).put("piece", n)).toString())
+                    ack(id, piece = n)
                     var at = 0
                     while (at < audio.size) {
                         if (stopped.remove(id)) return
@@ -274,7 +292,7 @@ object PhoneVoice {
                     }
                 }
                 while (queued() > 0 && !stopped.contains(id)) Thread.sleep(20)  // done when it has been heard
-                send(JSONObject().put("said", JSONObject().put("id", id).put("done", true)).toString())
+                ack(id, done = true)
             } finally {
                 over.set(true)
                 renderer.interrupt()

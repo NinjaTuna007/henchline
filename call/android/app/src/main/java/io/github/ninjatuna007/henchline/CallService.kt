@@ -692,7 +692,9 @@ class CallService : Service() {
     /** The sound mode, where it plays, and whether the phone's echo canceller is on, for the laptop: on the loudspeaker
      *  in clear sound, or without a canceller, our voice can reach this mic and talking over is judged with care. */
     private fun offerPhoneVoice(webSocket: WebSocket) {
-        if (phoneVoice != null) PhoneVoice.offer(this)?.let { webSocket.send(it.toString()) }
+        val voice = phoneVoice ?: return
+        PhoneVoice.offer(this)?.let { webSocket.send(it.toString()) }
+        voice.report().forEach { webSocket.send(it) }  // after a drop: how far each clip got while the line was down
     }
 
     private fun soundNote(): String = org.json.JSONObject().put("sound", if (clear) "clear" else "call").put("out", where)

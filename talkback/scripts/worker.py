@@ -450,7 +450,7 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
     marker.save()
     path.unlink(missing_ok=True)
     phonevoice.send(path.name, clip.agent, name, sid, plan.pieces, plan.joined, plan.sentence)
-    began, cut, fell_back, spoken = time.time(), False, "", 0
+    began, cut, fell_back, spoken, ended = time.time(), False, "", 0, False
     try:
         while True:
             state = phonevoice.progress(path.name)
@@ -464,24 +464,42 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
                 break
             if state["done"]:
                 break
-            if mic_busy() or voice.skip or not in_call() or CALL_SILENT.exists():
+            calling = in_call()
+            if not calling and line_dropped():  # a lift: the phone has the words and goes on speaking them; it
+                began = time.time()  # says how far it got when the line is back, so nothing is said twice
+                time.sleep(0.1)
+                continue
+            if not calling:  # hung up, or the dropped line didn't come back in time
+                ended = True
+                break
+            if CALL_SILENT.exists():  # the line went quiet but hasn't dropped yet: the phone may still be speaking
+                began = time.time()
+                time.sleep(0.05)
+                continue
+            if mic_busy() or voice.skip:  # the user talked over it
                 cut = True
-                if CALL_SILENT.exists():
-                    clip.replay = True  # the line dropped: said again from this sentence when the phone is back
-                elif not in_call():
-                    clip.for_call = True  # the call ended: texted, as for a clip the laptop was saying
-                phonevoice.stop(path.name)
                 break
             if time.time() - began > PHONE_TIMEOUT and not spoken:  # never started: the phone is gone or stuck
                 fell_back = "the phone didn't start it"
-                phonevoice.offer({"tts": "fallback", "reason": fell_back})
                 break
             time.sleep(0.05)
     finally:
         PLAYING.unlink(missing_ok=True)
-        if not cut:
+        if cut or fell_back == "the phone didn't start it":
+            phonevoice.cancel(path.name)  # stopped on the phone first: never spoken there and here at once
+        else:
             phonevoice.finished(path.name)
-    if fell_back or (cut and not voice.skip and clip.agent not in SYSTEM):
+    if fell_back == "the phone didn't start it":
+        phonevoice.offer({"tts": "fallback", "reason": fell_back})  # the rest of this call: the laptop's audio
+    if ended and clip.agent not in SYSTEM:
+        # The call is over: what the phone didn't confirm goes as a text, from the last piece it said it started
+        rest = plan.pieces[max(spoken - 1, 0):]
+        rest = [p for n, p in enumerate(rest, start=max(spoken - 1, 0)) if plan.sentence[n] >= 0]  # not the intro
+        if rest:
+            clip.sentences, clip.for_call = rest, True
+            clip.save(path)
+        log(TALKBACK_LOG, f"{clip.agent} on the phone: the call ended, {len(rest)} pieces left to text")
+    elif fell_back or (cut and not voice.skip and clip.agent not in SYSTEM):
         # Said again from the start of the sentence it reached, by whoever speaks next (the laptop, after a fallback)
         clip.sentences = plan.left(max(spoken - 1, 0), list(clip.sentences))
         if clip.sentences:

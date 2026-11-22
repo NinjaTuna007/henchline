@@ -64,6 +64,24 @@ class Clips(unittest.TestCase):
         phonevoice.offer({"tts": "fallback", "reason": "fell behind 1.2 s", "id": "c3"})
         self.assertEqual(phonevoice.progress("c3")["fallback"], "fell behind 1.2 s")
 
+    def test_cancel_passes_the_stop_on_before_the_files_go(self):
+        import threading
+        phonevoice.send("c4", "claude", "af_heart", 3, ["One."], set(), [0])
+        phonevoice.outgoing()  # sent
+        seen = []
+        server = threading.Thread(target=lambda: [seen.extend(phonevoice.outgoing()) or __import__("time").sleep(0.05)
+                                                  for _ in range(10)], daemon=True)
+        server.start()
+        phonevoice.cancel("c4")
+        server.join(2)
+        self.assertIn({"stop": "c4"}, seen)
+        self.assertFalse((phonevoice.PHONE_SAY / "c4.json").exists())
+
+    def test_cancel_with_no_call_to_pass_it_on_gives_up_and_cleans(self):
+        phonevoice.send("c5", "claude", "af_heart", 3, ["One."], set(), [0])
+        phonevoice.cancel("c5", wait=0.1)
+        self.assertEqual(list(phonevoice.PHONE_SAY.glob("c5*")), [])
+
     def test_bad_ids_and_unknown_clips_are_ignored(self):
         phonevoice.said({"said": {"id": "../escape", "piece": 0}})
         phonevoice.said({"said": {"id": "never-sent", "piece": 0}})

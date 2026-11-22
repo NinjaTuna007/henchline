@@ -172,6 +172,18 @@ def stop(clip: str) -> None:
         (PHONE_SAY / f"{clip}.stop").touch()
 
 
+def cancel(clip: str, wait: float = 1.5) -> None:
+    """The laptop takes the clip back (the phone never started it, or the user talked over it): the phone is told to
+    stop BEFORE the files go, so a slow phone can't speak it alongside the laptop's own audio. Waits for the call
+    server to pass the stop on (at most `wait`; with no call to pass it on, there's no phone to speak it either)."""
+    if (PHONE_SAY / f"{clip}.json").exists():
+        (PHONE_SAY / f"{clip}.stop").touch()
+        until = time.time() + wait
+        while (PHONE_SAY / f"{clip}.stop").exists() and time.time() < until:
+            time.sleep(0.02)
+    finished(clip)
+
+
 def finished(clip: str) -> None:
     for suffix in (".json", ".sent", ".progress", ".stop"):
         (PHONE_SAY / f"{clip}{suffix}").unlink(missing_ok=True)

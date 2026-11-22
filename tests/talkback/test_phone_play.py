@@ -111,3 +111,96 @@ class PhonePlay(unittest.TestCase):
             thread.join(3)
         self.assertEqual(stops, [path.name])
         self.assertEqual(spool.Clip.load(path).sentences, ["One sentence.", "Another sentence."])  # said again later
+
+
+class Timeout(unittest.TestCase):
+    """The phone never starts a clip: the laptop takes it back, but tells the phone to stop first."""
+
+    def setUp(self):
+        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        for p in [mock.patch.object(worker, "in_call", return_value=True),
+                  mock.patch.object(worker, "mic_busy", return_value=False),
+                  mock.patch.object(worker, "PHONE_TIMEOUT", 0.3),
+                  mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        phonevoice.call_over()
+        for path in SPOOL.glob("*.json"):
+            path.unlink()
+
+    def test_a_slow_phone_is_told_to_stop_before_the_laptop_says_it(self):
+        clip, path = clip_file("First sentence here. Second sentence here.")
+        sent = []
+        stop = threading.Event()
+
+        def server():  # the call server passing messages on, as its phone_voice() task does
+            while not stop.is_set():
+                sent.extend(phonevoice.outgoing())
+                time.sleep(0.02)
+
+        thread = threading.Thread(target=server, daemon=True)
+        thread.start()
+        worker.phone_play(FakeVoice(), clip, path, "")
+        stop.set()
+        thread.join(1)
+        kinds = [next(iter(m)) for m in sent]
+        self.assertEqual(kinds, ["say", "stop"])  # the stop went out, after the say, before the files went
+        self.assertFalse((phonevoice.PHONE_SAY / f"{path.name}.json").exists())
+        self.assertEqual(spool.Clip.load(path).sentences, ["First sentence here.", "Second sentence here."])
+        self.assertFalse(phonevoice.phone_renders())  # the laptop speaks the rest of the call
+
+
+class DroppedLine(unittest.TestCase):
+    """A lift: the phone has the words and goes on speaking; the laptop waits for its report instead of replaying."""
+
+    def setUp(self):
+        phonevoice.offer({"tts": {"engine": "sherpa-kokoro", "model": phonevoice.VERSION}})
+        self.calling, self.dropped = threading.Event(), threading.Event()
+        self.calling.set()
+        for p in [mock.patch.object(worker, "in_call", side_effect=lambda: self.calling.is_set()),
+                  mock.patch.object(worker, "line_dropped",
+                                    side_effect=lambda: {"until": time.time() + 30} if self.dropped.is_set() else None),
+                  mock.patch.object(worker, "mic_busy", return_value=False),
+                  mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        phonevoice.call_over()
+        for path in SPOOL.glob("*.json"):
+            path.unlink()
+
+    def test_a_drop_then_the_phones_report_says_nothing_twice(self):
+        clip, path = clip_file("First sentence here. Second sentence here. Third one too.")
+
+        def lift(say):
+            phonevoice.said({"said": {"id": say["id"], "piece": 0}})
+            self.calling.clear(); self.dropped.set()  # the line drops; the phone speaks on, its acks lost
+            time.sleep(0.4)
+            self.dropped.clear(); self.calling.set()  # back: the phone reports how far it got
+            phonevoice.said({"said": {"id": say["id"], "piece": len(say["pieces"]) - 1}})
+            phonevoice.said({"said": {"id": say["id"], "done": True}})
+
+        thread = phone(lift)
+        worker.phone_play(FakeVoice(), clip, path, "")
+        thread.join(3)
+        self.assertFalse(path.exists())  # nothing replayed: the phone said it all
+        self.assertFalse((phonevoice.PHONE_SAY / f"{path.name}.json").exists())
+
+    def test_if_the_line_never_comes_back_the_rest_is_texted_from_the_last_confirmed_piece(self):
+        clip, path = clip_file("First sentence here. Second sentence here. Third one too.")
+
+        def lift(say):
+            phonevoice.said({"said": {"id": say["id"], "piece": 1}})  # the second piece had started
+            self.calling.clear(); self.dropped.set()
+            time.sleep(0.3)
+            self.dropped.clear()  # the window passed: the call is over
+
+        thread = phone(lift)
+        worker.phone_play(FakeVoice(), clip, path, "")
+        thread.join(3)
+        kept = spool.Clip.load(path)
+        self.assertTrue(kept.for_call)  # texted, not said at the laptop
+        self.assertEqual(kept.sentences, ["Second sentence here.", "Third one too."])
