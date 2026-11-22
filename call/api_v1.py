@@ -7,8 +7,9 @@ Delivery itself stays where it was: the server hands this module a LocalHost who
 to_agent and agent listing, so nothing here knows about terminals or audio.
 
 A capability is advertised only when the host's config enables it and this module implements it: today that
-is "chat" (list chats, read this API's message events, send a message). The rest of the contract's routes
-answer 404 until their capability is built.
+is "chat" (list chats, read this API's message events, send a message) and "legacy_routes" (the server's own
+routes take the same signed requests: guard_legacy). The rest of the contract's routes answer 404 until their
+capability is built.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from call.canonical import b64url, pairing_bytes, unb64url
 from call.host_config import HostConfig
 from call.host_store import Device, HostStore
 
-IMPLEMENTED = {"chat"}
+IMPLEMENTED = {"chat", "legacy_routes"}
 LOG = logging.getLogger("henchline.api_v1")
 BUILD_ID = os.environ.get("HENCHLINE_BUILD_ID", "dev")
 DEFAULT_LIMIT, MAX_LIMIT = 50, 200
@@ -102,6 +103,34 @@ def setup(app: web.Application, config: HostConfig, store: HostStore, host: Loca
         app.on_cleanup.append(stop_ledger)
     r.add_route("*", "/api/v1/{tail:.*}", not_found)  # last: everything else answers in the error envelope
     return api
+
+
+def guard_legacy(app: web.Application, streamed: frozenset[str] = frozenset()) -> None:
+    """The server's own routes (everything outside /api/v1) take a request signed exactly as /api/v1 wants it,
+    when the host offers "legacy_routes". It is authenticated here, before the route runs, and kept on the
+    request under auth.SIGNED: the route's Origin check (server.trusted) then lets it through as that phone.
+    A request without a signature is left as it was (the route checks its Origin). One with a bad, replayed,
+    revoked or unknown signature is answered here in the error envelope and never falls back to the Origin.
+    streamed: routes that read their body as a stream (uploads), refused signed for now: checking the
+    signature needs the whole body hashed first, and they write it to disk as it comes."""
+
+    @web.middleware
+    async def signed_legacy(request: web.Request, handler: Any) -> web.StreamResponse:
+        if "X-Henchline-Signature" not in request.headers or request.path.startswith(("/api/v1/", "/.well-known/")):
+            return await handler(request)
+        api = request.app[API_KEY]
+        try:
+            if not api.capabilities.get("legacy_routes"):
+                raise ApiError(404, "capability_unavailable", "this host takes signed requests only under /api/v1")
+            resource = request.match_info.route.resource
+            if resource is not None and resource.canonical in streamed:
+                raise ApiError(400, "unsupported", "this route doesn't take signed requests yet")
+            request[auth.SIGNED] = await auth.authenticate(request, api.config, api.store)
+        except ApiError as error:
+            return error.response()
+        return await handler(request)
+
+    app.middlewares.append(signed_legacy)
 
 
 # ---- plumbing -------------------------------------------------------------------------------------------

@@ -20,6 +20,7 @@ DEFAULT_KEY = Path.home() / ".local/share/henchline/keys/host.ed25519"
 CAPABILITIES = {
     "chat", "calls", "files", "usage", "plans", "workflows",
     "delegated_agents", "notifications", "reminders",
+    "legacy_routes",  # the server's own routes (crew, texts, the call...) also take a signed request
 }
 UTC_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 

@@ -18,6 +18,7 @@ from call.host_store import Device, HostStore
 
 
 WINDOW = 120
+SIGNED = "henchline_signed_request"  # where a signed request on one of the server's own routes keeps its SignedRequest
 TIMESTAMP = re.compile(r"[1-9][0-9]{0,11}")
 REQUEST_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 

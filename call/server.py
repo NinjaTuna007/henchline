@@ -583,15 +583,33 @@ def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent
     return (got.spoken() if got else "your agent"), ""
 
 
+SIGNED_ORIGIN = ""   # with --api-v1: this host's own address (host.json), for requests a paired phone signed
+SIGNED_ONLY = False  # --signed-only: these routes take only signed requests (no Origin-only access)
+
+
 def trusted(request: web.Request) -> None:
     """Only the call page, or Henchline, which sends the page's own Origin. Browsers let any web page open a
     WebSocket or post a form to any address: without this, a page on some other site, open on the phone, could
     type into the agents' terminals. Not a password: a program on the tailnet can send any Origin. Only your
-    own devices reaching the Tailscale address is the real boundary."""
+    own devices reaching the Tailscale address is the real boundary.
+    With --api-v1, a request signed by a paired phone was checked before the route ran (api_v1.guard_legacy):
+    that phone, by its key, revocable on its own. With --signed-only, nothing else is let in."""
+    from call.auth import SIGNED
+    if request.get(SIGNED) is not None:
+        write_origin(SIGNED_ORIGIN)
+        return
+    if SIGNED_ONLY:
+        raise web.HTTPUnauthorized(content_type="application/json", text=json.dumps({"error": {
+            "code": "signature_required", "message": "this host takes only requests signed by a paired phone",
+            "retryable": False, "request_id": ""}}))
     origin = f"https://{request.host}"
     if request.headers.get("Origin") != origin:
         raise web.HTTPForbidden(text="only the call page may connect")
-    if CALL_ORIGIN.exists() and CALL_ORIGIN.read_text() == origin:
+    write_origin(origin)
+
+
+def write_origin(origin: str) -> None:
+    if not origin or CALL_ORIGIN.exists() and CALL_ORIGIN.read_text() == origin:
         return
     CALL_ORIGIN.parent.mkdir(parents=True, exist_ok=True)  # a fresh install has no state folder yet
     CALL_ORIGIN.write_text(origin)  # where `handsfree send` points a notification's link
@@ -2922,9 +2940,14 @@ class LocalHost:
                        capture_output=True, timeout=30)
 
 
-def mount_api_v1(app: web.Application, heartbeats: bool = False) -> str:
+STREAMED = frozenset({"/share/file", "/voice-note"})  # uploads read as they come: not signed yet (api_v1.guard_legacy)
+
+
+def mount_api_v1(app: web.Application, heartbeats: bool = False, signed_only: bool = False) -> str:
     """--api-v1: the signed host API beside the legacy routes, from ~/.config/henchline/host.json. "" or why not.
-    heartbeats (--directory-heartbeat): also keep this host listed in the directory it was enrolled with."""
+    heartbeats (--directory-heartbeat): also keep this host listed in the directory it was enrolled with.
+    signed_only (--signed-only): the legacy routes' Origin check lets in only requests a paired phone signed."""
+    global SIGNED_ORIGIN, SIGNED_ONLY
     from call import api_v1
     from call.host_config import HostConfig
     from call.host_store import HostStore
@@ -2936,7 +2959,12 @@ def mount_api_v1(app: web.Application, heartbeats: bool = False) -> str:
         store = HostStore(config.database)
     except (OSError, ValueError, RuntimeError) as exc:
         return str(exc)
+    if signed_only and not config.capabilities.get("legacy_routes"):
+        return '--signed-only needs "legacy_routes": true in host.json\'s capabilities (else no phone gets in)'
     api = api_v1.setup(app, config, store, LocalHost(), signer)
+    api_v1.guard_legacy(app, STREAMED)
+    SIGNED_ORIGIN = config.base_url.rstrip("/")
+    SIGNED_ONLY = signed_only
     if heartbeats:
         from call import directory_client
 
@@ -2980,7 +3008,12 @@ def main() -> int:
     parser.add_argument("--directory-heartbeat", action="store_true",
                         help="with --api-v1: a signed heartbeat a minute to the directory this host was enrolled "
                              "with (voice-call directory enroll); nothing when not enrolled")
+    parser.add_argument("--signed-only", action="store_true",
+                        help="with --api-v1: the server's own routes take only requests signed by a paired phone "
+                             "(host.json must offer legacy_routes); the browser call page and uploads stop working")
     args = parser.parse_args()
+    if args.signed_only and not args.api_v1:
+        parser.error("--signed-only needs --api-v1 (the phones' keys are paired there)")
     if args.directory_heartbeat and not args.api_v1:
         parser.error("--directory-heartbeat needs --api-v1 (it advertises that API's descriptor)")
     if args.behind_tailscale_serve:
@@ -3049,7 +3082,7 @@ def main() -> int:
     app.on_cleanup.append(stop_reminders)
     app.router.add_post("/crew/model", crew_model)
     app.router.add_get("/files/{secret}/{name}", sent_file)
-    if args.api_v1 and (why := mount_api_v1(app, args.directory_heartbeat)):
+    if args.api_v1 and (why := mount_api_v1(app, args.directory_heartbeat, args.signed_only)):
         print(f"--api-v1: {why}", file=sys.stderr)
         return 1
     proxied = args.behind_tailscale_serve
