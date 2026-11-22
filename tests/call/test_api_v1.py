@@ -500,11 +500,6 @@ class NoChat(Base):
         status, body = await self.call(key, device, "GET", "/api/v1/chats")
         self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CallLines(Base):
     """What is said on a call, kept as its chat's call_line events and served only to a phone that asks."""
 
@@ -548,3 +543,16 @@ class CallLines(Base):
         self.assertEqual(answer.status, 401)
         self.assertEqual(self.store.prune_events(at + 1), 1)  # with the rest of the ledger
         self.assertEqual(self.store.events("claude-1", 50), [])
+
+    async def test_a_clip_is_kept_once_and_a_placeholder_never(self):
+        at = time.time()
+        talk = self.line("Done, tests pass.", clip="0042-claude.json")
+        self.assertIsNotNone(api_v1.record_call_line(self.api, talk, now=at))
+        self.assertIsNone(api_v1.record_call_line(self.api, talk, now=at + 3))  # sent again after a resume
+        self.assertIsNone(api_v1.record_call_line(self.api, {"from": "you", "text": "(spoken, sent to Claude)",
+                                                             "session": "claude-1", "placeholder": True}, now=at))
+        self.assertEqual([json.loads(r["body"])["text"] for r in self.store.events("claude-1", 50)], ["Done, tests pass."])
+
+
+if __name__ == "__main__":
+    unittest.main()

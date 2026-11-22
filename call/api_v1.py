@@ -438,15 +438,19 @@ MAX_FROM = 64  # characters of a call line's speaker
 def record_call_line(api: Api, chat: dict[str, Any], now: float | None = None) -> str | None:
     """A line said on a call (your words as heard, an agent's talkback, a line typed in its terminal), kept in its
     chat's events as kind call_line ({from, text, created_at}), so a paired phone can read the call afterwards.
-    Not an agent's text (tid: ingested from texts/ already) or a file (its link is a secret). The new event's id,
-    or None when the line isn't kept. Pruned with the rest after ledger_days."""
+    Not an agent's text (tid: ingested from texts/ already), a file (its link is a secret) or a placeholder with no
+    words. A phone message sent over this API never comes here: it is delivered as a text (Heard.TEXTED), which the
+    call's chat doesn't repeat. A talkback clip is kept once however often it is sent (source clip:<name>). The new
+    event's id, or None when the line isn't kept. Pruned with the rest after ledger_days."""
     session, text = str(chat.get("session", "")), chat.get("text")
-    if (chat.get("tid") or chat.get("file") or not SESSION_ID.fullmatch(session)
+    if (chat.get("tid") or chat.get("file") or chat.get("placeholder") or not SESSION_ID.fullmatch(session)
             or not isinstance(text, str) or not text.strip()):
         return None
     at = time.time() if now is None else now
     body = {"from": str(chat.get("from", ""))[:MAX_FROM], "text": text[:MAX_TEXT], "created_at": utc(at)}
-    return api.store.append_event(session, "call_line", json.dumps(body).encode(), now=at)
+    clip = chat.get("clip")
+    source = f"clip:{clip}" if isinstance(clip, str) and clip else None
+    return api.store.append_event(session, "call_line", json.dumps(body).encode(), now=at, source=source)
 
 
 def ingest(api: Api, now: float | None = None) -> int:

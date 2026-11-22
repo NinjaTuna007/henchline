@@ -725,12 +725,15 @@ class AskSubmitted(unittest.TestCase):
 
     def test_enter_is_pressed_again_while_the_ask_is_still_in_the_box(self):
         from voice.desktop import tmux
+        # Only this thread's calls: an earlier typing test's "steer" thread (tmux.steer_after, a daemon pressing
+        # Enter for a few seconds) may still be running, and the patch reaches it too (3 presses seen, 2026-11-22)
+        here = threading.current_thread()
         screens = iter(["\n".join(self.STUCK), "\n".join(self.STUCK), "\n".join(self.SENT)])
-        with mock.patch.object(tmux, "out", side_effect=lambda *a: next(screens)), \
-                mock.patch.object(tmux, "tmux") as keys:
+        pressed = []
+        with mock.patch.object(tmux, "out", side_effect=lambda *a: next(screens) if threading.current_thread() is here else ""), \
+                mock.patch.object(tmux, "tmux", side_effect=lambda *a: pressed.append(a) if threading.current_thread() is here else None):
             self.assertTrue(tmux.submit_pending(Tab("tmux", "%7"), "[henchline · deploy]", pause=0))
-        self.assertEqual(keys.call_count, 2)
-        self.assertEqual(keys.call_args.args, ("send-keys", "-t", "%7", "Enter"))
+        self.assertEqual(pressed, [("send-keys", "-t", "%7", "Enter")] * 2)
 
     def test_a_box_that_never_empties_is_a_failure(self):
         from voice.desktop import tmux

@@ -118,12 +118,16 @@ class Status:
                 else:  # what it heard you say, so a mishearing shows
                     said = f"🎙 {sent.words}" if sent.words else f"(spoken, sent to {self.waiting_for})"
                 if said:
-                    lines.append({"chat": {"from": "you", "text": said, "session": sent.session}})
+                    # placeholder: no words to keep, only that something went (not kept in the host's ledger)
+                    lines.append({"chat": {"from": "you", "text": said, "session": sent.session,
+                                           **({} if sent.words else {"placeholder": True})}})
         playing = Playing.now()
         if playing and playing.clip != self.clip:
             self.clip = playing.clip
+            # clip: which talkback it is, so the host's ledger keeps it once (a call picked up again starts a new
+            # Status that sends the clip still playing a second time)
             lines.append({"chat": {"from": playing.agent.capitalize(), "text": playing.text,
-                                   "session": playing.session}})
+                                   "session": playing.session, "clip": playing.clip}})
         for line in sorted(CALL_MIRROR.glob("*.json")):  # typed in the terminal (call/hooks)
             mirrored = read_json(line)
             line.unlink(missing_ok=True)
