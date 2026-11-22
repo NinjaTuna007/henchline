@@ -50,6 +50,22 @@ object OkHttpTransport : Http {
     }
 }
 
+/** The headers that sign one request to a paired computer, as it checks them on /api/v1 and (when it offers
+ *  legacy_routes) on its own routes. url: exactly as it will be sent (its encoded path and query are signed).
+ *  bodySha256: hex digest of the exact bytes sent. */
+fun signedHeaders(host: Host, key: RequestKey, method: String, url: HttpUrl, bodySha256: String,
+                  requestId: String = UUID.randomUUID().toString(),
+                  timestamp: Long = System.currentTimeMillis() / 1000): Map<String, String> {
+    val nonce = Canonical.b64url(ByteArray(16).also { SecureRandom().nextBytes(it) })
+    val message = Canonical.requestBytes("1.0", host.hostId, "https", host.tlsAuthority, method,
+        url.encodedPath, url.encodedQuery ?: "", ByteArray(0), host.deviceId, timestamp, nonce, requestId, bodySha256)
+    return mapOf(
+        "X-Henchline-Api-Version" to "1.0", "X-Henchline-Host" to host.hostId,
+        "X-Henchline-Device" to host.deviceId, "X-Henchline-Timestamp" to timestamp.toString(),
+        "X-Henchline-Nonce" to nonce, "X-Henchline-Request-Id" to requestId,
+        "X-Henchline-Signature" to Canonical.b64url(key.sign(message)))
+}
+
 /** Signed requests to one paired computer (the host's v1 API). Multi-host only: Android 13+. */
 @androidx.annotation.RequiresApi(MultiHost.MIN_SDK)
 class HostClient(
@@ -66,16 +82,8 @@ class HostClient(
             segments.forEach { addPathSegment(it) }
             query.forEach { (k, v) -> addQueryParameter(k, v) }
         }.build()
-        val sent = body ?: ByteArray(0)
         val timestamp = clock()
-        val nonce = Canonical.b64url(ByteArray(16).also { SecureRandom().nextBytes(it) })
-        val message = Canonical.requestBytes("1.0", host.hostId, "https", host.tlsAuthority, method,
-            url.encodedPath, url.encodedQuery ?: "", sent, host.deviceId, timestamp, nonce, requestId)
-        val headers = mapOf(
-            "X-Henchline-Api-Version" to "1.0", "X-Henchline-Host" to host.hostId,
-            "X-Henchline-Device" to host.deviceId, "X-Henchline-Timestamp" to timestamp.toString(),
-            "X-Henchline-Nonce" to nonce, "X-Henchline-Request-Id" to requestId,
-            "X-Henchline-Signature" to Canonical.b64url(key.sign(message)))
+        val headers = signedHeaders(host, key, method, url, Canonical.sha256Hex(body ?: ByteArray(0)), requestId, timestamp)
         val answer = http.send(method, url, body, headers)
         val error = answer.json().optJSONObject("error")
         if (answer.code == 401 && error?.optString("code") == "timestamp_out_of_window" && error.has("server_time")) {

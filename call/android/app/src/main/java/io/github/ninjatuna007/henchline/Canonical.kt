@@ -69,14 +69,15 @@ object Canonical {
     }
 
     /** authorityId: the host_id for a host, the directory_id for the directory. deviceId: this phone's device id
-     *  there (a host's own id when a host signs a heartbeat). */
+     *  there (a host's own id when a host signs a heartbeat). bodySha256: the body's digest instead of the body
+     *  (an upload hashed as it is read, never held whole). */
     fun requestBytes(
         apiVersion: String, authorityId: String, scheme: String, authority: String, method: String,
         path: String, query: String, body: ByteArray, deviceId: String, timestamp: Long, nonce: String,
-        requestId: String,
+        requestId: String, bodySha256: String? = null,
     ): ByteArray = lines(listOf(
         PREFIX, apiVersion, authorityId.lowercase(), scheme.lowercase(), authority.lowercase(), method.uppercase(),
-        path(path), query(query), sha256Hex(body), deviceId, timestamp.toString(), nonce, requestId.lowercase(),
+        path(path), query(query), bodySha256 ?: sha256Hex(body), deviceId, timestamp.toString(), nonce, requestId.lowercase(),
     ))
 
     /** Signed with a new key when claiming a pairing code: proof the phone holds it. publicKey: the base64url text

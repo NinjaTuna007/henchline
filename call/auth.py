@@ -20,6 +20,7 @@ from call.host_store import Device, HostStore
 WINDOW = 120
 SIGNED = "henchline_signed_request"  # where a signed request on one of the server's own routes keeps its SignedRequest
 TIMESTAMP = re.compile(r"[1-9][0-9]{0,11}")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 REQUEST_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
@@ -50,6 +51,10 @@ class SignedRequest:
     request_id: str
     fingerprint: str
     body: bytes
+    body_sha256: str = ""  # streamed: the digest the signature covers, for the route to check as the body arrives
+
+    def body_matches(self, digest: str) -> bool:
+        return not self.body_sha256 or self.body_sha256 == digest
 
 
 def _header(request: web.Request, name: str) -> str:
@@ -95,7 +100,10 @@ def verify_signature(device: Device, signature: bytes, message: bytes) -> None:
 
 
 async def authenticate(request: web.Request, config: HostConfig, store: HostStore,
-                       *, now: float | None = None) -> SignedRequest:
+                       *, now: float | None = None, streamed: bool = False) -> SignedRequest:
+    """streamed: the body is left unread for the route to stream; the signature covers the digest in
+    X-Henchline-Content-SHA256, which the route must compare with what arrived (SignedRequest.body_matches)
+    before it keeps anything."""
     request_id = _header(request, "X-Henchline-Request-Id")
     if not REQUEST_ID.fullmatch(request_id):  # exactly one spelling: what the signature and the ledger hold
         raise ApiError(400, "invalid_request", "request id must be a lowercase hyphenated UUID",
@@ -133,7 +141,13 @@ async def authenticate(request: web.Request, config: HostConfig, store: HostStor
         signature = unb64url(_header(request, "X-Henchline-Signature"))
     except ValueError as exc:
         raise ApiError(401, "bad_signature", "invalid signature encoding", request_id=request_id) from exc
-    body = await request.read()
+    claimed = None
+    if streamed:
+        claimed = _header(request, "X-Henchline-Content-SHA256")
+        if not SHA256_HEX.fullmatch(claimed):
+            raise ApiError(400, "invalid_request", "content digest must be 64 lowercase hex digits",
+                           request_id=request_id)
+    body = b"" if streamed else await request.read()
     raw_path, _, raw_query = request.raw_path.partition("?")
     base = urlsplit(config.base_url)
     try:
@@ -150,6 +164,7 @@ async def authenticate(request: web.Request, config: HostConfig, store: HostStor
             timestamp=timestamp_text,
             nonce=nonce,
             request_id=request_id,
+            body_sha256=claimed,
         )
     except ValueError as exc:  # a malformed escape, a newline: no signature can cover it
         raise ApiError(400, "invalid_request", f"request cannot be canonicalized: {exc}",
@@ -162,6 +177,7 @@ async def authenticate(request: web.Request, config: HostConfig, store: HostStor
         request_id=request_id,
         fingerprint=request_fingerprint(request.method, raw_path, raw_query, body),
         body=body,
+        body_sha256=claimed or "",
     )
 
 

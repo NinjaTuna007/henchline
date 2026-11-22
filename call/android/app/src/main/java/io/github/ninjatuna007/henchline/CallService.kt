@@ -139,7 +139,7 @@ class CallService : Service() {
     // OkHttp hangs up when one ping goes unanswered for a whole interval. At 5 s a phone locked for a while (Wi-Fi
     // power save, the VPN app throttled) lost the line every 10-60 s, and talkback with it (2026-11-21 19:12-19:18:
     // 13 drops). 15 s rides out those stalls; a line that is really dead still goes within 15-30 s and is redialled.
-    private val client by lazy { OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS).build() }
+    private val client by lazy { OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS).addNetworkInterceptor(LegacySigner).build() }
     @Volatile private var ended = false  // the screen was already told why the call ended
     private var reply: String? = null  // an answered ring's report-back address: told if the call can't connect
     @Volatile private var startedAt = 0L  // when the laptop answered: the call's length, for the history

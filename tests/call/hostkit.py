@@ -64,7 +64,8 @@ def sign(key, message: bytes) -> bytes:
 def signed_headers(key, device_id: str, method: str, path_qs: str, body: bytes = b"", *,
                    host_id: str = HOST_ID, authority: str = AUTHORITY, api_version: str = "1.0",
                    timestamp: int | None = None, nonce: str | None = None,
-                   request_id: str | None = None) -> dict[str, str]:
+                   request_id: str | None = None, content_sha256: str | None = None) -> dict[str, str]:
+    """content_sha256: a streamed upload's declared digest, signed in place of the body's own (and sent)."""
     path, _, query = path_qs.partition("?")
     timestamp = int(time.time()) if timestamp is None else timestamp
     nonce = nonce or canonical.b64url(secrets.token_bytes(16))
@@ -72,7 +73,7 @@ def signed_headers(key, device_id: str, method: str, path_qs: str, body: bytes =
     message = canonical.request_bytes(
         api_version=api_version, authority_id=host_id, scheme="https", authority=authority,
         method=method, path=path, query=query, body=body, device_id=device_id,
-        timestamp=timestamp, nonce=nonce, request_id=request_id)
+        timestamp=timestamp, nonce=nonce, request_id=request_id, body_sha256=content_sha256)
     return {
         "X-Henchline-Api-Version": api_version,
         "X-Henchline-Host": host_id,
@@ -81,4 +82,5 @@ def signed_headers(key, device_id: str, method: str, path_qs: str, body: bytes =
         "X-Henchline-Nonce": nonce,
         "X-Henchline-Request-Id": request_id,
         "X-Henchline-Signature": canonical.b64url(sign(key, message)),
+        **({"X-Henchline-Content-SHA256": content_sha256} if content_sha256 else {}),
     }

@@ -111,8 +111,11 @@ def guard_legacy(app: web.Application, streamed: frozenset[str] = frozenset()) -
     request under auth.SIGNED: the route's Origin check (server.trusted) then lets it through as that phone.
     A request without a signature is left as it was (the route checks its Origin). One with a bad, replayed,
     revoked or unknown signature is answered here in the error envelope and never falls back to the Origin.
-    streamed: routes that read their body as a stream (uploads), refused signed for now: checking the
-    signature needs the whole body hashed first, and they write it to disk as it comes."""
+    streamed: routes that read their body as a stream (uploads, up to gigabytes): the body is left unread, the
+    signature covers the digest the phone declares (X-Henchline-Content-SHA256), and the route keeps the upload
+    only when what arrived has that digest (SignedRequest.body_matches).
+    No idempotency here (unlike /api/v1's mutations): a nonce is never accepted twice, but a retry signed
+    afresh runs the route again, exactly as an unsigned retry always has."""
 
     @web.middleware
     async def signed_legacy(request: web.Request, handler: Any) -> web.StreamResponse:
@@ -123,9 +126,8 @@ def guard_legacy(app: web.Application, streamed: frozenset[str] = frozenset()) -
             if not api.capabilities.get("legacy_routes"):
                 raise ApiError(404, "capability_unavailable", "this host takes signed requests only under /api/v1")
             resource = request.match_info.route.resource
-            if resource is not None and resource.canonical in streamed:
-                raise ApiError(400, "unsupported", "this route doesn't take signed requests yet")
-            request[auth.SIGNED] = await auth.authenticate(request, api.config, api.store)
+            request[auth.SIGNED] = await auth.authenticate(
+                request, api.config, api.store, streamed=resource is not None and resource.canonical in streamed)
         except ApiError as error:
             return error.response()
         return await handler(request)

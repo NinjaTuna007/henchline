@@ -26,7 +26,8 @@ import java.util.concurrent.TimeUnit
  */
 class UploadService : Service() {
 
-    private val client = OkHttpClient.Builder().readTimeout(120, TimeUnit.SECONDS).writeTimeout(120, TimeUnit.SECONDS).build()
+    private val client = OkHttpClient.Builder().readTimeout(120, TimeUnit.SECONDS).writeTimeout(120, TimeUnit.SECONDS)
+        .addNetworkInterceptor(LegacySigner).build()
     private val manager by lazy { getSystemService(NotificationManager::class.java) }
     private var busy = 0  // shares being sent: the service ends when none are
 

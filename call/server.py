@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -52,6 +53,7 @@ sys.path[:0] = [str(HERE.parent), str(HERE.parent / "handsfree/core")]  # voice/
 import routing  # noqa: E402
 from routing import Heard  # noqa: E402
 from voice import phonevoice
+from call.auth import SIGNED  # noqa: E402  (a name only: the signed API itself loads with --api-v1)
 from voice import chains, commands, cursor_cli, files, minions, pickup, plans, reminders, snaps, spool, screenshot, subagents, usage, voices, workflows  # noqa: E402
 from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
 from voice.desktop import current as desktop, cursor_bridge, tmux  # noqa: E402
@@ -594,9 +596,10 @@ def trusted(request: web.Request) -> None:
     own devices reaching the Tailscale address is the real boundary.
     With --api-v1, a request signed by a paired phone was checked before the route ran (api_v1.guard_legacy):
     that phone, by its key, revocable on its own. With --signed-only, nothing else is let in."""
-    from call.auth import SIGNED
     if request.get(SIGNED) is not None:
-        write_origin(SIGNED_ORIGIN)
+        # host.json's address only when none is recorded: the call page's own Origin wins, so a base_url
+        # spelled differently never makes the two take turns rewriting it
+        write_origin(SIGNED_ORIGIN, only_if_missing=True)
         return
     if SIGNED_ONLY:
         raise web.HTTPUnauthorized(content_type="application/json", text=json.dumps({"error": {
@@ -608,8 +611,15 @@ def trusted(request: web.Request) -> None:
     write_origin(origin)
 
 
-def write_origin(origin: str) -> None:
-    if not origin or CALL_ORIGIN.exists() and CALL_ORIGIN.read_text() == origin:
+def as_signed(request: web.Request, digest: str) -> bool:
+    """An upload a paired phone signed is kept only if what arrived is what it signed (its declared digest)."""
+    signed = request.get(SIGNED)
+    return signed is None or signed.body_matches(digest)
+
+
+def write_origin(origin: str, only_if_missing: bool = False) -> None:
+    """Where `handsfree send` points a notification's link; written only when it changes."""
+    if not origin or CALL_ORIGIN.exists() and (only_if_missing or CALL_ORIGIN.read_text() == origin):
         return
     CALL_ORIGIN.parent.mkdir(parents=True, exist_ok=True)  # a fresh install has no state folder yet
     CALL_ORIGIN.write_text(origin)  # where `handsfree send` points a notification's link
@@ -623,15 +633,19 @@ async def share_file(request: web.Request) -> web.Response:
     name = files.safe_name(request.query.get("name", "file"))
     part = folder / f".{secrets.token_hex(8)}.part"  # its own: two uploads of one name don't share it
     size = 0
+    digest = hashlib.sha256()
     try:
         with part.open("xb") as out:
             while chunk := await request.content.read(1 << 20):
                 size += len(chunk)
+                digest.update(chunk)
                 if size > MAX_UPLOAD:
                     raise OSError(f"bigger than {files.size_text(MAX_UPLOAD)}")
                 if size % (64 << 20) < len(chunk) and shutil.disk_usage(folder).free < KEEP_FREE:
                     raise OSError("the laptop's disk is nearly full")
                 out.write(chunk)
+        if not as_signed(request, digest.hexdigest()):
+            raise OSError("it changed on the way (not what the phone signed)")
         if shutil.disk_usage(folder).free < KEEP_FREE:
             raise OSError("the laptop's disk is nearly full")
         while True:  # a link never replaces a file: another upload of the same name may land meanwhile
@@ -2395,6 +2409,7 @@ async def voice_note(request: web.Request) -> web.Response:
     nid = secrets.token_hex(8)
     wav = VOICE_NOTES / f"{nid}.wav"
     size = 0
+    digest = hashlib.sha256()
     with wav.open("wb") as out:
         while chunk := await request.content.read(1 << 16):
             size += len(chunk)
@@ -2402,7 +2417,11 @@ async def voice_note(request: web.Request) -> web.Response:
                 out.close()
                 wav.unlink(missing_ok=True)
                 return web.json_response({"note": "Too long."}, status=413)
+            digest.update(chunk)
             out.write(chunk)
+    if not as_signed(request, digest.hexdigest()):  # before its .json: nothing picks it up
+        wav.unlink(missing_ok=True)
+        return web.json_response({"note": "It changed on the way (not what the phone signed)."}, status=400)
     os.chmod(wav, 0o600)
     write_json(VOICE_NOTES / f"{nid}.json", {"id": nid, "session": session, "status": "waiting", "at": time.time()},
                private=True)
@@ -2940,7 +2959,7 @@ class LocalHost:
                        capture_output=True, timeout=30)
 
 
-STREAMED = frozenset({"/share/file", "/voice-note"})  # uploads read as they come: not signed yet (api_v1.guard_legacy)
+STREAMED = frozenset({"/share/file", "/voice-note"})  # uploads read as they come: see api_v1.guard_legacy
 
 
 def mount_api_v1(app: web.Application, heartbeats: bool = False, signed_only: bool = False) -> str:
@@ -3010,7 +3029,7 @@ def main() -> int:
                              "with (voice-call directory enroll); nothing when not enrolled")
     parser.add_argument("--signed-only", action="store_true",
                         help="with --api-v1: the server's own routes take only requests signed by a paired phone "
-                             "(host.json must offer legacy_routes); the browser call page and uploads stop working")
+                             "(host.json must offer legacy_routes); the browser call page stops working")
     args = parser.parse_args()
     if args.signed_only and not args.api_v1:
         parser.error("--signed-only needs --api-v1 (the phones' keys are paired there)")

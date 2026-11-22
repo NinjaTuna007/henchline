@@ -1,5 +1,6 @@
 """The server's own routes taking requests signed by a paired phone (api_v1.guard_legacy, server.trusted)."""
 
+import hashlib
 import importlib.util
 import json
 import tempfile
@@ -14,6 +15,8 @@ try:
     from aiohttp.test_utils import AioHTTPTestCase
 except ImportError:
     raise unittest.SkipTest("aiohttp missing: run with ~/.local/share/henchline/venv/bin/python3")
+
+from aiohttp import WSServerHandshakeError
 
 from call import api_v1, canonical
 from call.host_store import HostStore
@@ -49,11 +52,14 @@ class Base(AioHTTPTestCase):
         folder = Path(tempfile.mkdtemp(dir=sandbox.HOME))
         self.config = hostkit.config(folder, capabilities=self.capabilities)
         self.store = HostStore(self.config.database)
+        server.CALL_ORIGIN.unlink(missing_ok=True)  # each test starts with no call page address recorded
+        self.addCleanup(server.CALL_ORIGIN.unlink, missing_ok=True)
         app = web.Application()
         app.router.add_post("/text", server.texted)
         app.router.add_get("/chat/minions", server.chat_minions)
         app.router.add_get("/call", socket)
         app.router.add_post("/share/file", server.share_file)
+        app.router.add_post("/voice-note", server.voice_note)
         app.router.add_get("/files/{secret}/{name}", files)
         self.api = api_v1.setup(app, self.config, self.store, FakeHost(), HostSigner.load_or_create(self.config.key_file))
         api_v1.guard_legacy(app, server.STREAMED)
@@ -95,7 +101,7 @@ class SignedRoutes(Base):
         answer, _ = await self.signed(key, device, "POST", "/text", {"text": "hi", "session": "claude-1"})
         self.assertEqual((answer.status, await answer.json()), (200, {"to": "Claude", "queued": False}))
         self.to_agent.assert_called_once_with("hi", "claude-1", server.Heard.TEXTED, False, False)
-        self.assertEqual(server.CALL_ORIGIN.read_text(), f"https://{hostkit.AUTHORITY}")  # the host's own address
+        self.assertEqual(server.CALL_ORIGIN.read_text(), f"https://{hostkit.AUTHORITY}")  # none recorded yet: the host's own
 
     async def test_a_signed_get_and_a_signed_websocket(self):
         key, device = await self.enrolled()
@@ -142,10 +148,86 @@ class SignedRoutes(Base):
         self.assertEqual(answer.status, 401)
         self.to_agent.assert_not_called()
 
-    async def test_streamed_uploads_refuse_signed_requests_for_now(self):
+    async def upload(self, key, device, path, sent: bytes, signed_for: bytes | None = None, **extra):
+        digest = hashlib.sha256(sent if signed_for is None else signed_for).hexdigest()
+        headers = hostkit.signed_headers(key, device, "POST", path, content_sha256=digest, **extra)
+        return await self.client.post(path, data=sent, headers=headers)
+
+    async def test_a_signed_upload_is_kept_when_it_arrives_as_signed(self):
         key, device = await self.enrolled()
-        answer, _ = await self.signed(key, device, "POST", "/share/file?name=a.txt")
-        self.assertEqual((answer.status, (await answer.json())["error"]["code"]), (400, "unsupported"))
+        answer = await self.upload(key, device, "/share/file?name=a.txt", b"x" * 300_000)
+        self.assertEqual(answer.status, 200)
+        saved = server.files.inbox_today() / (await answer.json())["saved"]
+        self.assertEqual(saved.read_bytes(), b"x" * 300_000)
+
+    async def test_a_signed_upload_that_changed_on_the_way_is_dropped(self):
+        key, device = await self.enrolled()
+        before = set(server.files.inbox_today().iterdir())
+        answer = await self.upload(key, device, "/share/file?name=b.txt", b"evil", signed_for=b"good")
+        self.assertEqual(answer.status, 400)
+        self.assertEqual(set(server.files.inbox_today().iterdir()), before)  # neither the file nor its .part
+
+    async def test_a_signed_upload_must_declare_a_proper_digest(self):
+        key, device = await self.enrolled()
+        headers = hostkit.signed_headers(key, device, "POST", "/share/file?name=c.txt")  # no digest: body's own
+        answer = await self.client.post("/share/file?name=c.txt", data=b"", headers=headers)
+        self.assertEqual((answer.status, (await answer.json())["error"]["code"]), (401, "bad_signature"))
+        headers = hostkit.signed_headers(key, device, "POST", "/share/file?name=c.txt", content_sha256="AB" * 32)
+        answer = await self.client.post("/share/file?name=c.txt", data=b"", headers=headers)
+        self.assertEqual((answer.status, (await answer.json())["error"]["code"]), (400, "invalid_request"))
+
+    async def test_a_signed_voice_message(self):
+        key, device = await self.enrolled()
+        speaker = mock.Mock(session="claude-1")
+        with mock.patch.object(server, "recent_speakers", return_value=[speaker]):
+            bad = await self.upload(key, device, "/voice-note?session=claude-1", b"RIFFevil", signed_for=b"RIFFgood")
+            good = await self.upload(key, device, "/voice-note?session=claude-1", b"RIFFgood")
+        self.assertEqual(bad.status, 400)
+        nid = (await good.json())["id"]
+        self.assertEqual(sorted(p.name for p in server.VOICE_NOTES.iterdir()), [f"{nid}.json", f"{nid}.wav"])
+
+    async def test_an_empty_signature_is_a_bad_one(self):
+        key, device = await self.enrolled()
+        data = json.dumps({"text": "hi", "session": "claude-1"}).encode()
+        headers = {**hostkit.signed_headers(key, device, "POST", "/text", data), "X-Henchline-Signature": "",
+                   **self.origin()}
+        answer = await self.client.post("/text", data=data, headers=headers)
+        self.assertEqual((answer.status, (await answer.json())["error"]["code"]), (401, "bad_signature"))
+        self.to_agent.assert_not_called()
+
+    async def test_a_changed_query_is_refused(self):
+        key, device = await self.enrolled()
+        headers = hostkit.signed_headers(key, device, "GET", "/chat/minions?session=a")
+        with mock.patch.object(server.chains, "view", return_value={}) as view:
+            answer = await self.client.get("/chat/minions?session=b", headers=headers)
+        self.assertEqual((answer.status, (await answer.json())["error"]["code"]), (401, "bad_signature"))
+        view.assert_not_called()
+
+    async def test_a_nonce_used_here_is_refused_under_api_v1(self):
+        key, device = await self.enrolled()
+        answer, used = await self.signed(key, device, "POST", "/text", {"text": "hi", "session": "claude-1"})
+        self.assertEqual(answer.status, 200)
+        headers = hostkit.signed_headers(key, device, "GET", "/api/v1/chats", nonce=used["X-Henchline-Nonce"])
+        answer = await self.client.get("/api/v1/chats", headers=headers)
+        self.assertEqual((answer.status, (await answer.json())["error"]["message"]),
+                         (401, "request nonce was already used"))
+
+    async def test_head_is_signed_like_get(self):
+        key, device = await self.enrolled()
+        with mock.patch.object(server.chains, "view", return_value={}), \
+                mock.patch.object(server.subagents, "helpers", return_value=[]):
+            answer, _ = await self.signed(key, device, "HEAD", "/chat/minions?session=a")
+            self.assertEqual(answer.status, 200)
+            headers = hostkit.signed_headers(key, device, "GET", "/chat/minions?session=a")  # signed as another method
+            answer = await self.client.head("/chat/minions?session=a", headers=headers)
+            self.assertEqual(answer.status, 401)
+
+    async def test_a_signed_request_leaves_the_call_pages_address_alone(self):
+        server.write_origin("https://laptop.example.ts.net")
+        key, device = await self.enrolled()
+        answer, _ = await self.signed(key, device, "POST", "/text", {"text": "hi", "session": "claude-1"})
+        self.assertEqual(answer.status, 200)
+        self.assertEqual(server.CALL_ORIGIN.read_text(), "https://laptop.example.ts.net")
 
     async def test_api_v1_routes_are_not_checked_twice(self):
         key, device = await self.enrolled()
@@ -163,9 +245,12 @@ class SignedOnly(Base):
     async def test_unsigned_requests_are_refused_even_with_the_origin(self):
         answer = await self.client.post("/text", json={"text": "hi", "session": "claude-1"}, headers=self.origin())
         self.assertEqual((answer.status, (await answer.json())["error"]["code"]), (401, "signature_required"))
-        with self.assertRaises(Exception):
+        with self.assertRaises(WSServerHandshakeError) as refused:
             async with self.client.ws_connect("/call", headers=self.origin()):
                 pass
+        self.assertEqual(refused.exception.status, 401)
+        answer = await self.client.head("/chat/minions?session=a", headers=self.origin())
+        self.assertEqual(answer.status, 401)
         self.to_agent.assert_not_called()
 
     async def test_signed_requests_still_get_in(self):

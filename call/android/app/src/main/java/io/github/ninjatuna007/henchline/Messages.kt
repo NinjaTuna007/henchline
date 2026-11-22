@@ -124,8 +124,8 @@ object Messages {
         Sent("Not sent: ${e.message ?: "the laptop couldn't be reached"} (is Tailscale on?)", false, offline = true)
     }
 
-    private val QUICK = okhttp3.OkHttpClient.Builder().callTimeout(8, java.util.concurrent.TimeUnit.SECONDS).build()
-    private val PATIENT = okhttp3.OkHttpClient.Builder().callTimeout(30, java.util.concurrent.TimeUnit.SECONDS).build()
+    private val QUICK = okhttp3.OkHttpClient.Builder().callTimeout(8, java.util.concurrent.TimeUnit.SECONDS).addNetworkInterceptor(LegacySigner).build()
+    private val PATIENT = okhttp3.OkHttpClient.Builder().callTimeout(30, java.util.concurrent.TimeUnit.SECONDS).addNetworkInterceptor(LegacySigner).build()
 
     /** How far an agent's texts got, told to the laptop (`handsfree text-status`): "delivered" when on the phone,
      *  "read" when you opened that chat or replied. Best effort: off Tailscale it is just not told. */

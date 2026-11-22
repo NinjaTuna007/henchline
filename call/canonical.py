@@ -91,7 +91,10 @@ def request_bytes(
     timestamp: int | str,
     nonce: str,
     request_id: str,
+    body_sha256: str | None = None,
 ) -> bytes:
+    """body_sha256: the body's digest when the body itself isn't at hand yet (an upload read as it streams in;
+    the receiver checks the bytes against it before keeping them)."""
     fields = (
         PREFIX,
         api_version,
@@ -101,7 +104,7 @@ def request_bytes(
         method.upper(),
         canonical_path(path),
         canonical_query(query),
-        body_digest(body),
+        body_digest(body) if body_sha256 is None else body_sha256,
         device_id,
         str(timestamp),
         nonce,

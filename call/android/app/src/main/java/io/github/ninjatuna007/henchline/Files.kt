@@ -31,7 +31,7 @@ object Files {
     const val SIZE = "file_size"
     const val SESSION = "file_session"
 
-    val client: OkHttpClient = OkHttpClient.Builder().readTimeout(60, TimeUnit.SECONDS).build()
+    val client: OkHttpClient = OkHttpClient.Builder().readTimeout(60, TimeUnit.SECONDS).addNetworkInterceptor(LegacySigner).build()
 
     /** The laptop's address as Henchline knows it, e.g. https://laptop.tailnet.ts.net */
     fun origin(context: Context): String? {
