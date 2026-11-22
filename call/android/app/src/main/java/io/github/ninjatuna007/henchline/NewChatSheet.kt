@@ -301,6 +301,7 @@ class NewChatSheet(
     private var failure = ""  // why the last start didn't happen, shown until something else is picked
     private var modelRefresh: () -> Unit = {}
     private var refreshNow: () -> Unit = {}  // the sheet's own refresh, once it is built
+    private var asking = false  // a computer picked and not answered yet: another tap waits for that answer
 
     /** A listed folder the picked agent doesn't trust yet (the computer says so: trusted {agent: false}; an older one
      *  says nothing): starting there gets the same confirm as a typed path, and the computer then answers the agent's
@@ -325,9 +326,12 @@ class NewChatSheet(
                 alpha = if (reachable) 1f else 0.45f
                 // This sheet stays until that computer's own sheet is ready; if it can't be, it says why here
                 if (reachable && key != computer) setOnClickListener {
+                    if (asking) return@setOnClickListener  // one at a time: no second sheet stacked on the first
+                    asking = true
                     pop(this)
                     failure = "Asking $name…"; refreshNow()
                     pickComputer.invoke(key) { why ->
+                        asking = false
                         if (why == null) close() else { failure = why; refreshNow() }
                     }
                 }

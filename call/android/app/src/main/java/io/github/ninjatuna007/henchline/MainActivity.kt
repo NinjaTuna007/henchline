@@ -3271,7 +3271,10 @@ class MainActivity : Activity() {
                 val request = okhttp3.Request.Builder().url("$origin$path").header("Origin", origin)
                 if (body != null) request.post(body.toString().toRequestBody("application/json".toMediaType()))
                 Files.client.newCall(request.build()).execute().use { response ->
-                    val json = try { JSONObject(response.body?.string()?.ifEmpty { "{}" } ?: "{}") } catch (e: org.json.JSONException) { JSONObject() }
+                    val json = try { JSONObject(response.body?.string()?.ifEmpty { "{}" } ?: "{}") } catch (e: org.json.JSONException) {
+                        android.util.Log.w("Henchline", "$path on $who: HTTP ${response.code}, not JSON")
+                        if (response.isSuccessful) JSONObject().put("note", "Couldn't read $who's answer.") else JSONObject()
+                    }
                     // Refused (an unsigned request where only signed ones are taken, a route it hasn't got): said so
                     if (!response.isSuccessful && !json.has("note")) {
                         val code = json.optJSONObject("error")?.optString("code").orEmpty()
