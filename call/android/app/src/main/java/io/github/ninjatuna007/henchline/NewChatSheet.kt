@@ -284,7 +284,13 @@ class NewChatSheet(
     private val loadModels: (agent: String, then: (JSONObject) -> Unit) -> Unit,  // {models} or {menu}
     private val cursorChats: (() -> Unit)? = null,  // a Cursor chat you already have, instead of a new agent
     private val start: (folder: String, agent: String, model: String, params: Map<String, String>, typed: Boolean,
-                        done: (String?) -> Unit) -> Unit,
+                        trust: Boolean, done: (String?) -> Unit) -> Unit,
+    // Multi-host: which computer it starts on (key, name), the one picked, those that can't be reached, and a pick
+    // of another (the sheet opens again with that computer's own folders and agents). One computer: no row.
+    private val computers: List<Pair<String, String>> = emptyList(),
+    private val computer: String = "",
+    private val offline: Set<String> = emptySet(),
+    private val pickComputer: ((String) -> Unit)? = null,
 ) : BottomPanel(activity) {
     private var model = ""  // "" the agent's own default
     private var modelName = "Default"
@@ -295,11 +301,34 @@ class NewChatSheet(
     private var failure = ""  // why the last start didn't happen, shown until something else is picked
     private var modelRefresh: () -> Unit = {}
 
+    /** A listed folder the picked agent doesn't trust yet (the computer says so: trusted {agent: false}; an older one
+     *  says nothing): starting there gets the same confirm as a typed path, and the computer then answers the agent's
+     *  trust question (trust: true). */
+    private fun untrusted(): Boolean = typed.isEmpty() && agent in TrustRules.ASKING &&
+        TrustRules.untrusted(folder?.optJSONObject("trusted"), agent)
+
     fun show() {
-        val sheet = open("New chat", "Starts an agent on your laptop, in its own tmux window")
+        val where = computers.firstOrNull { it.first == computer }?.second
+        val sheet = open("New chat", if (where == null) "Starts an agent on your laptop, in its own tmux window"
+            else "Starts an agent on $where, in its own tmux window")
+        if (computers.size > 1 && pickComputer != null) {
+            sheet.addView(label("COMPUTER"), wide(16))
+            val row = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
+            for ((key, name) in computers) row.addView(TextView(activity).apply {
+                text = name; textSize = 14f; gravity = Gravity.CENTER; maxLines = 1
+                setTextColor(colour(if (key == computer) R.color.text else R.color.muted))
+                setPadding(px(16), px(10), px(16), px(10))
+                background = rounded(if (key == computer) colour(R.color.surface_high) else Color.TRANSPARENT, 20f,
+                    if (key == computer) 2 else 1, if (key == computer) colour(R.color.cyan) else colour(R.color.surface_high))
+                val reachable = key !in offline
+                alpha = if (reachable) 1f else 0.45f
+                if (reachable && key != computer) setOnClickListener { pop(this); close(); pickComputer.invoke(key) }
+            }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = px(8) })
+            sheet.addView(HorizontalScrollView(activity).apply { isHorizontalScrollBarEnabled = false; addView(row) }, wide(10))
+        }
         cursorChats?.let { show -> sheet.addView(actionRow("💬", "Open a Cursor chat you already have",
             "Any chat in Cursor's list, quiet ones too", R.color.cyan) { close(); show() }, wide(12)) }
-        sheet.addView(label("AGENT"), wide(20))
+        if (agents.size > 1) sheet.addView(label("AGENT"), wide(20))  // one agent there: no choice to show
         val chips = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
         val go = primary("")
         val warning = TextView(activity).apply {
@@ -332,7 +361,7 @@ class NewChatSheet(
             go.alpha = if (go.isEnabled) 1f else 0.5f
             when {
                 failure.isNotEmpty() -> { warning.text = failure; warning.setTextColor(colour(R.color.hang)); warning.visibility = View.VISIBLE }
-                typed.isNotEmpty() -> {
+                typed.isNotEmpty() || untrusted() -> {
                     warning.text = "A folder the agent hasn't worked in: starting there trusts it to read and change its files."
                     warning.setTextColor(colour(R.color.muted)); warning.visibility = View.VISIBLE
                 }
@@ -374,7 +403,7 @@ class NewChatSheet(
                 setOnClickListener { agent = kind; failure = ""; model = ""; modelName = "Default"; settings.clear(); pop(this); refresh() }
             }, LinearLayout.LayoutParams(px(96), ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = px(10) })
         }
-        sheet.addView(HorizontalScrollView(activity).apply { isHorizontalScrollBarEnabled = false; addView(chips) }, wide(10))
+        if (agents.size > 1) sheet.addView(HorizontalScrollView(activity).apply { isHorizontalScrollBarEnabled = false; addView(chips) }, wide(10))
         // The model: a pill saying which, a list to pick from (loaded for the agent picked)
         val modelPill = TextView(activity).apply {
             setTextColor(colour(R.color.cyan)); textSize = 14f
@@ -440,7 +469,7 @@ class NewChatSheet(
             go.isEnabled = false
             go.text = "Starting ${agent.replaceFirstChar { it.uppercase() }}…"
             go.animate().alpha(0.7f).setDuration(150).start()
-            start(path, agent, model, settings.toMap(), typed.isNotEmpty()) { why ->
+            start(path, agent, model, settings.toMap(), typed.isNotEmpty(), untrusted()) { why ->
                 if (why == null) close()  // this sheet's own close: never a newer sheet's
                 else { failure = why; refresh() }
             }
@@ -1786,4 +1815,13 @@ class ShowSheet(
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
     }
+}
+
+/** Which folder a new chat's agent doesn't trust yet, from the computer's folder list: pure, for the JVM tests. */
+object TrustRules {
+    /** The agents whose trust question the computer answers once the user said yes (call/server.py ASKS_TRUST). */
+    val ASKING = setOf("claude", "codex")
+
+    /** Untrusted only when the computer says so for that agent: an older computer sends no map (and asks nothing). */
+    fun untrusted(trusted: JSONObject?, agent: String): Boolean = trusted != null && trusted.has(agent) && !trusted.optBoolean(agent)
 }

@@ -901,8 +901,8 @@ class MainActivity : Activity() {
             }
             val laptopChats = if (query.isEmpty()) groups.filter { it.first != "Pinned" } else listOf("" to byRecent)
             if (query.isEmpty() || byRecent.isNotEmpty()) {
-                val open = query.isNotEmpty() || "laptop" !in folded
-                crew.addView(computerHeading("laptop", HostPush.laptopLabel(this) ?: "This laptop",
+                val open = query.isNotEmpty() || LAPTOP !in folded
+                crew.addView(computerHeading(LAPTOP, HostPush.laptopLabel(this) ?: "This laptop",
                     if (names.isNotEmpty()) HostLists.Dot.LIVE else HostLists.Dot.UNKNOWN, "",
                     rest.sumOf { unread(it.session, it.last) }, open, null))
                 if (open) drawGroups(laptopChats.filter { it.second.isNotEmpty() }, inComputer = true)
@@ -916,7 +916,8 @@ class MainActivity : Activity() {
                 val (dot, words) = HostLists.status(look, now)
                 val open = query.isNotEmpty() || h.hostId !in folded
                 crew.addView(computerHeading(h.hostId, h.label, dot, words,
-                    summaries.count { it.sessionId !in hostPins && HostLists.unread(it, seenThere[HostLists.pinKey(h.hostId, it.sessionId)] ?: 0L) },
+                    summaries.map { it.sessionId }.toSet().let { all -> summaries.count { !HostLists.inPinned(it, hostPins, all) &&
+                        HostLists.unread(it, seenThere[HostLists.pinKey(h.hostId, it.sessionId)] ?: 0L) } },
                     open, h))
                 if (!open) continue
                 if (summaries.isEmpty() && dot == HostLists.Dot.OFFLINE) crew.addView(quietLine("Can't reach ${h.label} right now."))
@@ -2505,6 +2506,7 @@ class MainActivity : Activity() {
             setPadding(dp(if (nested) 44 else 20), dp(12), dp(20), dp(12))
             background = getDrawable(if (remote == null && session == current) R.drawable.row_current else android.R.color.transparent)
             setOnClickListener {
+                prefs().edit().putString(NEW_CHAT_ON, remote?.host?.hostId ?: LAPTOP).apply()  // New chat starts there next
                 if (remote == null) open(session)
                 else startActivity(HostChatActivity.open(this@MainActivity, ChatKey(remote.host.hostId, session)))
             }
@@ -2646,6 +2648,7 @@ class MainActivity : Activity() {
 
     private fun computerMenu(label: String, host: Host?) {
         panel = ActionsSheet(this, label, if (host == null) "This phone's laptop" else host.baseUrl, buildList {
+            add(Triple("➕", "New chat on $label") { newChat(host?.hostId ?: LAPTOP) })
             add(Triple("↻", "Refresh") { if (host == null) findCrew() else HostLists.refresh(this@MainActivity, host) })
             if (host != null && Build.VERSION.SDK_INT >= MultiHost.MIN_SDK) add(Triple("⚙", "Computer settings") { HostsSheet(this@MainActivity).show() })
         }).also { it.show() }
@@ -3256,12 +3259,18 @@ class MainActivity : Activity() {
     /** A request to the laptop off the main thread: the JSON answer (with "note" saying why not), on the main thread. */
     private fun ask(path: String, body: JSONObject?, then: (JSONObject) -> Unit) {
         val origin = Files.origin(this) ?: return say("", "Set the laptop's address in Settings first.", note = true).let {}
+        askAt(origin, "the laptop", path, body, then)
+    }
+
+    /** The same request to any computer's address: another paired computer's is signed on the way (LegacySigner,
+     *  for one that offers its own routes that way). */
+    private fun askAt(origin: String, who: String, path: String, body: JSONObject?, then: (JSONObject) -> Unit) {
         Thread {
             val answer = try {
                 val request = okhttp3.Request.Builder().url("$origin$path").header("Origin", origin)
                 if (body != null) request.post(body.toString().toRequestBody("application/json".toMediaType()))
                 Files.client.newCall(request.build()).execute().use { JSONObject(it.body?.string()?.ifEmpty { "{}" } ?: "{}") }
-            } catch (_: Exception) { JSONObject().put("note", "Couldn't reach the laptop (is Tailscale on?)") }
+            } catch (_: Exception) { JSONObject().put("note", "Couldn't reach $who (is Tailscale on?)") }
             main.post { then(answer) }
         }.start()
     }
@@ -3332,29 +3341,59 @@ class MainActivity : Activity() {
 
     /** New chat (the user's wish, 2026-11-16): the laptop's folders (those its Claude trusts, newest first, or a
      *  typed path) and agents, in a bottom sheet; the agent starts in its own tmux window there and its chat opens. */
-    private fun newChat() {
-        ask("/crew/folders", null) { answer ->
+    private fun newChat(on: String? = null) {
+        // Multi-host: on the computer asked for (a heading's New chat, the sheet's computer row), else the one whose
+        // chat was opened last; that computer's own folders and agents, its new chat opened there
+        val computers = otherComputers()
+        val looks = if (computers.isEmpty()) emptyMap() else HostLists.cached(this)
+        val now = System.currentTimeMillis()
+        val offline = computers.filter { HostLists.status(looks[it.hostId], now).first == HostLists.Dot.OFFLINE }.map { it.hostId }.toSet()
+        val key = HostLists.newChatOn(on, prefs().getString(NEW_CHAT_ON, null), computers.map { it.hostId }, offline, LAPTOP)
+        val host = computers.firstOrNull { it.hostId == key }
+        val who = host?.label ?: "the laptop"
+        // Another computer's requests go to its own address only, never the laptop's in its place
+        val origin = if (host != null) HostPush.origin(host.baseUrl)?.trimEnd('/') ?: run {
+            android.widget.Toast.makeText(this, "${host.label}'s address can't be used: pair it again in Settings › Computers.",
+                android.widget.Toast.LENGTH_LONG).show()
+            return
+        } else Files.origin(this) ?: return say("", "Set the laptop's address in Settings first.", note = true).let {}
+        askAt(origin, who, "/crew/folders", null) { answer ->
             val folders = answer.optJSONArray("folders")
             val agents = answer.optJSONArray("agents")
+            if ((folders == null || agents == null) && on == null && host != null) {
+                return@askAt newChat(LAPTOP)  // the remembered computer didn't answer: the laptop, whose sheet can switch
+            }
             if (folders == null || agents == null || agents.length() == 0) {
-                android.widget.Toast.makeText(this, answer.optString("note").ifEmpty { "No agent to start on the laptop (it needs tmux)." },
+                android.widget.Toast.makeText(this, answer.optString("note").ifEmpty { "No agent to start on $who (it needs tmux)." },
                     android.widget.Toast.LENGTH_LONG).show()
-                return@ask
+                return@askAt
             }
             panel = NewChatSheet(this, (0 until folders.length()).map { folders.getJSONObject(it) },
                 (0 until agents.length()).map { agents.getString(it) },
-                loadModels = { agent, then -> ask("/crew/models?agent=$agent", null) { answer -> then(answer) } },
-                cursorChats = { cursorChats() }
-            ) { folder, agent, model, params, typed, done ->
-                ask("/crew/new", JSONObject().put("folder", folder).put("agent", agent).put("model", model)
-                    .put("params", JSONObject(params as Map<*, *>)).put("typed", typed)) { started ->
-                    val session = started.optString("session")
-                    if (session.isEmpty()) return@ask done(started.optString("note").ifEmpty { "It didn't start." })
-                    done(null)
-                    takeCrew(started)
-                    open(session)
-                }
-            }.also { it.show() }
+                loadModels = { agent, then -> askAt(origin, who, "/crew/models?agent=$agent", null) { answer -> then(answer) } },
+                cursorChats = if (host == null) { { cursorChats() } } else null,  // the laptop's Cursor IDE chats only
+                start = { folder, agent, model, params, typed, trust, done ->
+                    askAt(origin, who, "/crew/new", JSONObject().put("folder", folder).put("agent", agent).put("model", model)
+                        .put("params", JSONObject(params as Map<*, *>)).put("typed", typed).put("trust", trust)) { started ->
+                        val session = started.optString("session")
+                        if (session.isEmpty()) return@askAt done(started.optString("note").ifEmpty { "It didn't start." })
+                        done(null)
+                        prefs().edit().putString(NEW_CHAT_ON, key).apply()
+                        if (host == null) {
+                            takeCrew(started)
+                            open(session)
+                        } else {
+                            HostLists.refresh(this, host)
+                            if (ChatKey.validSession(session)) startActivity(HostChatActivity.open(this, ChatKey(host.hostId, session)))
+                        }
+                    }
+                },
+                computers = if (computers.isEmpty()) emptyList()
+                    else listOf(LAPTOP to (HostPush.laptopLabel(this) ?: "This laptop")) + computers.map { it.hostId to it.label },
+                computer = key,
+                offline = offline,
+                pickComputer = { picked -> newChat(picked) }
+            ).also { it.show() }
         }
     }
 
@@ -4546,6 +4585,8 @@ class MainActivity : Activity() {
     }
 
     companion object {
+        private const val LAPTOP = "laptop"  // the laptop's key among computers (its heading's fold, New chat's pick)
+        private const val NEW_CHAT_ON = "new_chat_on"  // the computer whose chat was opened last: New chat starts there
         const val HOLD_MS = 300L  // longer than this is a hold; shorter is a tap
         const val ANSWER = "io.github.ninjatuna007.henchline.ANSWER"  // from IncomingActivity's Answer
         const val ANSWER_KEY = "answer_key"  // the ring's own key, with ANSWER (Ringing.mayAnswerLaptop)

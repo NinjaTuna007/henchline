@@ -88,9 +88,8 @@ object HostLists {
     fun groups(chats: List<ChatSummary>, sort: String, pinned: Set<String>, query: String):
             List<Pair<String, List<Pair<ChatSummary, Boolean>>>> {
         val q = query.trim().lowercase()
-        // Outside a search, Pinned draws the pinned ones, each with its helpers under it
-        fun inPinned(c: ChatSummary) = c.sessionId in pinned || (c.boss.isNotEmpty() && c.boss != c.sessionId && c.boss in pinned)
-        val shown = chats.filter { (q.isNotEmpty() || !inPinned(it)) && Strays.listed(it.state, false, q.isNotEmpty()) }
+        val all = chats.map { it.sessionId }.toSet()
+        val shown = chats.filter { (q.isNotEmpty() || !inPinned(it, pinned, all)) && Strays.listed(it.state, false, q.isNotEmpty()) }
             .sortedByDescending { it.lastAt }
         if (q.isNotEmpty()) {
             val hits = shown.filter { c ->
@@ -113,6 +112,11 @@ object HostLists {
         }.filter { it.second.isNotEmpty() }
     }
 
+    /** Drawn in Pinned (outside a search): a pinned chat, or a helper whose pinned boss is still in that computer's
+     *  list (sessions); a helper whose pinned boss is gone keeps its own place. */
+    fun inPinned(c: ChatSummary, pinned: Set<String>, sessions: Set<String>) = c.sessionId in pinned ||
+        (c.boss.isNotEmpty() && c.boss != c.sessionId && c.boss in pinned && c.boss in sessions)
+
     /** The Pinned block's rows: every pinned chat, the laptop's and the other computers', newest first, each followed
      *  by its helpers (not pinned themselves) nested under it, as the laptop's own Pinned group always did. */
     fun <T> pinnedRows(pinned: List<T>, at: (T) -> Long, helpers: (T) -> List<T>): List<Pair<T, Boolean>> =
@@ -121,6 +125,15 @@ object HostLists {
     /** What "seen" records for a chat open now: never earlier than its newest line, so a computer whose clock runs
      *  ahead of this phone's can't keep it unread. */
     fun seenStamp(now: Long, newest: Long) = maxOf(now, newest)
+
+    /** The computer a New chat starts on: the one asked for (a heading's, the sheet's row) when it is still paired;
+     *  else the one whose chat was opened last, unless it is no longer paired or can't be reached now; else the
+     *  laptop. */
+    fun newChatOn(asked: String?, remembered: String?, computers: List<String>, offline: Set<String>, laptop: String): String = when {
+        asked != null -> asked.takeIf { it in computers } ?: laptop
+        remembered != null && remembered in computers && remembered !in offline -> remembered
+        else -> laptop
+    }
 
     /** Unread: the agent spoke last, after the chat was last open here. */
     fun unread(c: ChatSummary, seenAt: Long): Boolean = !c.lastMine && c.lastText.isNotEmpty() && c.lastAt > seenAt

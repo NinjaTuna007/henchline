@@ -72,6 +72,15 @@ class HostListsTest {
         assertTrue(HostLists.groups(chats, "recent", emptySet(), "site")[0].second.none { it.second })  // flat: no nesting
     }
 
+    @Test fun aHelperWhosePinnedBossIsGoneKeepsItsOwnPlace() {
+        val helper = chat("codex-3", "Codex, in site", at = 200, boss = "claude-1")
+        // Its boss is pinned but no longer in that computer's list: nothing in Pinned would draw it
+        assertEquals(listOf("codex-3" to false), HostLists.groups(listOf(helper), "recent", setOf("claude-1"), "")[0].second
+            .map { it.first.sessionId to it.second })
+        assertFalse(HostLists.inPinned(helper, setOf("claude-1"), setOf("codex-3")))
+        assertTrue(HostLists.inPinned(helper, setOf("claude-1"), setOf("codex-3", "claude-1")))
+    }
+
     @Test fun aHelperOfAPinnedBossIsDrawnUnderItInPinned() {
         // The review's case: helper H of pinned laptop boss B (H not pinned) must not vanish
         data class P(val name: String, val at: Long, val helpers: List<P> = emptyList())
@@ -97,6 +106,18 @@ class HostListsTest {
         assertEquals(500L, HostLists.seenStamp(now = 100L, newest = 500L))  // that computer's clock runs ahead
         assertEquals(800L, HostLists.seenStamp(now = 800L, newest = 500L))
         assertFalse(HostLists.unread(chat("c", at = 500, text = "done"), seenAt = HostLists.seenStamp(100L, 500L)))
+    }
+
+    @Test fun newChatStartsWhereAskedElseOnTheLastComputerOnlyIfItCanBeReached() {
+        val ids = listOf("desk", "studio")
+        assertEquals("studio", HostLists.newChatOn("studio", "desk", ids, emptySet(), "laptop"))   // asked
+        assertEquals("laptop", HostLists.newChatOn("laptop", "desk", ids, emptySet(), "laptop"))
+        assertEquals("laptop", HostLists.newChatOn("gone", "desk", ids, emptySet(), "laptop"))     // asked, no longer paired
+        assertEquals("desk", HostLists.newChatOn(null, "desk", ids, emptySet(), "laptop"))         // the last one
+        assertEquals("laptop", HostLists.newChatOn(null, "desk", ids, setOf("desk"), "laptop"))    // offline: not stuck there
+        assertEquals("laptop", HostLists.newChatOn(null, "gone", ids, emptySet(), "laptop"))
+        assertEquals("laptop", HostLists.newChatOn(null, null, ids, emptySet(), "laptop"))
+        assertEquals("laptop", HostLists.newChatOn(null, "desk", emptyList(), emptySet(), "laptop"))  // multi-host off
     }
 
     @Test fun rowsAreNamedAsTheLaptopsAre() {
