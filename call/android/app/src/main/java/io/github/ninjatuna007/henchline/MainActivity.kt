@@ -806,7 +806,8 @@ class MainActivity : Activity() {
                 Strays.listed(others[s]?.optString("state") ?: "", s in ended, query.isNotEmpty()) &&
                 (Chats.last(this, s)?.optLong("at") ?: 0) > System.currentTimeMillis() - 3 * 86_400_000L }.map { session ->
             // A timer's or a script's texts have their own group: no agent is behind them to put on the crew list
-            if (isReminders(session)) Chat(session, "Reminders", "reminders", Chats.last(this, session), "")
+            // named by its sender (the user's pick, 2026-11-22): "Reminders" for the laptop's own notices
+            if (isReminders(session)) Chat(session, "Reminders", HostChatRules.remindersFrom(session), Chats.last(this, session), "")
             else Strays.describe(session, others[session]).let { Chat(session, it.agent, it.project, Chats.last(this, session), "", it.state) }
         }
         // One that texted since the crew was last asked: likely an agent just started from a new chat, under its own

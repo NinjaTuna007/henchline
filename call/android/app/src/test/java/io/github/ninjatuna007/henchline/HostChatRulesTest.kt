@@ -7,10 +7,12 @@ import org.junit.Test
 
 /** A computer's chats named as the laptop's are, and its Reminders read-only. */
 class HostChatRulesTest {
-    @Test fun aScriptsOrTheComputersOwnTextsReadAsReminders() {
+    @Test fun aComputersOwnNoticesReadAsRemindersAndAScriptsByItsName() {
         assertEquals("Reminders · Desk", HostChatRules.title("reminders-reminders", "Desk"))  // its own notices
-        assertEquals("Reminders · Desk", HostChatRules.title("reminders-desk", "Desk"))       // handsfree text --from Desk
-        assertEquals("Reminders", HostChatRules.name("reminders-backup", "reminders-backup"))
+        assertEquals("Aquabase · Desk", HostChatRules.title("reminders-aquabase", "Desk"))    // handsfree text --from Aquabase
+        assertEquals("Backup job", HostChatRules.name("reminders-backup_job", "reminders-backup_job"))
+        assertEquals("Reminders", HostChatRules.remindersFrom("reminders-"))
+        assertEquals("Nightly.sh", HostChatRules.remindersFrom("reminders-nightly.sh"))
     }
 
     @Test fun otherChatsKeepTheirNameOrKey() {

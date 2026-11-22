@@ -31,8 +31,17 @@ object HostChatRules {
     /** A timer's or a script's texts (handsfree text --from, or the computer's own notices): "reminders-<name>". */
     fun isReminders(sessionId: String) = sessionId.startsWith("reminders-")
 
-    /** As the laptop's chat list names it: "Reminders" for those, else the name the computer gives, else its key. */
-    fun name(sessionId: String, given: String = "") = if (isReminders(sessionId)) "Reminders" else given.ifEmpty { sessionId }
+    /** Who a Reminders chat is from: "Reminders" for the computer's own notices (reminders-reminders: a timer, the
+     *  server, a text with no name), else the sender's name as handsfree text --from gave it (slugged lowercase there:
+     *  "reminders-backup_job" is "Backup job"). */
+    fun remindersFrom(sessionId: String): String {
+        val from = sessionId.removePrefix("reminders-").replace('_', ' ').trim()
+        return if (from.isEmpty() || from == "reminders") "Reminders" else from.replaceFirstChar { it.uppercase() }
+    }
+
+    /** As the laptop's chat list names it: a Reminders chat by its sender, else the name the computer gives, else
+     *  its key. */
+    fun name(sessionId: String, given: String = "") = if (isReminders(sessionId)) remindersFrom(sessionId) else given.ifEmpty { sessionId }
 
     fun title(sessionId: String?, label: String) = if (sessionId == null) label else "${name(sessionId)} · $label"
 

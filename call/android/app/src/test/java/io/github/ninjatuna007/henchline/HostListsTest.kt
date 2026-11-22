@@ -121,7 +121,12 @@ class HostListsTest {
     }
 
     @Test fun rowsAreNamedAsTheLaptopsAre() {
-        assertEquals("Reminders" to "reminders", HostLists.named(chat("reminders-desk", "Reminders", agent = "reminders")))
+        assertEquals("Reminders" to "Desk", HostLists.named(chat("reminders-desk", "Reminders", agent = "reminders")))  // by sender
+        assertEquals("Reminders" to "Reminders", HostLists.named(chat("reminders-reminders", "Reminders", agent = "reminders")))
+        // Two of them on one computer: two rows told apart by who sent them, both "Reminders" in the agent line
+        assertEquals(listOf("Aquabase", "Reminders"), HostLists.groups(listOf(chat("reminders-reminders", "Reminders", at = 1, agent = "reminders"),
+            chat("reminders-aquabase", "Reminders", at = 2, agent = "reminders")), "recent", emptySet(), "")[0].second
+            .map { HostLists.named(it.first).second })
         assertEquals("Claude" to "site", HostLists.named(chat("claude-1", "Claude, in site")))
         assertEquals("Codex" to "codex-gone", HostLists.named(chat("codex-gone", "Codex", agent = "codex")))  // a fallback name
     }

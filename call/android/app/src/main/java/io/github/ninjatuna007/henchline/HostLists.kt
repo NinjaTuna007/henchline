@@ -73,7 +73,8 @@ object HostLists {
 
     /** A chat's name parts on its row: the agent (as the laptop's rows name it) and its project. */
     fun named(c: ChatSummary): Pair<String, String> {
-        if (c.agent == "reminders" || HostChatRules.isReminders(c.sessionId)) return "Reminders" to "reminders"
+        // A Reminders chat by its sender (bold), "Reminders" under it, as the laptop's rows
+        if (HostChatRules.isReminders(c.sessionId)) return "Reminders" to HostChatRules.remindersFrom(c.sessionId)
         val agent = c.name.substringBefore(",").trim().ifEmpty { IncomingActivity.nameOf(c.agent) }
         val project = if (", " in c.name) Strays.projectOf(c.name) else c.sessionId.take(32)
         return agent to project
