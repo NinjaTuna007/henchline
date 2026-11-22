@@ -22,6 +22,10 @@ import org.json.JSONObject
  *
  * The push address reaches each paired computer that takes signed requests on its own routes (legacy_routes) the
  * way it reaches the laptop: POST /ring-endpoint, signed by LegacySigner.
+ *
+ * A push's host_id is not authenticated, and whatever answers at the laptop's address can serve another computer's
+ * public descriptor: either can only make a push go the old way (as the laptop's), never grant anything, since
+ * nothing here acts on a push beyond showing it and opening that computer's chat.
  */
 object HostPush {
     /** An address as an origin to compare: https://host[:port]/ with the host lowercased and the default port
@@ -45,10 +49,29 @@ object HostPush {
         return host.takeIf { origin(it.baseUrl).let { o -> o != null && o != laptop } }
     }
 
-    /** sender, reading the paired computers itself: null (the old way) when they can't be read. */
-    fun senderOrNull(push: JSONObject, registry: HostRegistry, laptopOrigin: String?, laptopId: String?): Host? = try {
-        sender(push, registry.all(), laptopOrigin, laptopId)
-    } catch (e: Exception) { null }
+    /** The paired computers, or null when they can't be read (every push then goes the old way). */
+    fun hostsOrNull(registry: HostRegistry): List<Host>? = try { registry.all() } catch (e: Exception) { null }
+
+    /** Whether the laptop's id should be learned again: not known; it names no paired computer any more (re-paired,
+     *  or its host.json replaced); or a ring names a paired computer at the laptop's own address that isn't the id
+     *  held (the laptop's id changed at the same address). */
+    fun shouldRelearn(push: JSONObject, hosts: List<Host>, laptopOrigin: String?, laptopId: String?): Boolean {
+        val laptop = origin(laptopOrigin) ?: return false
+        if (laptopId == null || hosts.none { it.hostId == laptopId }) return true
+        val id = push.optString("host_id").lowercase()
+        val isRing = !(push.has("text") || push.has("file"))
+        return isRing && id.isNotEmpty() && id != laptopId && hosts.any { it.hostId == id && origin(it.baseUrl) == laptop }
+    }
+
+    private val learning = java.util.concurrent.atomic.AtomicBoolean()
+
+    /** One look at a time, off the main thread. */
+    private fun relearn(context: Context) {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU || !learning.compareAndSet(false, true)) return
+        Thread {
+            try { learnLaptopId(context) } catch (_: Exception) {} finally { learning.set(false) }
+        }.start()
+    }
 
     /** The computers (not the laptop, by id or address) that should have this phone's push address: none while the
      *  laptop's address isn't known, since their pushes would then be taken for the laptop's. */
@@ -108,10 +131,10 @@ object HostPush {
 
     private fun handleOrThrow(context: Context, push: JSONObject): Boolean {
         if (!MultiHost.enabled(context)) return false
+        val hosts = hostsOrNull(HostRegistry.of(context)) ?: return false
         val laptopId = knownLaptopId(context)
-        if (laptopId == null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU)
-            Thread { try { learnLaptopId(context) } catch (_: Exception) {} }.start()  // for the next push
-        val host = senderOrNull(push, HostRegistry.of(context), laptop(context), laptopId) ?: return false
+        if (shouldRelearn(push, hosts, laptop(context), laptopId)) relearn(context)  // for the next push
+        val host = sender(push, hosts, laptop(context), laptopId) ?: return false
         val agent = IncomingActivity.nameOf(push.optString("agent", "handsfree"))
         val session = push.optString("session")
         when {

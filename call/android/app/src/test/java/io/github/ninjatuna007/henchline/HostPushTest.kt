@@ -2,6 +2,8 @@ package io.github.ninjatuna007.henchline
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -68,9 +70,22 @@ class HostPushTest {
 
     @Test fun anUnreadableHostsFileSendsEveryPushTheOldWay() {
         val file = java.io.File.createTempFile("hosts", ".json").apply { writeText("{broken") }
-        assertNull(HostPush.senderOrNull(text(otherId), HostRegistry(file), laptopOrigin, laptopId))
+        assertNull(HostPush.hostsOrNull(HostRegistry(file)))
         file.writeText("[" + other.toJson() + "]")
-        assertEquals(otherId, HostPush.senderOrNull(text(otherId), HostRegistry(file), laptopOrigin, laptopId)?.hostId)
+        assertEquals(listOf(otherId), HostPush.hostsOrNull(HostRegistry(file))!!.map { it.hostId })
+    }
+
+    @Test fun aStaleLaptopIdIsLearnedAgain() {
+        val newId = "00000000-0000-4000-8000-00000000000d"
+        val repaired = listOf(host(newId, "https://laptop.example.ts.net/"), other)  // the laptop's id changed, same address
+        assertTrue(HostPush.shouldRelearn(ring(newId), repaired, laptopOrigin, laptopId))   // a ring from it says so
+        assertTrue(HostPush.shouldRelearn(text(otherId), repaired, laptopOrigin, laptopId)) // the id held names no one now
+        assertTrue(HostPush.shouldRelearn(text(otherId), hosts, laptopOrigin, null))        // not known yet
+        assertFalse(HostPush.shouldRelearn(ring(otherId), hosts, laptopOrigin, laptopId))   // another computer: fine
+        assertFalse(HostPush.shouldRelearn(ring(laptopId), hosts, laptopOrigin, laptopId))  // the laptop as known
+        assertFalse(HostPush.shouldRelearn(text(newId), listOf(laptop, host(newId, "https://laptop.example.ts.net/")),
+            laptopOrigin, laptopId))  // only a ring triggers the address rule
+        assertFalse(HostPush.shouldRelearn(ring(newId), repaired, null, laptopId))          // no laptop address: nothing to ask
     }
 
     @Test fun everythingElseGoesWhereItAlwaysWent() {
