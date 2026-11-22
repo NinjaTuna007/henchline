@@ -190,11 +190,15 @@ open class BottomPanel(protected val activity: Activity) {
         val r = root ?: return
         val s = sheet
         root = null; sheet = null
+        try { onClosed() } catch (_: Throwable) {}
         val done = { (r.parent as? ViewGroup)?.removeView(r) }
         if (!animate || s == null) return done().let {}
         r.animate().alpha(0f).setDuration(200).start()
         s.animate().translationY(s.height.toFloat()).setDuration(200).withEndAction { done() }.start()
     }
+
+    /** The sheet was closed, however (Close, a drag, a tap outside, back): what it listened to is let go. */
+    protected open fun onClosed() {}
 
     /** A row with an icon, a title and a line under it, as the chat's and a message's long-press sheets show. */
     protected fun actionRow(icon: String, title: String, detail: String, colourId: Int, then: () -> Unit) = LinearLayout(activity).apply {
@@ -1507,30 +1511,133 @@ class YouSheet(
     }
 }
 
-/** How the agents sound (the user's wish, 2026-11-17): each its own, one voice, or a surprise that stays. */
+/** How the agents sound (the user's wish, 2026-11-17): where the voices come from (the laptop's, or Jenny made on
+ *  this phone), and on the laptop each its own, one voice, or a surprise that stays. */
 class VoicesSheet(
     activity: Activity,
     private var setup: JSONObject,
     private val save: (JSONObject, (JSONObject) -> Unit) -> Unit,
     private val preview: (String) -> Unit,
-) : BottomPanel(activity) {
+    private val changed: () -> Unit = {},  // Settings' "Agents' voices" value says what the sheet now stands at
+) : VoicePanel(activity) {
     private val agents = listOf("claude" to "Claude", "cursor" to "Cursor", "codex" to "Codex")
+    private var body: LinearLayout? = null
+    private var offerDownload = false  // Phone tapped before Jenny is here: her download card shows
+    private var previewing = false  // Jenny's preview is loading or playing: its ▶ is cyan
+    private val onVoice: () -> Unit = {
+        activity.runOnUiThread { body?.let { if (isOpen) draw(it) } }
+    }
 
     fun show() {
         val sheet = open("Voices", "How the agents sound")
         val body = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+        this.body = body
+        CallService.Bus.voiceListener = onVoice
+        followDownload { draw(body) }
         draw(body)
         sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(body) }, flexible(8))
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
     }
 
+    override fun onClosed() {
+        super.onClosed()
+        if (CallService.Bus.voiceListener === onVoice) CallService.Bus.voiceListener = null
+    }
+
     private var picking: String? = null  // the agent whose voice list is open
     private var playing: String? = null  // the voice being previewed, cyan for a few seconds
+
+    /** "COMES FROM": Laptop | Phone, built as the mode track; the line under it says what the choice means now. */
+    private fun drawSource(body: LinearLayout): VoiceSource.State {
+        val service = CallService.Bus.service
+        val ready = PhoneVoice.ready(activity)
+        val state = VoiceSource.state(PhoneVoice.enabled(activity), ready, service != null, service?.otherHost == true,
+            service?.voiceFellBehind == true, service?.voicePreparing == true)
+        if (ready || !state.phoneUsable) offerDownload = false
+        body.addView(label("COMES FROM"))
+        val track = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = rounded(colour(R.color.navy), 20f); setPadding(px(3), px(3), px(3), px(3))
+        }
+        for ((phone, words) in listOf(false to "Laptop", true to "Phone")) {
+            val on = phone == state.phone
+            track.addView(TextView(activity).apply {
+                text = words; gravity = Gravity.CENTER; textSize = 13f
+                setTextColor(colour(if (on) R.color.text else R.color.muted))
+                if (on) {
+                    background = rounded(colour(R.color.surface_high), 17f)
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                }
+                if (phone && !state.phoneUsable) { isEnabled = false; contentDescription = "Phone (not on this call)" }
+                else setOnClickListener { pick(body, phone, state, ready, this) }
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+        }
+        body.addView(track, wide(4, px(40)))
+        body.addView(TextView(activity).apply {
+            text = state.line; textSize = 13f
+            setTextColor(colour(if (state.waiting) R.color.wait else R.color.muted))
+        }, wide(8))
+        if (offerDownload || (JennyDownload.job != null && !ready)) body.addView(downloadCard(thenUse = true), wide(12))
+        return state
+    }
+
+    /** A tap on Laptop or Phone: the thumb moves at once (with the Away switch's confirming buzz), and a call that's
+     *  up changes voice from its next clip. Phone before Jenny is here offers her download instead. */
+    private fun pick(body: LinearLayout, phone: Boolean, state: VoiceSource.State, ready: Boolean, tapped: android.view.View) {
+        if (phone && !ready) { offerDownload = true; draw(body); return }
+        if (phone == state.phone && !(phone && state.waiting)) return  // already there (Phone again retries a fallback)
+        tapped.performHapticFeedback(android.view.HapticFeedbackConstants.CONFIRM)
+        offerDownload = false
+        val service = CallService.Bus.service
+        if (service != null && !service.otherHost) service.useVoice(phone) else PhoneVoice.setEnabled(activity, phone)
+        draw(body)
+    }
+
+    /** Phone chosen: Jenny's one row (with a preview made on this phone), in place of the laptop's voices. */
+    private fun drawJenny(body: LinearLayout) {
+        body.addView(LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = px(64)
+            addView(TextView(activity).apply {
+                text = "J"; gravity = Gravity.CENTER; textSize = 17f; setTextColor(colour(R.color.text))
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(colour(R.color.surface_high)) }
+            }, LinearLayout.LayoutParams(px(40), px(40)))
+            addView(LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(activity).apply { text = "Jenny"; setTextColor(colour(R.color.text)); textSize = 15f })
+                addView(TextView(activity).apply { text = "British English · every agent"; setTextColor(colour(R.color.muted)); textSize = 13f })
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = px(12) })
+            addView(TextView(activity).apply {
+                text = "▶"; textSize = 18f; gravity = Gravity.CENTER
+                setTextColor(colour(if (previewing) R.color.cyan else R.color.text))
+                background = ripple(); contentDescription = "Play Jenny's voice"
+                setOnClickListener {
+                    if (previewing) return@setOnClickListener
+                    previewing = true; draw(body)
+                    previewJenny { _ ->
+                        // about the line's length after it starts playing
+                        body.postDelayed({ previewing = false; if (isOpen) draw(body) }, 3000)
+                    }
+                }
+            }, LinearLayout.LayoutParams(px(48), px(48)))
+        }, wide(16))
+        body.addView(TextView(activity).apply {
+            text = "Your laptop voices are kept for when you switch back."
+            textSize = 12f; setTextColor(colour(R.color.muted))
+        }, wide(4))
+        body.addView(quiet("Manage download") { PhoneVoiceSheet(activity) { activity.runOnUiThread { if (isOpen) draw(body) } }.show() },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                gravity = Gravity.START; topMargin = px(4) })
+    }
 
     private fun draw(body: LinearLayout) {
         body.removeAllViews()
         val mode = setup.optString("mode", "own")
+        PhoneVoice.setLaptopMode(activity, mode)
+        changed()
+        if (drawSource(body).phone) { drawJenny(body); return }
         // On the sheet's surface the track needs the darker navy to show (the Chat|Plan switch sits on navy)
         val track = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1549,7 +1656,7 @@ class VoicesSheet(
                 }
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
         }
-        body.addView(track, wide(4, px(40)))
+        body.addView(track, wide(16, px(40)))
         body.addView(TextView(activity).apply {
             text = when (mode) {
                 "one" -> "One voice for every agent: tap an agent to pick it"

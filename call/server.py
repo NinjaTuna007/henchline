@@ -402,13 +402,40 @@ async def ring_endpoint(request: web.Request) -> web.Response:
     return web.json_response({"ok": keep_ring_endpoint(address)})
 
 
+def confirm_switch(message: dict) -> str:
+    """The user switched the call's voice: a few words in the new one (the phone's, through its phonemes, or the
+    current agent's Kokoro voice), unless the user is talking or a reply is waiting, which says it soon enough.
+    What was queued, or "" (logged either way). Never raises: the call goes on without it."""
+    try:
+        words = phonevoice.confirmation(message)
+        if not words:
+            return ""
+        if phase_now()[0] is not Phase.IDLE or spool.queued() or spool.any_held():
+            log(HANDSFREE_LOG, "call: voice switch not confirmed aloud (the user is talking or a reply is queued)")
+            return ""
+        voice = ""
+        if not phonevoice.phone_renders():  # the laptop says it, as the agent the user last heard
+            last = last_speaker()
+            voice = voices.for_agent(last.agent) if last and last.agent != BY_HANDSFREE else ""
+        routing.say(words, voice=voice)
+        return words
+    except Exception as exc:  # noqa: BLE001
+        log(HANDSFREE_LOG, f"call: voice switch confirmation failed ({exc})")
+        return ""
+
+
 async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None) -> str:
     """The talk button held or let go, a switch, or a typed chat message; a note for the page, if any."""
     if "tts" in message:  # the phone can speak talkback itself, or can't keep up any more (voice/phonevoice.py)
         await asyncio.get_running_loop().run_in_executor(None, phonevoice.offer, message)
         TTS_CHANGED.set()  # the speaker loop's cached "the phone renders" is stale now (a fallback's first second)
+        switched = phonevoice.chosen(message)  # the user moved the voice mid-call (None: an offer or a fallback)
+        reason = message.get("reason") or (phonevoice.CHOSE_LAPTOP if switched is False else "")
         log(HANDSFREE_LOG, f"call: the phone {'renders talkback' if phonevoice.phone_renders() else 'leaves talkback to the laptop'}"
-                           f"{' (' + str(message.get('reason'))[:120] + ')' if message.get('reason') else ''}")
+                           f"{' (the user chose the phone)' if switched else ''}"
+                           f"{' (' + str(reason)[:120] + ')' if reason else ''}")
+        if switched is not None:
+            await asyncio.get_running_loop().run_in_executor(None, confirm_switch, message)
         return ""
     if "said" in message:  # the phone started a piece of a clip it speaks
         await asyncio.get_running_loop().run_in_executor(None, phonevoice.said, message)

@@ -37,6 +37,54 @@ class Offer(unittest.TestCase):
         self.assertEqual(phonevoice.outgoing(), [])
 
 
+class Chosen(unittest.TestCase):
+    """The user switches the call's voice mid-call (the Voices sheet): to the phone, or back to the laptop."""
+
+    OFFER = {"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION, "rtf": 0.2}}
+
+    def tearDown(self):
+        phonevoice.call_over()
+
+    def test_choosing_the_laptop_keeps_the_offer_as_a_fallback_of_its_own(self):
+        phonevoice.offer(self.OFFER)
+        phonevoice.offer({"tts": "laptop"})
+        self.assertFalse(phonevoice.phone_renders())
+        state = phonevoice.read_json(phonevoice.CALL_TTS)
+        self.assertEqual(state["fallback"], phonevoice.CHOSE_LAPTOP)
+        self.assertEqual(state["rtf"], 0.2)  # its speed stays for a switch back
+        phonevoice.offer({**self.OFFER, "chosen": True})
+        self.assertTrue(phonevoice.phone_renders())
+
+    def test_choosing_the_laptop_with_no_offer_changes_nothing(self):
+        phonevoice.offer({"tts": "laptop"})
+        self.assertFalse(phonevoice.CALL_TTS.exists())
+
+    def test_choosing_the_phone_after_it_fell_behind_tries_again(self):
+        phonevoice.offer(self.OFFER)
+        phonevoice.offer({"tts": "fallback", "reason": "fell behind by over a second, twice"})
+        phonevoice.offer({**self.OFFER, "chosen": True})
+        self.assertTrue(phonevoice.phone_renders())
+
+    def test_only_a_users_switch_is_chosen(self):
+        self.assertIsNone(phonevoice.chosen(self.OFFER))
+        self.assertIsNone(phonevoice.chosen({"tts": "fallback", "reason": "battery 9%"}))
+        self.assertIsNone(phonevoice.chosen({**self.OFFER, "chosen": "yes"}))
+        self.assertTrue(phonevoice.chosen({**self.OFFER, "chosen": True}))
+        self.assertIs(phonevoice.chosen({"tts": "laptop"}), False)
+
+    def test_confirmed_in_the_voice_chosen(self):
+        self.assertIsNone(phonevoice.confirmation(self.OFFER))  # a call's start says nothing
+        phonevoice.offer({**self.OFFER, "chosen": True})
+        self.assertEqual(phonevoice.confirmation({**self.OFFER, "chosen": True}), phonevoice.SAID_PHONE)
+        phonevoice.offer({"tts": "laptop"})
+        self.assertEqual(phonevoice.confirmation({"tts": "laptop"}), phonevoice.SAID_LAPTOP)
+
+    def test_a_switch_to_a_model_the_laptop_wont_take_says_nothing(self):
+        other = {"tts": {"engine": "sherpa-kokoro", "model": "kokoro-multi-lang-v1_0"}, "chosen": True}
+        phonevoice.offer(other)
+        self.assertIsNone(phonevoice.confirmation(other))
+
+
 class RenderSpeed(unittest.TestCase):
     """The phone's measured render speed sets how small the laptop cuts its pieces (Jenny: 0.14, 2026-11-22)."""
 

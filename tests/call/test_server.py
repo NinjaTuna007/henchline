@@ -184,6 +184,57 @@ class SilentMicTest(unittest.TestCase):
         tell.assert_called_once_with()
 
 
+class ConfirmSwitch(unittest.TestCase):
+    """A voice switch the user made mid-call is said in the new voice, unless they're talking or a reply waits."""
+
+    OFFER = {"tts": {"engine": server.phonevoice.ENGINE, "model": server.phonevoice.VERSION}, "chosen": True}
+
+    def tearDown(self):
+        server.phonevoice.call_over()
+
+    def run_it(self, message, idle=True, queued=(), held=False, last=None):
+        phase = server.Phase.IDLE if idle else server.Phase.RECORDING
+        with mock.patch.object(server, "phase_now", lambda: (phase,)), \
+             mock.patch.object(server.spool, "queued", lambda: list(queued)), \
+             mock.patch.object(server.spool, "any_held", lambda: held), \
+             mock.patch.object(server, "last_speaker", lambda: last), \
+             mock.patch.object(server, "log"), \
+             mock.patch.object(server.routing, "say") as say:
+            server.phonevoice.offer(message)
+            said = server.confirm_switch(message)
+        return said, say
+
+    def test_to_the_phone_queued_as_a_phone_clip(self):
+        said, say = self.run_it(self.OFFER)
+        self.assertEqual(said, server.phonevoice.SAID_PHONE)
+        say.assert_called_once_with(server.phonevoice.SAID_PHONE, voice="")
+
+    def test_to_the_laptop_in_the_last_agents_voice(self):
+        server.phonevoice.offer(self.OFFER)
+        last = server.Speaker("claude-x", "claude", "henchline")
+        with mock.patch.object(server.voices, "for_agent", lambda agent: f"voice-of-{agent}"):
+            said, say = self.run_it({"tts": "laptop"}, last=last)
+        self.assertEqual(said, server.phonevoice.SAID_LAPTOP)
+        say.assert_called_once_with(server.phonevoice.SAID_LAPTOP, voice="voice-of-claude")
+
+    def test_skipped_while_the_user_talks_or_a_reply_waits(self):
+        for kwargs in ({"idle": False}, {"queued": ["clip"]}, {"held": True}):
+            said, say = self.run_it(self.OFFER, **kwargs)
+            self.assertEqual(said, "")
+            say.assert_not_called()
+
+    def test_an_offer_or_fallback_says_nothing(self):
+        for message in ({"tts": self.OFFER["tts"]}, {"tts": "fallback", "reason": "battery 9%"}):
+            said, say = self.run_it(message)
+            self.assertEqual(said, "")
+            say.assert_not_called()
+
+    def test_never_raises(self):
+        with mock.patch.object(server.phonevoice, "confirmation", side_effect=OSError("disk")), \
+             mock.patch.object(server, "log"):
+            self.assertEqual(server.confirm_switch(self.OFFER), "")
+
+
 class ClosedHow(unittest.TestCase):
     def test_says_who_closed_and_why(self):
         ws = mock.Mock(close_code=1006, exception=lambda: ConnectionResetError("reset by peer"))

@@ -2763,19 +2763,16 @@ class MainActivity : Activity() {
         }
         showDefaults()
         list.addView(UsageDraw(this).label("VOICES").apply { setPadding(dp(20), dp(24), dp(20), dp(6)) })
-        list.addView(line("Agents' voices", TextView(this).apply { text = "Choose" }) { voices() })
-        list.addView(TextView(this).apply {
-            text = "Each agent its own, one voice for all, or surprise me."
-            textSize = 13f; setTextColor(getColor(R.color.muted)); setPadding(dp(20), 0, dp(20), dp(10))
-        })
         val voiceValue = TextView(this)
         fun showVoice() {
-            voiceValue.text = if (PhoneVoice.ready(this@MainActivity) && PhoneVoice.enabled(this@MainActivity)) "On" else "Off"
+            voiceValue.text = VoiceSource.summary(PhoneVoice.ready(this@MainActivity) && PhoneVoice.enabled(this@MainActivity),
+                PhoneVoice.laptopMode(this@MainActivity))
         }
         showVoice()
-        list.addView(line("Speak on the phone", voiceValue) { PhoneVoiceSheet(this) { runOnUiThread { showVoice() } }.show() })
+        voicesChanged = { runOnUiThread { showVoice() } }
+        list.addView(line("Agents' voices", voiceValue) { voices() })
         list.addView(TextView(this).apply {
-            text = "On calls, this phone makes the agents' voices itself: a weak signal cuts no words off."
+            text = "Made on the laptop, each its own or one for all, or by this phone: a weak signal cuts no words off."
             textSize = 13f; setTextColor(getColor(R.color.muted)); setPadding(dp(20), 0, dp(20), dp(10))
         })
         list.addView(UsageDraw(this).label("NEW CALLS").apply { setPadding(dp(20), dp(24), dp(20), dp(6)) })
@@ -2831,6 +2828,8 @@ class MainActivity : Activity() {
         }
     }
 
+    private var voicesChanged: () -> Unit = {}  // Settings' "Agents' voices" value, while Settings is drawn
+
     /** The voices sheet: the laptop keeps the choice, and plays a short preview. */
     private fun voices() {
         if (Files.origin(this) == null) return
@@ -2853,7 +2852,7 @@ class MainActivity : Activity() {
                         android.widget.Toast.LENGTH_LONG).show()
                     else { stopSound(); AudioCard(url, "Preview", autoplay = true, headless = true) }  // a voice sample: no card, played once loaded
                 }
-            }).also { it.show() }
+            }, changed = { voicesChanged() }).also { it.show() }
         }
     }
 

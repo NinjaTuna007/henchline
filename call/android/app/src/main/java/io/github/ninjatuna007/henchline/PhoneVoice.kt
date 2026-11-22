@@ -71,6 +71,12 @@ object PhoneVoice {
     fun setEnabled(context: Context, on: Boolean) = prefs(context).edit().putBoolean(PREF, on).apply()
     fun mobileData(context: Context) = prefs(context).getBoolean(PREF_MOBILE, false)
     fun setMobileData(context: Context, on: Boolean) = prefs(context).edit().putBoolean(PREF_MOBILE, on).apply()
+    // The laptop's voice mode as the Voices sheet last saw it ("own", "one", "surprise"): Settings names it offline
+    fun laptopMode(context: Context): String? = prefs(context).getString(PREF_LAPTOP_MODE, null)
+    fun setLaptopMode(context: Context, mode: String) {
+        if (laptopMode(context) != mode) prefs(context).edit().putString(PREF_LAPTOP_MODE, mode).apply()
+    }
+    private const val PREF_LAPTOP_MODE = "voices_mode"
     private fun prefs(context: Context) = context.getSharedPreferences("call", Context.MODE_PRIVATE)
 
     // --- the model files --------------------------------------------------------------------------------------
@@ -111,8 +117,10 @@ object PhoneVoice {
     }
 
     /** May the download start on this network: Wi-Fi (unmetered) unless the user allowed mobile data. */
-    fun networkAllows(context: Context): Boolean {
-        if (mobileData(context)) return true
+    fun networkAllows(context: Context): Boolean = mobileData(context) || unmetered(context)
+
+    /** The phone's network is Wi-Fi or another that isn't metered. */
+    fun unmetered(context: Context): Boolean {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return false
         val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
@@ -218,6 +226,7 @@ object PhoneVoice {
 
     @Volatile private var tts: com.k2fsa.sherpa.onnx.OfflineTts? = null
     private val loadLock = Any()
+    private val renderLock = Any()  // one render at a time on the engine: a call's clip and a preview take turns
 
     /** The model in memory; held for the call. */
     fun load(context: Context): Boolean = synchronized(loadLock) {
@@ -246,7 +255,20 @@ object PhoneVoice {
         }
     }
 
-    fun release() = synchronized(loadLock) { tts?.release(); tts = null; engineThreads = IntArray(0) }
+    // Lock order: loadLock, then renderLock (only here); a render never takes loadLock, so they can't deadlock. A
+    // render under way finishes before the engine is freed, and one after finds tts changed and stops (rendered())
+    fun release() = synchronized(loadLock) {
+        synchronized(renderLock) { tts?.release(); tts = null; engineThreads = IntArray(0) }
+    }
+
+    /** One render on `engine` under renderLock, with the time it took (not counting the wait for the lock); throws
+     *  if the engine was released meanwhile (never rendered on freed memory). */
+    private fun rendered(engine: com.k2fsa.sherpa.onnx.OfflineTts, text: String, ph: String?, sid: Int): Pair<FloatArray, Long> =
+        synchronized(renderLock) {
+            check(tts === engine) { "the voice model was released" }
+            val began = System.currentTimeMillis()
+            render(engine, text, ph, sid) to System.currentTimeMillis() - began
+        }
 
     /** Jenny's engine over the files in `folder`: the model, its symbols, and espeak's data (ignored by sherpa-onnx 2.0,
      *  which speaks only the phonemes it's given). */
@@ -358,11 +380,28 @@ object PhoneVoice {
         }
     }
 
-    /** What the phone tells the laptop on connecting: it can speak talkback (only when switched on and here). */
-    fun offer(context: Context): JSONObject? =
+    /** What the phone tells the laptop on connecting: it can speak talkback (only when switched on and here).
+     *  `chosen`: the user switched to the phone mid-call (the laptop then says so in this voice). */
+    fun offer(context: Context, chosen: Boolean = false): JSONObject? =
         if (enabled(context) && ready(context)) JSONObject().put("tts", JSONObject().put("engine", ENGINE).put("model", MODEL)
             .apply { if (rtf > 0f) put("rtf", rtf.toDouble()) })
+            .apply { if (chosen) put("chosen", true) }
         else null
+
+    // The Voices sheet's preview: its phonemes made once on the laptop (python -m voice.phonevoice phonemes …), as
+    // this engine speaks only phonemes
+    const val PREVIEW = "Hello, I'm Jenny, speaking from your phone."
+    private const val PREVIEW_PH = "həlˈəʊ, aɪm dʒˈɛnɪ, spˈiːkɪŋ fɹɒm jɔː fˈəʊn."
+
+    /** The preview line as 16-bit PCM at RATE, or null when the model isn't here or won't load. Loads the model
+     *  (about 2.4 s the first time); off a call the caller releases it again. Never throws. */
+    fun previewPcm(context: Context): ByteArray? = try {
+        if (!load(context)) null
+        else tts?.let { engine -> pcm(resampler.of(rendered(engine, PREVIEW, PREVIEW_PH, SPEAKER).first), 0f) }
+    } catch (e: Throwable) {
+        android.util.Log.w("Henchline", "phone voice: preview failed: $e")
+        null
+    }
 
     /** Why the phone shouldn't take a clip now, or null. */
     private fun unfit(context: Context): String? {
@@ -431,6 +470,7 @@ object PhoneVoice {
         private val send: (String) -> Unit,  // a message to the laptop
         private val played: () -> Long = { 0L },  // this phone's own chunks the speaker has taken, all told
         private val flush: () -> Unit = {},  // drop what's still queued at the speaker
+        private val fellBackNow: () -> Unit = {},  // it just fell back by itself: the Voices sheet says so
     ) {
         // Where each piece of the clip being spoken ends, in chunks enqueued all told: a piece whose end the speaker
         // has passed has been heard. Said on a fallback, so the laptop goes on from the next piece, not from the
@@ -478,6 +518,12 @@ object PhoneVoice {
         fun stopAll() { clips.clear(); if (current.isNotEmpty()) stopped.add(current) }
         fun close() { running = false; stopAll(); thread.interrupt(); boost.close() }
 
+        /** It fell back to the laptop's audio by itself this call (behind, hot, low battery). */
+        val fellBehind get() = fellBack
+
+        /** The user chose the phone again after a fallback: clips are taken again (the laptop is told by an offer). */
+        fun tryAgain() { fellBack = false }
+
         private fun fallback(id: String, reason: String) {
             fellBack = true
             clips.clear()
@@ -488,6 +534,7 @@ object PhoneVoice {
             }
             send(message.toString())
             android.util.Log.i("Henchline", "phone voice: falling back to the laptop's audio ($reason)")
+            try { fellBackNow() } catch (_: Throwable) {}
         }
 
         private fun loop() {
@@ -521,9 +568,8 @@ object PhoneVoice {
                     val ph = phonemesOf(clip, n, pieces.length())
                     log("render $id #$n start (${text.length} chars${if (ph != null) ", ${ph.length} phonemes" else ""})")
                     boost.start(text.length / SPEECH_CPS)
-                    val began = System.currentTimeMillis()
-                    val samples = resampler.of(render(engine, text, ph, sid))
-                    val took = System.currentTimeMillis() - began
+                    val (raw, took) = rendered(engine, text, ph, sid)  // a preview's turn on the engine isn't counted
+                    val samples = resampler.of(raw)
                     // Words alone (no phonemes from the laptop) give this voice nothing to say: the laptop says it
                     if (samples.isEmpty() && ph == null && text.any { it.isLetterOrDigit() }) error("no phonemes for #$n")
                     boost.done(took)

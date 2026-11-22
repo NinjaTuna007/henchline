@@ -58,6 +58,9 @@ class CallService : Service() {
         @Volatile var hostListener: ((String) -> Unit)? = null
         @Volatile var hostConnected = false
         val hostLines = HostLines()
+        // The Voices sheet while it's open: told (on any thread) when the call's voice changes (a switch made,
+        // Jenny loaded, the phone falling behind)
+        @Volatile var voiceListener: (() -> Unit)? = null
     }
 
     /** What was said on the latest call with another computer (not its agents' texts, which its chat history keeps),
@@ -187,8 +190,17 @@ class CallService : Service() {
     private val attributes get() = if (clear) MEDIA else VOICE
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null  // Wi-Fi kept out of power save for the call
-    // Talkback the phone speaks itself (PhoneVoice): only when "Speak on the phone" is on and the model is here
-    private var phoneVoice: PhoneVoice.Speaker? = null
+    // Talkback the phone speaks itself (PhoneVoice): made at the start when the phone voice is chosen and the model
+    // is here, or later when the user switches to it on the Voices sheet (useVoice)
+    @Volatile private var phoneVoice: PhoneVoice.Speaker? = null
+    private val voiceLock = Any()  // making phoneVoice mid-call and ending the call take turns
+    @Volatile var voicePreparing = false  // a switch to the phone is loading Jenny (about 2.4 s)
+        private set
+    @Volatile private var voiceFailed = false  // the last switch to the phone couldn't load Jenny
+    /** The phone voice is chosen but the laptop speaks for now: the phone fell behind (or Jenny wouldn't load). */
+    val voiceFellBehind get() = voiceFailed || phoneVoice?.fellBehind == true
+    /** This call is with another computer: its voices aren't the laptop's, so the phone's own voice can't stand in. */
+    val otherHost get() = hostId != null
     @Volatile private var lastDrop = ""  // why the line last dropped: told to the laptop once it's back
     @Volatile private var running = false
     @Volatile private var link = 0  // which connection is the call's now: a dropped one's late words are ignored
@@ -212,9 +224,18 @@ class CallService : Service() {
     // The phone voice's chunks gone from `spoken`, played or dropped, all told: PhoneVoice compares where each piece
     // ends with it, to tell the laptop on a fallback which pieces were really heard
     private val spokenTaken = java.util.concurrent.atomic.AtomicLong()
+    // A Voices sheet preview's chunks in `spoken`: played like the phone voice's, but not counted in spokenTaken,
+    // which PhoneVoice matches against its own pieces' ends. Empty unless a preview is playing
+    private val previewChunks = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<ByteArray, Boolean>())
+    @Volatile private var previewing = false  // previewChunks isn't empty: the speaker's one look before locking
 
     /** Empty `spoken`, counting what goes as taken (so the pieces' ends stay comparable). */
-    private fun clearSpoken() { val n = spoken.size; spoken.clear(); spokenTaken.addAndGet(n.toLong()) }
+    private fun clearSpoken() {
+        val n = spoken.size
+        spoken.clear()
+        val previews = synchronized(previewChunks) { previewChunks.size.also { previewChunks.clear(); previewing = false } }
+        spokenTaken.addAndGet((n - previews).coerceAtLeast(0).toLong())
+    }
     private val audio by lazy { getSystemService(AudioManager::class.java) }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -259,8 +280,7 @@ class CallService : Service() {
         } catch (e: Exception) { null }
         // The phone's own voice is the laptop's (its voices and manifest come from there): not on another computer's call
         if (hostId == null && PhoneVoice.enabled(this) && PhoneVoice.ready(this)) {
-            phoneVoice = PhoneVoice.Speaker(this, enqueue = { spoken.offer(it) }, queued = { spoken.size },
-                send = { socket?.send(it) }, played = { spokenTaken.get() }, flush = { clearSpoken() })
+            phoneVoice = newSpeaker()
             Thread { PhoneVoice.load(this) }.start()  // about 2.4 s: ready before the first reply
         }
         applySound()
@@ -368,13 +388,16 @@ class CallService : Service() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wifiLock?.let { try { if (it.isHeld) it.release() } catch (e: Exception) {} }
         wifiLock = null
-        phoneVoice?.close()
-        phoneVoice = null
+        synchronized(voiceLock) {
+            phoneVoice?.close()
+            phoneVoice = null
+        }
         PhoneVoice.release()  // the model's few hundred MB go with the call
         nearEar(false)
         up = false
         if (startedAt > 0) logCall()
         Bus.service = null
+        voiceChanged()  // an open Voices sheet shows the choice as for the next call
         Bus.host = null
         Bus.hostSession = ""
         Bus.lastAgents = null
@@ -387,6 +410,77 @@ class CallService : Service() {
 
     fun send(json: String) {
         socket?.send(json)
+    }
+
+    // --- the agents' voices: the laptop's or the phone's own (the Voices sheet's switch) ----------------------
+
+    private fun newSpeaker() = PhoneVoice.Speaker(this, enqueue = { spoken.offer(it) }, queued = { spoken.size },
+        send = { socket?.send(it) }, played = { spokenTaken.get() }, flush = { clearSpoken() },
+        fellBackNow = { voiceChanged() })
+
+    private fun voiceChanged() { try { Bus.voiceListener?.invoke() } catch (_: Throwable) {} }
+
+    /**
+     * The user switched the agents' voices mid-call. A clip already playing finishes in the voice it started in; the
+     * next one is in the new voice. To the phone: Jenny is loaded (made now if the call began without her), then the
+     * laptop is offered her again, marked chosen (it says so in her voice). To the laptop: {"tts": "laptop"}, and a
+     * clip the phone holds still plays out. Not on another computer's call. Never throws.
+     */
+    fun useVoice(phone: Boolean) {
+        if (hostId != null || !running) return
+        try {
+            PhoneVoice.setEnabled(this, phone)
+            voiceFailed = false
+            if (!phone) {
+                voicePreparing = false
+                socket?.send(org.json.JSONObject().put("tts", "laptop").toString())
+                android.util.Log.i("Henchline", "call: the user chose the laptop's voice")
+                voiceChanged()
+                return
+            }
+            voicePreparing = true
+            voiceChanged()
+            Thread {
+                try {
+                    val voice = synchronized(voiceLock) { if (running) phoneVoice ?: newSpeaker().also { phoneVoice = it } else null }
+                    if (voice != null) {
+                        voice.tryAgain()
+                        val loaded = PhoneVoice.load(this)
+                        if (!running) {
+                            if (Bus.service == null) PhoneVoice.release()  // the call ended while she loaded
+                        } else if (!loaded) {
+                            voiceFailed = true
+                            android.util.Log.w("Henchline", "call: the user chose the phone's voice, but it wouldn't load")
+                        } else if (PhoneVoice.enabled(this)) {  // not switched back meanwhile
+                            PhoneVoice.offer(this, chosen = true)?.let { socket?.send(it.toString()) }
+                            android.util.Log.i("Henchline", "call: the user chose the phone's voice")
+                        }
+                    }
+                } catch (e: Throwable) {
+                    voiceFailed = true
+                    android.util.Log.w("Henchline", "call: switching to the phone's voice failed: $e")
+                } finally {
+                    voicePreparing = false
+                    voiceChanged()
+                }
+            }.apply { name = "henchline-voice-switch"; start() }
+        } catch (e: Throwable) {
+            voicePreparing = false
+            android.util.Log.w("Henchline", "call: voice switch failed: $e")
+        }
+    }
+
+    /** The Voices sheet's preview of the phone's voice, played into the call (16-bit PCM at the call's 24 kHz). */
+    fun playPreview(pcm: ByteArray) {
+        if (!running) return
+        val chunk = PhoneVoice.RATE / 50 * 2
+        var at = 0
+        while (at < pcm.size) {
+            val piece = pcm.copyOfRange(at, minOf(at + chunk, pcm.size))
+            synchronized(previewChunks) { previewChunks.add(piece); previewing = true }
+            spoken.offer(piece)
+            at += chunk
+        }
     }
 
     // --- the mic kept alive: headsets coming and going, a silenced capture, a mic sending only zeros ----------
@@ -829,7 +923,8 @@ class CallService : Service() {
      *  the laptop's goes (its idle monitor would otherwise build up behind); the laptop's loud ones are kept. */
     private fun nextChunk(): ByteArray? {
         spoken.poll()?.let { mine ->
-            spokenTaken.incrementAndGet()
+            if (!previewing || !synchronized(previewChunks) { previewChunks.remove(mine).also { previewing = previewChunks.isNotEmpty() } })
+                spokenTaken.incrementAndGet()
             heard.peek()?.let { theirs -> if (!loud(theirs) && heard.removeFirstOccurrence(theirs)) dropped.incrementAndGet() }
             return mine
         }

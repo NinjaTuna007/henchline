@@ -7,7 +7,8 @@ rendered too slowly there (1.12-1.34 s per second of speech on the cores a locke
 2026-11-22), so every agent's talkback is Jenny's voice on the phone.
 
 The pieces travel through files, so the talkback worker and the call server stay separate processes:
-  CALL_TTS                 the phone's offer for this call: {"engine", "model", "fallback": reason or ""}
+  CALL_TTS                 the phone's offer for this call: {"engine", "model", "fallback": reason or ""}; the user
+                           switching to the laptop mid-call is a fallback too (CHOSE_LAPTOP)
   PHONE_SAY/<id>.json      a clip for the phone, written by the worker, sent by the call server: {"id", "pieces",
                            "ph" (each piece's phonemes, spoken in place of its words), "joined", "sentence_map", …}
   PHONE_SAY/<id>.sent      the server sent it
@@ -130,10 +131,22 @@ def stale(root: Path = ROOT) -> list[Path]:
 
 # --- the call: the phone's offer, and its fallback ------------------------------------------------------------
 
+CHOSE_LAPTOP = "the user chose the laptop"  # a fallback the user picked mid-call, not one the phone needed
+SAID_PHONE = "Speaking from your phone now."  # said in the new voice when the user switches mid-call
+SAID_LAPTOP = "Back on the laptop."
+
+
 def offer(message: dict) -> None:
-    """The phone said what it can render ({"tts": {"engine", "model"}}), or that it can't keep up any more
-    ({"tts": "fallback", "reason"}): from then on, this call streams the laptop's audio again."""
+    """The phone said what it can render ({"tts": {"engine", "model"}}; "chosen": true when the user switched to it
+    mid-call), that it can't keep up any more ({"tts": "fallback", "reason"}), or that the user chose the laptop's
+    voice mid-call ({"tts": "laptop"}): after either of the last two, this call streams the laptop's audio again."""
     tts = message.get("tts")
+    if tts == "laptop":  # kept as a fallback with its own reason: the phone's measured speed stays for a switch back
+        state = read_json(CALL_TTS) if CALL_TTS.exists() else {}
+        if state:
+            state["fallback"] = CHOSE_LAPTOP
+            write_json(CALL_TTS, state)
+        return
     if isinstance(tts, dict):
         if tts.get("model") == VERSION and tts.get("engine") == ENGINE:
             state = {"engine": tts["engine"], "model": tts["model"], "fallback": ""}
@@ -152,6 +165,28 @@ def offer(message: dict) -> None:
             heard = message.get("heard")
             _progress(clip, fallback=state.get("fallback") or "the phone asked",
                       heard=heard if isinstance(heard, int) and not isinstance(heard, bool) and heard >= -1 else None)
+
+
+def chosen(message: dict) -> bool | None:
+    """The user switched the voice mid-call: True to the phone, False to the laptop; None for anything else (an
+    offer at the call's start, a fallback the phone needed)."""
+    tts = message.get("tts")
+    if tts == "laptop":
+        return False
+    if isinstance(tts, dict) and message.get("chosen") is True:
+        return True
+    return None
+
+
+def confirmation(message: dict) -> str | None:
+    """The words that confirm a switch the user made, in the voice they chose: None when it wasn't a switch, or the
+    switch to the phone didn't take (another model: the laptop keeps speaking, and says nothing of it)."""
+    to_phone = chosen(message)
+    if to_phone is None:
+        return None
+    if to_phone:
+        return SAID_PHONE if phone_renders() else None
+    return SAID_LAPTOP
 
 
 def _rtf(value) -> float | None:
