@@ -163,7 +163,11 @@ class Status:
 
 
 def pactl(*args: str) -> str:
-    return subprocess.run(["pactl", *args], capture_output=True, text=True).stdout.strip()
+    """pactl's answer; empty on a computer with no sound server (a headless host serving chats and texts only)."""
+    try:
+        return subprocess.run(["pactl", *args], capture_output=True, text=True).stdout.strip()
+    except FileNotFoundError:
+        return ""
 
 
 class Devices:
