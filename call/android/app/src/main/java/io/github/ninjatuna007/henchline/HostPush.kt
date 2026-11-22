@@ -141,7 +141,8 @@ object HostPush {
         when {
             push.has("text") -> {
                 notify(context, "$agent on ${host.label}", push.optString("text"), chat(context, host, session), Messages.CHANNEL,
-                    id = "${host.hostId} $session".hashCode())  // one per chat: a newer text replaces the last
+                    id = "${host.hostId} $session".hashCode(),  // one per chat: a newer text replaces the last
+                    message = messageOf(push, host), agent = push.optString("agent", "handsfree"))
                 val tid = push.optString("id")
                 if (tid.isNotEmpty()) post(host, "text-status", JSONObject().put("ids", listOf(tid).let { org.json.JSONArray(it) })
                     .put("status", "delivered"))  // one tick for the agent there; read is reported by its chat screen
@@ -151,7 +152,8 @@ object HostPush {
                 val url = file.optString("url")
                 val open = if (url.startsWith(host.baseUrl)) Intent(Intent.ACTION_VIEW, Uri.parse(url)) else chat(context, host, session)
                 notify(context, "$agent on ${host.label} sent you ${file.optString("name", "a file")}",
-                    push.optString("why").ifEmpty { "Tap to open it." }, open, Files.CHANNEL)
+                    push.optString("why").ifEmpty { "Tap to open it." }, open, Files.CHANNEL,
+                    message = messageOf(push, host), agent = push.optString("agent", "handsfree"))
             }
             else -> {  // a ring: a real one, whose Answer calls this computer (RingService.answerIntent)
                 val reply = Reply.valid(push.optString("reply"))
@@ -207,15 +209,40 @@ object HostPush {
         (if (session.isEmpty()) HostChatActivity.openHost(context, host.hostId) else HostChatActivity.open(context, ChatKey(host.hostId, session)))
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
+    /** A text or a file from another computer, as its agent's message there: shown as the laptop's texts are
+     *  (Messages.post), so the phone ranks and filters both alike (a Do Not Disturb that lets messages through). */
+    internal data class Message(val sender: String, val text: String, val category: String = Notification.CATEGORY_MESSAGE)
+
+    /** Null for anything else (a ring's notice stays a plain notification). */
+    internal fun messageOf(push: JSONObject, host: Host): Message? {
+        val sender = "${IncomingActivity.nameOf(push.optString("agent", "handsfree"))} on ${host.label}"
+        val file = push.optJSONObject("file")
+        return when {
+            push.has("text") -> Message(sender, push.optString("text"))
+            file != null -> Message(sender, "📎 " + file.optString("name", "a file") +
+                push.optString("why").let { if (it.isEmpty()) "" else "\n$it" })
+            else -> null
+        }
+    }
+
     private fun notify(context: Context, title: String, text: String, open: Intent, channel: String,
-                       id: Int = (title + text + System.nanoTime()).hashCode()) {
+                       id: Int = (title + text + System.nanoTime()).hashCode(), message: Message? = null, agent: String = "") {
         val manager = context.getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(channel,
             if (channel == Files.CHANNEL) "Files from your crew" else "Messages from your crew", NotificationManager.IMPORTANCE_HIGH))
-        manager.notify(id, Notification.Builder(context, channel)
+        val built = Notification.Builder(context, channel)
             .setSmallIcon(R.drawable.ic_notify).setContentTitle(title).setContentText(text)
-            .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(PendingIntent.getActivity(context, id, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))
-            .setAutoCancel(true).build())
+            .setAutoCancel(true)
+        if (message == null) built.setStyle(Notification.BigTextStyle().bigText(text))
+        else {
+            val you = android.app.Person.Builder().setName("You")
+                .setIcon(android.graphics.drawable.Icon.createWithResource(context, R.drawable.avatar_you)).build()
+            val them = android.app.Person.Builder().setName(message.sender)
+                .setIcon(android.graphics.drawable.Icon.createWithResource(context, MainActivity.avatarOf(agent))).setImportant(true).build()
+            built.setCategory(message.category)
+                .setStyle(Notification.MessagingStyle(you).addMessage(message.text, System.currentTimeMillis(), them))
+        }
+        manager.notify(id, built.build())
     }
 }

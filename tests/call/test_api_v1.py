@@ -427,6 +427,16 @@ class Ledger(Base):
                          [("Tests pass.", "a" * 16, "claude"), ("Second.", "b" * 16, "claude")])
         self.assertEqual(events[0]["created_at"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(1795000010)))
 
+    async def test_a_scripts_text_is_kept_in_its_reminders_chat(self):
+        # As `handsfree text --from Desk` writes it (handsfree.sender): the chat the phone's notification opens
+        key, device = await self.enrolled()
+        self.host.texts_kept = [text("9" * 16, session="reminders-desk", agent="reminders", words="Hello from Desk.",
+                                     at=1795000010.0)]
+        self.assertEqual(api_v1.ingest(self.api), 1)
+        events = await self.events(key, device, session="reminders-desk")
+        self.assertEqual([(e["kind"], e["text"], e["agent"]) for e in events], [("agent_text", "Hello from Desk.", "reminders")])
+        self.assertEqual(await self.events(key, device, session="reminders-reminders"), [])
+
     async def test_a_late_older_text_takes_its_place(self):
         key, device = await self.enrolled()
         self.host.texts_kept = [text("b" * 16, words="Later.", at=1795000020.0)]

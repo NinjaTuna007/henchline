@@ -100,6 +100,18 @@ class HostPushTest {
         assertEquals(emptyList<Host>(), HostPush.recipients(listOf(host(otherId, "https://desk.example.ts.net/", pending = true)), laptopOrigin, laptopId))
     }
 
+    @Test fun textsAndFilesFromAnotherComputerAreMessagesLikeTheLaptops() {
+        val text = HostPush.messageOf(text(otherId), other)!!
+        assertEquals(android.app.Notification.CATEGORY_MESSAGE, text.category)
+        assertEquals("msg", text.category)  // what Messages.post sets on the laptop's texts
+        assertEquals("Claude on Host", text.sender)
+        assertEquals("hi", text.text)
+        val file = HostPush.messageOf(file(otherId).put("why", "the plot"), other)!!
+        assertEquals("msg", file.category)
+        assertEquals("📎 a file\nthe plot", file.text)
+        assertNull(HostPush.messageOf(ring(otherId), other))  // a ring's notice stays as it was
+    }
+
     /** The test vector's signed descriptor stands in for what the laptop's address serves. */
     private val served = JSONObject(SelfTest.SIGNED_DESCRIPTOR)
     private val servedId = served.getString("host_id")

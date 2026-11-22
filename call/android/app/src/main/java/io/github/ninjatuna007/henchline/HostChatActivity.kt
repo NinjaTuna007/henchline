@@ -26,6 +26,20 @@ import androidx.annotation.RequiresApi
  * Messages here go through that computer's own queue (HostOutbox) and nowhere else; the laptop's usual chat
  * screens keep their own outbox: each message has exactly one way out.
  */
+/** How a computer's chat is named and what it offers: pure, for the JVM tests. */
+object HostChatRules {
+    /** A timer's or a script's texts (handsfree text --from, or the computer's own notices): "reminders-<name>". */
+    fun isReminders(sessionId: String) = sessionId.startsWith("reminders-")
+
+    /** As the laptop's chat list names it: "Reminders" for those, else the name the computer gives, else its key. */
+    fun name(sessionId: String, given: String = "") = if (isReminders(sessionId)) "Reminders" else given.ifEmpty { sessionId }
+
+    fun title(sessionId: String?, label: String) = if (sessionId == null) label else "${name(sessionId)} · $label"
+
+    /** Reminders take no replies and no calls: nothing reads them. */
+    fun takesReplies(sessionId: String) = !isReminders(sessionId)
+}
+
 class HostChatActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -132,7 +146,7 @@ class HostChatActivity : Activity() {
                 fitsSystemWindows = true
             }
             root.addView(TextView(activity).apply {
-                text = if (sessionId == null) host.label else "$sessionId · ${host.label}"
+                text = HostChatRules.title(sessionId, host.label)
                 textSize = 20f; setTextColor(activity.getColor(R.color.text)); typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
                 setPadding(px(16), px(16), px(16), px(4)); maxLines = 2
             })
@@ -142,7 +156,8 @@ class HostChatActivity : Activity() {
             if (sessionId != null) { list.addView(events); list.addView(queue); list.addView(callLines); empty.visibility = View.GONE; list.addView(empty) }
             scroll.addView(list)
             root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-            if (sessionId != null) root.addView(composer())
+            // A timer's or a script's texts (Reminders) take no replies, as the laptop's: no Call, no message box
+            if (sessionId != null && HostChatRules.takesReplies(sessionId)) root.addView(composer())
             activity.setContentView(root)
             refresh()
         }
@@ -238,7 +253,7 @@ class HostChatActivity : Activity() {
             if (chats.isEmpty()) list.addView(note("No agents are running on ${host.label} right now."))
             chats.forEach { c ->
                 list.addView(TextView(activity).apply {
-                    text = c.name.ifEmpty { c.sessionId }; textSize = 16f; setTextColor(activity.getColor(R.color.text))
+                    text = HostChatRules.name(c.sessionId, c.name); textSize = 16f; setTextColor(activity.getColor(R.color.text))
                     setPadding(px(4), px(14), px(4), px(14))
                     setOnClickListener { activity.startActivity(open(activity, ChatKey(host.hostId, c.sessionId))) }
                 })
@@ -358,6 +373,7 @@ class HostChatActivity : Activity() {
         /** Call this chat's agent on this computer (answering: the ring answered, which the computer routes to the
          *  agent that rang): one call at a time, the laptop's included. */
         fun call(answering: String? = null, answered: Boolean = answering != null) {
+            if (sessionId != null && !HostChatRules.takesReplies(sessionId)) return  // no agent to talk to
             val session = sessionId ?: return  // a computer's chat list: nobody to call
             if (ours()) { showCall(); return }
             if (CallService.Bus.service != null) {
