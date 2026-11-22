@@ -159,9 +159,7 @@ object HostPush {
         val session = push.optString("session")
         when {
             push.has("text") -> {
-                notify(context, "$agent on ${host.label}", push.optString("text"), chat(context, host, session), Messages.CHANNEL,
-                    id = "${host.hostId} $session".hashCode(),  // one per chat: a newer text replaces the last
-                    message = messageOf(push, host), agent = push.optString("agent", "handsfree"))
+                postText(context, host, push.optString("agent", "handsfree"), session, push.optString("text"))
                 val tid = push.optString("id")
                 if (tid.isNotEmpty()) post(host, "text-status", JSONObject().put("ids", listOf(tid).let { org.json.JSONArray(it) })
                     .put("status", "delivered"))  // one tick for the agent there; read is reported by its chat screen
@@ -244,8 +242,30 @@ object HostPush {
         }
     }
 
+    const val REPLY_KEY = "host_reply"
+    const val REPLY = "io.github.ninjatuna007.henchline.HOST_REPLY"
+
+    /** Whether a text from that chat gets a Reply box: an agent's chat, not a timer's or a script's (Reminders). */
+    fun takesReply(session: String) = session.isNotEmpty() && HostChatRules.takesReplies(session) && ChatKey.validSession(session)
+
+    /** Another computer's text, as its notification (one per chat: a newer text replaces the last), with a Reply box
+     *  that goes through that computer's own queue (HostReplyReceiver); mine: the reply just typed in it, shown
+     *  under their line without a new buzz. */
+    fun postText(context: Context, host: Host, agent: String, session: String, text: String, mine: String? = null) {
+        val name = IncomingActivity.nameOf(agent)
+        val id = "${host.hostId} $session".hashCode()
+        val reply = if (!takesReply(session)) null else PendingIntent.getBroadcast(context, id,
+            Intent(context, HostReplyReceiver::class.java).setAction(REPLY).putExtra("host_id", host.hostId)
+                .putExtra("session", session).putExtra("agent", agent).putExtra("text", text),
+            PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)  // mutable: the reply text is added to it
+        notify(context, "$name on ${host.label}", mine ?: text, chat(context, host, session), Messages.CHANNEL, id = id,
+            message = Message("$name on ${host.label}", text), agent = agent, mine = mine,
+            reply = reply?.let { name to it })
+    }
+
     private fun notify(context: Context, title: String, text: String, open: Intent, channel: String,
-                       id: Int = (title + text + System.nanoTime()).hashCode(), message: Message? = null, agent: String = "") {
+                       id: Int = (title + text + System.nanoTime()).hashCode(), message: Message? = null, agent: String = "",
+                       mine: String? = null, reply: Pair<String, PendingIntent>? = null) {
         val manager = context.getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(channel,
             if (channel == Files.CHANNEL) "Files from your crew" else "Messages from your crew", NotificationManager.IMPORTANCE_HIGH))
@@ -259,9 +279,51 @@ object HostPush {
                 .setIcon(android.graphics.drawable.Icon.createWithResource(context, R.drawable.avatar_you)).build()
             val them = android.app.Person.Builder().setName(message.sender)
                 .setIcon(android.graphics.drawable.Icon.createWithResource(context, MainActivity.avatarOf(agent))).setImportant(true).build()
-            built.setCategory(message.category)
-                .setStyle(Notification.MessagingStyle(you).addMessage(message.text, System.currentTimeMillis(), them))
+            val style = Notification.MessagingStyle(you).addMessage(message.text, System.currentTimeMillis(), them)
+            if (mine != null) style.addMessage(mine, System.currentTimeMillis(), null as android.app.Person?)  // yours
+            built.setCategory(message.category).setStyle(style).setOnlyAlertOnce(mine != null)
+        }
+        reply?.let { (who, intent) ->
+            built.addAction(Notification.Action.Builder(null, "Reply", intent)
+                .addRemoteInput(android.app.RemoteInput.Builder(REPLY_KEY).setLabel("Reply to $who").build())
+                .setAllowGeneratedReplies(false).build())
         }
         manager.notify(id, built.build())
+    }
+}
+
+/** A reply typed into another computer's text notification: queued in that computer's own outbox first (it survives
+ *  no network, and goes in order behind what waits), shown under their line at once, then sent, as a message from
+ *  its chat screen is (signed v1; the chat shows its tick). Not for a computer being removed, nor for Reminders. */
+class HostReplyReceiver : android.content.BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (android.os.Build.VERSION.SDK_INT < MultiHost.MIN_SDK || intent.action != HostPush.REPLY) return
+        val words = android.app.RemoteInput.getResultsFromIntent(intent)?.getCharSequence(HostPush.REPLY_KEY)?.toString()?.trim()
+        val hostId = intent.getStringExtra("host_id") ?: return
+        val session = intent.getStringExtra("session") ?: return
+        if (words.isNullOrEmpty() || !HostPush.takesReply(session)) return
+        val app = context.applicationContext
+        val pending = goAsync()
+        Thread {
+            var host: Host? = null
+            try {
+                host = HostRegistry.of(app).get(hostId)?.takeIf { !it.revocationPending } ?: return@Thread
+                Store(app).use { HostOutbox.enqueue(it, host!!, session, words) }
+                HostLists.markSeen(app, hostId, session)  // replying means reading
+                HostPush.postText(app, host!!, intent.getStringExtra("agent") ?: "handsfree", session,
+                    intent.getStringExtra("text") ?: "", mine = words)
+            } catch (e: Exception) {
+                android.util.Log.w("Henchline", "reply to ${hostId.take(8)} not queued: ${e.javaClass.simpleName}")
+            } finally {
+                pending.finish()  // queued (or not): the rest may outlive the receiver's few seconds
+            }
+            val queued = host ?: return@Thread
+            try {
+                Store(app).use { store ->
+                    HostOutbox.flushHost(store, queued) { h -> HostChat(HostClient(h, HostKeys.forAuthority("host", h.hostId)), h.hostId) }
+                }
+            } catch (e: Exception) {}  // it waits in the queue: the chat screen sends it when opened
+            HostLists.refresh(app, queued)
+        }.start()
     }
 }

@@ -112,6 +112,15 @@ class HostPushTest {
         assertNull(HostPush.messageOf(ring(otherId), other))  // a ring's notice stays as it was
     }
 
+    @Test fun anAgentsTextGetsAReplyBoxAndATimersDoesNot() {
+        assertTrue(HostPush.takesReply("cursor-1"))
+        assertTrue(HostPush.takesReply("claude-12345678-1234-4234-8234-123456789abc"))
+        assertFalse(HostPush.takesReply("reminders-aquabase"))  // Reminders take no replies
+        assertFalse(HostPush.takesReply("reminders-reminders"))
+        assertFalse(HostPush.takesReply(""))                    // no chat to answer
+        assertFalse(HostPush.takesReply("bad\nkey"))           // not a session a chat could have
+    }
+
     /** The test vector's signed descriptor stands in for what the laptop's address serves. */
     private val served = JSONObject(SelfTest.SIGNED_DESCRIPTOR)
     private val servedId = served.getString("host_id")

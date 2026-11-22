@@ -109,6 +109,11 @@
             android:name=".Messages$ReplyReceiver"
             android:exported="false" />
 
+        <!-- A reply typed into another paired computer's text notification -->
+        <receiver
+            android:name=".HostReplyReceiver"
+            android:exported="false" />
+
         <!-- A Quick Settings tile to call or hang up: added by you, from the Quick Settings editor -->
         <service
             android:name=".CallTile"
