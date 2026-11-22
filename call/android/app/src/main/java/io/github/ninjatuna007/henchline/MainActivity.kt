@@ -518,7 +518,7 @@ class MainActivity : Activity() {
 
     /** Opened while an agent's ring still sounds: say so, with Answer and Decline. */
     private fun showRinging() {
-        val ring = Ringing.now(this) ?: return
+        val ring = Ringing.laptops(this) ?: return  // another computer's ring answers in its own chat
         if (CallService.Bus.service != null || ringingShown?.isShowing == true) return
         val reply = ring.optString("reply").ifEmpty { null }
         ringingShown = AlertDialog.Builder(this)
@@ -572,10 +572,10 @@ class MainActivity : Activity() {
 
     private fun call(given: String? = null) {
         // A call made by hand while a ring sounds answers that ring: the laptop routes it to the agent that rang
-        val reply = given ?: Ringing.now(this)?.optString("reply")?.ifEmpty { null }
-        Ringing.end(this)
+        val reply = given ?: Ringing.laptops(this)?.optString("reply")?.ifEmpty { null }
+        if (given != null || Ringing.laptops(this) != null) Ringing.end(this)  // never another computer's ring
         if (CallService.Bus.service != null) {  // already connecting: one call at a time
-            state.text = "Connecting…"
+            state.text = if (CallService.Bus.host != null) "On a call with another computer: hang up there first." else "Connecting…"
             return
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {

@@ -55,7 +55,13 @@ class RingService : PushService() {
             CallService.Bus.listener?.invoke("""{"reload": true}""")
             return
         }
-        if (CallService.Bus.service != null) return  // on a call already: the agent is heard there
+        if (CallService.Bus.service != null) {  // on a call already
+            // With another computer (multi-host): this agent isn't heard there, so it mustn't vanish: a notification
+            CallService.Bus.host?.let { Reply.send(Reply.valid(ring.optString("reply")), "rang") }  // it reached the phone
+            CallService.Bus.host?.let { Messages.show(this, ring.optString("agent", "handsfree"), ring.optString("session"),
+                "Rang while you were on a call with another computer: ${ring.optString("why").ifEmpty { "call back when you can" }}") }
+            return  // with the laptop: the agent is heard there
+        }
         val reply = Reply.valid(ring.optString("reply"))
         Reply.send(reply, "rang")  // it reached the phone
         val agent = ring.optString("agent", "handsfree")
@@ -113,13 +119,31 @@ class RingService : PushService() {
         fun phraseFor(agent: String, kind: String): Int =
             KINDS[agent.takeIf { it in IncomingActivity.FLAVOURS } ?: "handsfree"]!!.let { if (kind == "done") it.second else it.first }
 
+        /** Where Answer goes for the ring with this reply: the laptop's call (MainActivity), or, for a ring from another
+         *  paired computer (Ringing.hostOf), that computer's chat, which calls it answering this ring. */
+        fun answerIntent(context: Context, reply: String?): Intent? {
+            val ring = Ringing.now(context)
+            val host = Ringing.hostOf(ring)
+                ?: return Intent(context, MainActivity::class.java).setAction(MainActivity.ANSWER)  // the laptop's ring, or none
+                    .putExtra(IncomingActivity.REPLY, reply).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            // Another computer's ring sounds: only that ring's own Answer opens its call (a stale screen answers nothing)
+            if (ring!!.optString("reply") != (reply ?: "") || android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU) return null
+            return HostChatActivity.answer(context, ChatKey(host.hostId, host.session), reply, Ringing.answerKey(ring))
+        }
+
+        /** Who is calling, as the ring says it: the agent, and its computer when that isn't the laptop. */
+        fun callerOf(context: Context, agent: String, reply: String?): String {
+            val host = Ringing.hostOf(Ringing.now(context)?.takeIf { it.optString("reply") == (reply ?: "") })
+            return IncomingActivity.nameOf(agent) + (host?.let { " on ${it.label}" } ?: "")
+        }
+
         fun ringNow(context: Context, agent: String, why: String, reply: String? = null, banner: Boolean = false,
-                    seconds: Long = RING_SECONDS, quiet: Boolean = false, phrase: Int = 0) {
+                    seconds: Long = RING_SECONDS, quiet: Boolean = false, phrase: Int = 0, host: RingHost? = null) {
             val manager = context.getSystemService(NotificationManager::class.java)
             val flavour = agent.takeIf { it in IncomingActivity.FLAVOURS } ?: "handsfree"
             val inUse = banner || (context.getSystemService(android.os.PowerManager::class.java).isInteractive &&
                 !context.getSystemService(android.app.KeyguardManager::class.java).isKeyguardLocked)
-            if (seconds == RING_SECONDS) Ringing.started(context, agent, why, reply)
+            if (seconds == RING_SECONDS) Ringing.started(context, agent, why, reply, host)
             retire(manager)
             // quiet: the ring screen is up and rings itself; the notification stays for its buttons, silent
             val channel = if (inUse && !quiet) bannerChannel(context, manager, flavour, phrase) else CHANNEL.also {
@@ -131,14 +155,12 @@ class RingService : PushService() {
                 .putExtra(IncomingActivity.REPLY, reply).putExtra(IncomingActivity.PHRASE, phrase)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_USER_ACTION)
             val open = PendingIntent.getActivity(context, 3, screen, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-            val answer = PendingIntent.getActivity(context, 4, Intent(context, MainActivity::class.java)
-                .setAction(MainActivity.ANSWER).putExtra(IncomingActivity.REPLY, reply)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            val answer = PendingIntent.getActivity(context, 4, answerIntent(context, reply) ?: return,  // not the ring now: no notification
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             val decline = PendingIntent.getBroadcast(context, 5, Intent(context, RingActions::class.java)
                 .setAction(RingActions.DECLINE).putExtra(IncomingActivity.REPLY, reply),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-            val name = IncomingActivity.nameOf(agent)
+            val name = callerOf(context, agent, reply)
             val ring = Notification.Builder(context, channel)
                 .setSmallIcon(R.drawable.ic_notify)
                 .setContentTitle("$name is calling")

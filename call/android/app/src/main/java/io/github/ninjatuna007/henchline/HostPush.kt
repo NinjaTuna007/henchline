@@ -17,8 +17,9 @@ import org.json.JSONObject
  * Pushes from a paired computer other than the laptop (multi-host preview). Each push now names the computer it
  * came from (host_id, from its host.json). One from the laptop, or one naming no computer or one this phone isn't
  * paired with, goes exactly where it always went (RingService). One from another paired computer is shown as that
- * computer's: a text or a ring opens its chat (HostChatActivity), a file opens its link. Calls through a second
- * computer come later: a ring from one says who wants you and opens the chat.
+ * computer's: a text opens its chat (HostChatActivity), a file opens its link, and a ring rings as the laptop's do,
+ * its Answer calling that computer from that agent's chat (RingService.answerIntent). A ring that can't be answered
+ * that way (a call already up, no valid session) is a notification that opens the chat instead.
  *
  * The push address reaches each paired computer that takes signed requests on its own routes (legacy_routes) the
  * way it reaches the laptop: POST /ring-endpoint, signed by LegacySigner.
@@ -152,10 +153,20 @@ object HostPush {
                 notify(context, "$agent on ${host.label} sent you ${file.optString("name", "a file")}",
                     push.optString("why").ifEmpty { "Tap to open it." }, open, Files.CHANNEL)
             }
-            else -> {  // a ring: no call through this computer yet
-                Reply.send(Reply.valid(push.optString("reply")), "rang")
-                notify(context, "$agent on ${host.label} wants you", push.optString("why").ifEmpty { "Open the chat to answer." },
-                    chat(context, host, session), Messages.CHANNEL)
+            else -> {  // a ring: a real one, whose Answer calls this computer (RingService.answerIntent)
+                val reply = Reply.valid(push.optString("reply"))
+                Reply.send(reply, "rang")
+                if (CallService.Bus.service != null || !ChatKey.validSession(session)) {  // on a call, or no agent to call: said
+                    notify(context, "$agent on ${host.label} wants you", push.optString("why").ifEmpty { "Open the chat to answer." },
+                        chat(context, host, session), Messages.CHANNEL)
+                } else {
+                    val raw = push.optString("agent", "handsfree")
+                    Calls.add(context, JSONObject().put("id", Calls.ringId(reply) ?: "ring-${System.currentTimeMillis()}").put("kind", "ring")
+                        .put("agent", raw).put("session", session).put("why", push.optString("why")).put("host_id", host.hostId)
+                        .put("outcome", if (reply == null) "rang" else "ringing"))
+                    RingService.ringNow(context, raw, push.optString("why"), reply,
+                        phrase = RingService.phraseFor(raw, push.optString("kind")), host = RingHost(host.hostId, session, host.label))
+                }
             }
         }
         return true

@@ -34,6 +34,14 @@ class HostChatActivity : Activity() {
             ?: ChatKey.parse(intent.getStringExtra(HOST), intent.getStringExtra(SESSION)?.let { Canonical.b64url(it.toByteArray()) })
         if (target == null) { finish(); return }
         Screen(this, target.first, target.second).start()
+        // Answer on this computer's ring (RingService.answerIntent): the call, answering that ring. Only the app's own
+        // Answer: never from a link (data), and only with the key and reply of the ring sounding now for this chat
+        if (intent.hasExtra(ANSWERING)) {
+            val reply = intent.getStringExtra(ANSWERING)?.ifEmpty { null }
+            if (intent.data == null && target.second != null &&
+                Ringing.mayAnswer(Ringing.now(this), target.first, target.second!!, reply, intent.getStringExtra(ANSWER_KEY) ?: ""))
+                screen?.call(reply, answered = true)
+        }
     }
 
     private val ticker = android.os.Handler(android.os.Looper.getMainLooper())
@@ -47,16 +55,31 @@ class HostChatActivity : Activity() {
     /** On screen now: only then is a text drawn here reported read. */
     @Volatile private var resumed = false
 
+    /** A call with this computer shows here (CallService keeps the laptop's screens out of it). */
+    private val callWatcher: (String) -> Unit = { message ->
+        runOnUiThread { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) screen?.fromCall(message) }
+    }
+
     override fun onResume() {
         super.onResume()
         resumed = true
         ticker.post(tick)
+        CallService.Bus.hostListener = callWatcher
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) screen?.showCall()
     }
 
     override fun onPause() {
         resumed = false
         ticker.removeCallbacks(tick)
+        if (CallService.Bus.hostListener === callWatcher) CallService.Bus.hostListener = null  // the call goes on
         super.onPause()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != MIC || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED) screen?.call(pendingAnswer, pendingAnswered)
+        else screen?.say("A call needs the microphone: allow it for Henchline in the phone's settings.")
     }
 
     override fun onDestroy() {
@@ -66,6 +89,8 @@ class HostChatActivity : Activity() {
     }
 
     private var screen: Screen? = null
+    private var pendingAnswer: String? = null  // the ring being answered while the microphone is asked for
+    private var pendingAnswered = false
 
     /** The screen's network and store work runs on one worker thread, one piece at a time: a look at the host
      *  (send what waits, fetch what's new) never overlaps a send's enqueue or a receipt, and the store is closed
@@ -112,7 +137,9 @@ class HostChatActivity : Activity() {
                 setPadding(px(16), px(16), px(16), px(4)); maxLines = 2
             })
             root.addView(banner)
-            if (sessionId != null) { list.addView(events); list.addView(queue); empty.visibility = View.GONE; list.addView(empty) }
+            if (sessionId != null) root.addView(callBar)
+            root.addView(elsewhere)
+            if (sessionId != null) { list.addView(events); list.addView(queue); list.addView(callLines); empty.visibility = View.GONE; list.addView(empty) }
             scroll.addView(list)
             root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
             if (sessionId != null) root.addView(composer())
@@ -282,6 +309,109 @@ class HostChatActivity : Activity() {
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END })
         }
 
+        // ---- a call with this computer's agent (CallService with HOST_ID): its bar, and what is said on it -------
+        private val callState = TextView(activity).apply { textSize = 14f; setTextColor(activity.getColor(R.color.text)) }
+        private fun callButton(label: String, action: String) = Button(activity).apply {
+            text = label; isAllCaps = false; setTextColor(activity.getColor(R.color.navy)); minHeight = px(40)
+            background = GradientDrawable().apply { setColor(activity.getColor(R.color.cyan)); cornerRadius = 20 * dp }
+            setOnClickListener { activity.startService(Intent(activity, CallService::class.java).setAction(action)) }
+        }
+        private val talk = callButton("Talk", CallService.TALK)
+        private val callBar = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; visibility = View.GONE
+            setPadding(px(16), px(6), px(16), px(6)); setBackgroundColor(activity.getColor(R.color.surface))
+            addView(callState, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(talk)
+            addView(callButton("Hang up", CallService.STOP), LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = px(8) })
+        }
+        private val callLines = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }  // this screen's call only
+        private var shownSeq = -1  // main thread: the last call line drawn here
+
+        fun say(words: String) = show(words)
+
+        private fun ours() = CallService.Bus.service != null && CallService.Bus.host == hostId && CallService.Bus.hostSession == sessionId
+
+        /** Elsewhere: a call with another chat (here or on another computer) is up; tapping goes there. */
+        private val elsewhere = TextView(activity).apply {
+            textSize = 13f; setTextColor(activity.getColor(R.color.cyan)); setPadding(px(16), px(6), px(16), px(6)); visibility = View.GONE
+            setOnClickListener {
+                val h = CallService.Bus.host ?: return@setOnClickListener
+                activity.startActivity(open(activity, ChatKey(h, CallService.Bus.hostSession)))
+            }
+        }
+
+        /** The bar as the call is now (coming back to this screen mid-call). */
+        fun showCall() {
+            val other = CallService.Bus.host?.takeIf { CallService.Bus.service != null && !ours() }
+            elsewhere.visibility = if (other != null) View.VISIBLE else View.GONE
+            if (other != null) elsewhere.text = "On a call with ${CallService.Bus.hostSession}" +
+                (if (other == hostId) "" else " on another computer") + ": tap to open it"
+            if (sessionId == null) return
+            // What was said while this screen was away (or before it was opened again): each line once, in order
+            CallService.Bus.hostLines.of(hostId, sessionId).forEach { fromCall(it, replay = true) }
+            CallService.Bus.hostLines.takeClosed(hostId, sessionId)?.let { show(it) }  // it ended while away
+            callBar.visibility = if (ours()) View.VISIBLE else View.GONE
+            if (ours()) callState.text = if (CallService.Bus.hostConnected) "On a call" else "Connecting…"
+        }
+
+        /** Call this chat's agent on this computer (answering: the ring answered, which the computer routes to the
+         *  agent that rang): one call at a time, the laptop's included. */
+        fun call(answering: String? = null, answered: Boolean = answering != null) {
+            val session = sessionId ?: return  // a computer's chat list: nobody to call
+            if (ours()) { showCall(); return }
+            if (CallService.Bus.service != null) {
+                if (answered) Ringing.end(activity)  // its ring stops: it can't be answered over this call
+                show("Already on a call: hang up that one first."); return
+            }
+            if (activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                pendingAnswer = answering; pendingAnswered = answered
+                activity.requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), MIC); return
+            }
+            pendingAnswer = null; pendingAnswered = false
+            if (answered) Ringing.end(activity)  // answered: the ring stops everywhere
+            val prefs = activity.getSharedPreferences("call", Context.MODE_PRIVATE)
+            callLines.removeAllViews(); shownSeq = -1
+            activity.startForegroundService(Intent(activity, CallService::class.java)
+                .putExtra(CallService.SERVER, host.baseUrl.trimEnd('/'))
+                .putExtra(CallService.HOST_ID, host.hostId).putExtra(CallService.HOST_SESSION, session)
+                .putExtra(CallService.CLEAR, prefs.getBoolean("clear", true))
+                // A ring answered starts on the loudspeaker, as the laptop's does (the phone may be on the desk)
+                .putExtra(CallService.SPEAKER, answered || prefs.getBoolean("speaker", true))
+                .putExtra(IncomingActivity.REPLY, answering))
+            callBar.visibility = View.VISIBLE; callState.text = "Connecting…"
+        }
+
+        /** What the call says (main thread). */
+        fun fromCall(json: String, replay: Boolean = false) {
+            val m = try { org.json.JSONObject(json) } catch (e: Exception) { return }
+            // Only this chat's own call (replayed lines are this chat's already): another's only updates the note
+            if (!replay && (m.optString(CallService.CALL_HOST) != hostId || m.optString(CallService.CALL_SESSION) != sessionId)) {
+                showCall()
+                if (m.has("closed")) elsewhere.visibility = View.GONE  // that other call is over
+                return
+            }
+            if (m.has("closed")) CallService.Bus.hostLines.takeClosed(hostId, sessionId ?: "")  // seen here: not again
+            when {
+                m.has("opened") -> { callBar.visibility = View.VISIBLE; callState.text = "On a call" }
+                m.has("reconnecting") -> callState.text = if (m.optBoolean("reconnecting")) "Reconnecting…" else "On a call"
+                m.has("closed") -> { callBar.visibility = View.GONE; show(m.optString("closed")) }
+                m.has("talking") -> talk.text = if (m.optBoolean("talking")) "Send" else "Talk"
+                m.has("note") -> show(m.optString("note"))
+            }
+            m.optJSONObject("chat")?.let { line ->
+                val seq = m.optInt("seq", -1)
+                if (seq <= shownSeq) return  // drawn already (told live, then replayed on coming back)
+                shownSeq = seq
+                val atBottom = !scroll.canScrollVertically(1)
+                callLines.addView(if (line.optString("from") == "you") bubble(line.optString("text"), "said on the call")
+                    else theirs(line.optString("from").ifEmpty { "Agent" }, line.optString("text")))
+                if (callLines.childCount > CallService.HostLines.MAX) callLines.removeViewAt(0)  // as many as are kept
+                empty.visibility = View.GONE
+                if (atBottom) scroll.post { scroll.scrollTo(0, list.height) }
+            }
+        }
+
         private fun composer(): View {
             val box = EditText(activity).apply {
                 hint = "Message"; setTextColor(activity.getColor(R.color.text)); setHintTextColor(activity.getColor(R.color.muted))
@@ -304,6 +434,11 @@ class HostChatActivity : Activity() {
             return LinearLayout(activity).apply {
                 orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
                 setPadding(px(12), px(8), px(12), px(12)); setBackgroundColor(activity.getColor(R.color.surface))
+                addView(Button(activity).apply {
+                    text = "Call"; isAllCaps = false; setTextColor(activity.getColor(R.color.text)); minHeight = px(48)
+                    background = GradientDrawable().apply { setStroke(px(1), activity.getColor(R.color.cyan)); cornerRadius = 22 * dp }
+                    setOnClickListener { call() }
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, px(48)).apply { marginEnd = px(8) })
                 addView(box, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 addView(send, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, px(48)).apply { marginStart = px(8) })
             }
@@ -313,11 +448,20 @@ class HostChatActivity : Activity() {
     companion object {
         const val POLL_MS = 5000L
         const val PAGES_PER_LOOK = 10
+        private const val MIC = 7
         const val HOST = "host_id"
         const val SESSION = "session_id"
 
         fun open(context: Context, key: ChatKey) = Intent(context, HostChatActivity::class.java)
             .putExtra(HOST, key.hostId).putExtra(SESSION, key.sessionId)
+
+        const val ANSWERING = "answering"
+        const val ANSWER_KEY = "answer_key"
+
+        /** Answer on a ring from this computer: its chat, which calls it answering that ring (with the ring's key). */
+        fun answer(context: Context, key: ChatKey, reply: String?, answerKey: String) = open(context, key)
+            .putExtra(ANSWERING, reply ?: "").putExtra(ANSWER_KEY, answerKey)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
 
         fun openHost(context: Context, hostId: String) = Intent(context, HostChatActivity::class.java).putExtra(HOST, hostId)
     }

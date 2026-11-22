@@ -49,7 +49,7 @@ class IncomingActivity : Activity() {
             setPadding((24 * dp).toInt(), (96 * dp).toInt(), (24 * dp).toInt(), (64 * dp).toInt())
         }
         screen.addView(TextView(this).apply {
-            text = "${nameOf(agent)} is calling"
+            text = "${RingService.callerOf(this@IncomingActivity, agent, reply)} is calling"
             setTextColor(getColor(R.color.text))
             textSize = 28f
             gravity = Gravity.CENTER
@@ -83,8 +83,7 @@ class IncomingActivity : Activity() {
         buttons.addView(round(R.drawable.ic_phone, R.drawable.round_call, "Answer") {
             told = true  // the call tells the laptop the rest (answered, or couldn't connect)
             ended = true
-            startActivity(Intent(this, MainActivity::class.java).setAction(MainActivity.ANSWER)
-                .putExtra(REPLY, reply).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP))
+            RingService.answerIntent(this, reply)?.let { startActivity(it) }  // the laptop's call, or the ringing computer's
             stop()
         }, LinearLayout.LayoutParams((76 * dp).toInt(), (76 * dp).toInt()))
         screen.addView(buttons)

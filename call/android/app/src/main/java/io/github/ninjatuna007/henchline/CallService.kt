@@ -51,7 +51,67 @@ class CallService : Service() {
         // wasn't listening then (answering from the ring screen) showed "nobody has spoken" (2026-11-15)
         @Volatile var lastAgents: String? = null
         @Volatile var lastMode: String? = null
+        // A call with another paired computer (multi-host preview): its id, and its screen (HostChatActivity). Its
+        // messages go only there, and `connected` stays false: the laptop's screens never take it for their call
+        @Volatile var host: String? = null
+        @Volatile var hostSession = ""  // and the agent's chat there: the only chat screen that shows this call
+        @Volatile var hostListener: ((String) -> Unit)? = null
+        @Volatile var hostConnected = false
+        val hostLines = HostLines()
     }
+
+    /** What was said on the latest call with another computer (not its agents' texts, which its chat history keeps),
+     *  each with a sequence number: its chat screen draws them however often it is opened, each once. Kept until
+     *  the next such call starts. */
+    class HostLines {
+        private val lines = ArrayList<String>()
+        private var next = 0
+        private var hostId: String? = null
+        private var session = ""
+
+        private var closedWhy: String? = null
+
+        @Synchronized fun start(hostId: String, session: String) {
+            lines.clear(); closedWhy = null; this.hostId = hostId; this.session = session
+        }
+
+        /** How the call ended, for its chat screen if it wasn't showing then. */
+        @Synchronized fun closed(why: String) { closedWhy = why }
+
+        /** That ending, once: null if none, or for another chat. */
+        @Synchronized fun takeClosed(hostId: String, session: String): String? =
+            if (hostId == this.hostId && session == this.session) closedWhy.also { closedWhy = null } else null
+
+        /** The line as told to the screen: with its "seq". */
+        @Synchronized fun add(message: org.json.JSONObject): String {
+            val told = org.json.JSONObject(message.toString()).put("seq", next++).toString()
+            lines += told
+            if (lines.size > MAX) lines.removeAt(0)
+            return told
+        }
+
+        @Synchronized fun of(hostId: String, session: String): List<String> =
+            if (hostId == this.hostId && session == this.session) lines.toList() else emptyList()
+
+        companion object { const val MAX = 500 }
+    }
+
+    // Set once per call, before it connects: null, the laptop (every path as it always was)
+    @Volatile private var hostId: String? = null
+    @Volatile private var hostSession = ""
+
+    /** To the screen watching this call: the laptop's (MainActivity), or another computer's chat. */
+    private fun tell(json: String) {
+        val host = hostId ?: return Bus.listener?.invoke(json) ?: Unit
+        // Which call it is: every chat screen of every computer listens, only this call's own chat acts on it
+        val tagged = try { org.json.JSONObject(json).put(CALL_HOST, host).put(CALL_SESSION, hostSession) } catch (e: Exception) { return }
+        tagged.optString("closed").takeIf { tagged.has("closed") }?.let { Bus.hostLines.closed(it) }  // shown on coming back
+        Bus.hostListener?.invoke(tagged.toString())
+    }
+
+    private var up: Boolean
+        get() = if (hostId == null) Bus.connected else Bus.hostConnected
+        set(v) { if (hostId == null) Bus.connected = v else Bus.hostConnected = v }
 
     // Written on the main and OkHttp threads, read on the mic thread
     @Volatile private var socket: WebSocket? = null
@@ -175,6 +235,12 @@ class CallService : Service() {
             return START_NOT_STICKY
         }
         if (running) return START_NOT_STICKY  // already calling or connecting
+        hostId = intent.getStringExtra(HOST_ID)?.takeIf { Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && MultiHost.enabled(this) }
+        hostSession = if (hostId == null) "" else intent.getStringExtra(HOST_SESSION) ?: ""
+        Bus.hostSession = hostSession
+        Bus.host = hostId
+        hostId?.let { Bus.hostLines.start(it, hostSession) }
+        if (hostId != null) goForeground()  // its notification opens that computer's chat
         clear = intent.getBooleanExtra(CLEAR, true)
         speaker = intent.getBooleanExtra(SPEAKER, true)
         if (!speaker) clear = false  // the earpiece is only on the phone-call path
@@ -191,7 +257,8 @@ class CallService : Service() {
                 .createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "henchline:call")
                 .apply { setReferenceCounted(false); acquire() }
         } catch (e: Exception) { null }
-        if (PhoneVoice.enabled(this) && PhoneVoice.ready(this)) {
+        // The phone's own voice is the laptop's (its voices and manifest come from there): not on another computer's call
+        if (hostId == null && PhoneVoice.enabled(this) && PhoneVoice.ready(this)) {
             phoneVoice = PhoneVoice.Speaker(this, enqueue = { spoken.offer(it) }, queued = { spoken.size },
                 send = { socket?.send(it) }, played = { spokenTaken.get() }, flush = { clearSpoken() })
             Thread { PhoneVoice.load(this) }.start()  // about 2.4 s: ready before the first reply
@@ -269,11 +336,11 @@ class CallService : Service() {
     /** Start talking, or send what was said: as holding the talk button. */
     @Synchronized
     fun toggleTalk() {
-        if (!Bus.connected) return  // the laptop isn't there yet: nothing to start or send
+        if (!up) return  // the laptop isn't there yet: nothing to start or send
         talking = !talking
         socket?.send(org.json.JSONObject().put("push", talking).toString())
         beep(talking)
-        Bus.listener?.invoke(org.json.JSONObject().put("talking", talking).toString())
+        tell(org.json.JSONObject().put("talking", talking).toString())
         goForeground()  // the notification's button says Send while talking
     }
 
@@ -305,13 +372,15 @@ class CallService : Service() {
         phoneVoice = null
         PhoneVoice.release()  // the model's few hundred MB go with the call
         nearEar(false)
-        Bus.connected = false
+        up = false
         if (startedAt > 0) logCall()
         Bus.service = null
+        Bus.host = null
+        Bus.hostSession = ""
         Bus.lastAgents = null
         Bus.lastMode = null
         // Said once: the socket closing after this (onClosing, onFailure) would say it again (2026-11-15)
-        if (!ended) Bus.listener?.invoke("""{"closed": "Call ended"}""")
+        if (!ended) tell("""{"closed": "Call ended"}""")
         ended = true
         super.onDestroy()
     }
@@ -408,12 +477,12 @@ class CallService : Service() {
         when (spell) {
             0 -> {
                 silentSpell = 1
-                Bus.listener?.invoke(org.json.JSONObject().put("note", "Your mic went silent: restarting it").toString())
+                tell(org.json.JSONObject().put("note", "Your mic went silent: restarting it").toString())
                 restartAudio("the mic sends only silence")
             }
             1 -> {
                 silentSpell = 2
-                Bus.listener?.invoke(org.json.JSONObject().put("note",
+                tell(org.json.JSONObject().put("note",
                     "Your mic is still silent. Try switching sound, or taking the earbuds out and back in.").toString())
                 restartAudio("the mic still sends only silence")
             }
@@ -473,7 +542,7 @@ class CallService : Service() {
         if (lostAt == 0L) {
             lostAt = now
             android.util.Log.i("Henchline", "call: connection dropped (${lastDrop.ifEmpty { "no cause seen" }}), reconnecting")
-            Bus.listener?.invoke("""{"reconnecting": true}""")
+            tell("""{"reconnecting": true}""")
         }
         if (now - lostAt > RECONNECT_FOR) {
             fail("The connection dropped and didn't come back.")
@@ -506,13 +575,17 @@ class CallService : Service() {
                         lastDrop = ""
                     }
                     if (talking) webSocket.send(org.json.JSONObject().put("push", true).toString())  // the laptop forgot
-                    Bus.listener?.invoke("""{"reconnecting": false}""")
+                    tell("""{"reconnecting": false}""")
                     return
                 }
-                Bus.connected = true
+                up = true
                 startedAt = System.currentTimeMillis()
                 Calls.add(this@CallService, org.json.JSONObject().put("id", "call-$startedAt").put("kind", "call")
-                    .put("at", startedAt).put("answering", Calls.ringId(reply) ?: ""))
+                    .put("at", startedAt).put("answering", Calls.ringId(reply) ?: "").apply { hostId?.let { put("host_id", it) } })
+                // Another computer's call is with the agent of the chat it was started from (the laptop's screen
+                // says so itself once it hears "opened")
+                if (hostId != null && reply == null && hostSession.isNotEmpty())
+                    webSocket.send(org.json.JSONObject().put("switch", hostSession).toString())
                 // Answering a ring: which one, so the laptop puts the call through to the agent that rang
                 reply?.let { webSocket.send(org.json.JSONObject().put("answering", it.substringAfterLast('/')).toString()) }
                 // Where the laptop can ring this phone later (`handsfree ring`), refreshed every call
@@ -521,7 +594,7 @@ class CallService : Service() {
                 }
                 offerPhoneVoice(webSocket)
                 startAudio()
-                Bus.listener?.invoke("""{"opened": true}""")
+                tell("""{"opened": true}""")
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -535,6 +608,17 @@ class CallService : Service() {
                 message?.optString("stop")?.takeIf { it.isNotEmpty() }?.let { phoneVoice?.stop(it); return }
                 if (message?.optBoolean("flush") == true) {  // the user started talking: drop the talkback still queued
                     flushSpeaker()
+                    return
+                }
+                if (hostId != null) {  // another computer's call: never the laptop's crew, status or chats
+                    message?.optJSONObject("chat")?.let { line ->
+                        // An agent's text (tid) is in that computer's own chat history too: its chat screen shows it
+                        // from there and reports it read. What else is said is kept here for that screen, which may
+                        // be paused or opened again mid-call (lines lost while away: 2026-11-15)
+                        if (line.optString("tid").isEmpty()) tell(Bus.hostLines.add(message))
+                        return
+                    }
+                    tell(text)
                     return
                 }
                 if (message?.has("agents") == true) Bus.lastAgents = text
@@ -564,7 +648,7 @@ class CallService : Service() {
                 message?.optString("delivered")?.takeIf { it.isNotEmpty() }?.let { id ->  // typed into the agent
                     Chats.setStatus(this@CallService, message.optString("session").ifEmpty { lastSession }, id, "delivered")
                 }
-                Bus.listener?.invoke(text)
+                tell(text)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -590,7 +674,7 @@ class CallService : Service() {
                     (response?.let { " (HTTP ${it.code})" } ?: ""))
                 if (me != link) return
                 lastDrop = "${t.javaClass.simpleName}: ${t.message ?: "no message"}"
-                if (Bus.connected && running && !ended) { reconnect(); return }  // mid-call: try again
+                if (up && running && !ended) { reconnect(); return }  // mid-call: try again
                 // A self-signed certificate (call/server.py --host tailscale) fails here: the app trusts only
                 // real ones, so it needs the `tailscale serve` address
                 fail("Couldn't reach the call: ${t.message}")
@@ -621,7 +705,7 @@ class CallService : Service() {
                 ).onEach { it.enabled = true } else emptyList()
                 echoCanceller = if (clear) effects.any { it is AcousticEchoCanceler } else null
                 socket?.send(soundNote())  // where it plays now (a restart or a sound switch may have moved it)
-                if (clear) Bus.listener?.invoke(org.json.JSONObject().put("note",
+                if (clear) tell(org.json.JSONObject().put("note",
                     "Clear voice: phone echo canceller ${if (effects.any { it is AcousticEchoCanceler }) "on" else "not available"}").toString())
                 try {
                     mic.startRecording()
@@ -797,6 +881,11 @@ class CallService : Service() {
         // The chat of the agent the call was with (the laptop's last word on it), not the chat shown
         val withAgent = try { org.json.JSONObject(Bus.lastAgents ?: "{}").optString("current") } catch (_: Exception) { "" }
         val session = withAgent.ifEmpty { getSharedPreferences("call", MODE_PRIVATE).getString("current", "") ?: "" }
+        if (hostId != null) {  // another computer's call: in the history, not in the laptop's chats
+            Calls.update(this, "call-$startedAt") { it.put("seconds", seconds).put("session", hostSession) }
+            startedAt = 0
+            return
+        }
         Calls.update(this, "call-$startedAt") { it.put("seconds", seconds).put("session", session) }
         // As a messaging app shows a call: on the side of whoever started it (an answered ring: the agent's)
         Chats.add(this, session, org.json.JSONObject().put("from", "").put("note", true).put("mine", false)
@@ -810,14 +899,14 @@ class CallService : Service() {
         if (ended) return
         ended = true
         android.util.Log.i("Henchline", "call ended: $why")  // the screen's note isn't kept: this is, in the phone's log
-        if (!Bus.connected) {  // answered, but the laptop is out of reach
+        if (!up) {  // answered, but the laptop is out of reach
             Reply.send(reply, "unreachable")
             Calls.outcome(this, reply, "unreachable")
         }
         // Over before the screen hears it: the bar went on showing the call, and what it last said (the user's
         // catch, 2026-11-16: still "on a call" after hanging up)
-        Bus.connected = false
-        Bus.listener?.invoke(org.json.JSONObject().put("closed", why).toString())
+        up = false
+        tell(org.json.JSONObject().put("closed", why).toString())
         android.os.Handler(mainLooper).post { stopSelf() }
     }
 
@@ -854,8 +943,11 @@ class CallService : Service() {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL, "Call", NotificationManager.IMPORTANCE_LOW))
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE)
+        val chat = hostId?.takeIf { Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU }?.let {
+            HostChatActivity.open(this, ChatKey(it, hostSession)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val open = PendingIntent.getActivity(this, 0, chat ?: Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val hangUp = PendingIntent.getService(this, 1, Intent(this, CallService::class.java).setAction(STOP),
             PendingIntent.FLAG_IMMUTABLE)
         val talk = PendingIntent.getService(this, 2, Intent(this, CallService::class.java).setAction(TALK),
@@ -877,6 +969,10 @@ class CallService : Service() {
     companion object {
         const val SERVER = "server"
         const val CLEAR = "clear"
+        const val HOST_ID = "host_id"        // multi-host: a call with that paired computer instead of the laptop
+        const val HOST_SESSION = "host_session"  // and with that agent there
+        const val CALL_HOST = "call_host"        // on each message to the screens: whose call it is
+        const val CALL_SESSION = "call_session"
         const val SPEAKER = "speaker"
         // Earbuds and headsets the call uses before the phone's own speaker or earpiece, best first
         val HEADSETS = intArrayOf(AudioDeviceInfo.TYPE_BLE_HEADSET, AudioDeviceInfo.TYPE_BLUETOOTH_SCO,

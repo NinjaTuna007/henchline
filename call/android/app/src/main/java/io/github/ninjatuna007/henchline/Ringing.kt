@@ -12,10 +12,34 @@ import org.json.JSONObject
 object Ringing {
     private const val KEY = "ringing"
 
-    fun started(context: Context, agent: String, why: String, reply: String?) {
+    /** host: a ring from another paired computer (multi-host): its id, the agent's session there, its name. */
+    fun started(context: Context, agent: String, why: String, reply: String?, host: RingHost? = null) {
         prefs(context).edit().putString(KEY, JSONObject().put("agent", agent).put("why", why).put("reply", reply ?: "")
-            .put("until", System.currentTimeMillis() + RingService.RING_SECONDS * 1000).toString()).apply()
+            .put("until", System.currentTimeMillis() + RingService.RING_SECONDS * 1000)
+            .apply { host?.let { put("host_id", it.hostId).put("session", it.session).put("host_label", it.label)
+                // Only the app's own Answer carries it: the chat screen is reachable by links and other apps too
+                .put("answer_key", java.util.UUID.randomUUID().toString()) } }
+            .toString()).apply()
     }
+
+    /** The computer a ring comes from when it isn't the laptop: null for the laptop's (every ring until multi-host). */
+    fun hostOf(ring: JSONObject?): RingHost? = ring?.optString("host_id")?.takeIf { it.isNotEmpty() }
+        ?.let { RingHost(it, ring.optString("session"), ring.optString("host_label")) }
+
+    /** Whether a chat screen opened with these may answer the ring sounding now: it is that computer's ring for that
+     *  chat, with that reply, and the key matches the one only the app's own Answer carries. */
+    fun mayAnswer(ring: JSONObject?, hostId: String, session: String, reply: String?, key: String): Boolean {
+        val host = hostOf(ring) ?: return false
+        val kept = ring!!.optString("answer_key")
+        return host.hostId == hostId && host.session == session && ring.optString("reply") == (reply ?: "") &&
+            key.isNotEmpty() && java.security.MessageDigest.isEqual(kept.toByteArray(), key.toByteArray())
+    }
+
+    /** The key of the ring sounding now (another computer's), for its Answer. */
+    fun answerKey(ring: JSONObject?): String = ring?.optString("answer_key") ?: ""
+
+    /** The ring sounding now if it is the laptop's: what the laptop's screens may answer. */
+    fun laptops(context: Context): JSONObject? = now(context)?.takeIf { hostOf(it) == null }
 
     /** The ring still sounding: {agent, why, reply, until}, or null. */
     fun now(context: Context): JSONObject? {
@@ -34,3 +58,6 @@ object Ringing {
 
     private fun prefs(context: Context) = context.getSharedPreferences("call", Context.MODE_PRIVATE)
 }
+
+/** Another paired computer ringing: who, and which agent's chat a call to it opens with. */
+data class RingHost(val hostId: String, val session: String, val label: String)
