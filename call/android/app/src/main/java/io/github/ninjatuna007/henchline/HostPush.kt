@@ -249,23 +249,24 @@ object HostPush {
     fun takesReply(session: String) = session.isNotEmpty() && HostChatRules.takesReplies(session) && ChatKey.validSession(session)
 
     /** Another computer's text, as its notification (one per chat: a newer text replaces the last), with a Reply box
-     *  that goes through that computer's own queue (HostReplyReceiver); mine: the reply just typed in it, shown
-     *  under their line without a new buzz. */
-    fun postText(context: Context, host: Host, agent: String, session: String, text: String, mine: String? = null) {
+     *  that goes through that computer's own queue (HostReplyReceiver); mine: the replies typed in it so far, each a
+     *  line under theirs, shown without a new buzz (the Reply box carries them, so the next adds a line). */
+    fun postText(context: Context, host: Host, agent: String, session: String, text: String, mine: List<String> = emptyList()) {
         val name = IncomingActivity.nameOf(agent)
         val id = "${host.hostId} $session".hashCode()
         val reply = if (!takesReply(session)) null else PendingIntent.getBroadcast(context, id,
             Intent(context, HostReplyReceiver::class.java).setAction(REPLY).putExtra("host_id", host.hostId)
-                .putExtra("session", session).putExtra("agent", agent).putExtra("text", text),
+                .putExtra("session", session).putExtra("agent", agent).putExtra("text", text)
+                .putStringArrayListExtra("mine", ArrayList(mine)),
             PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)  // mutable: the reply text is added to it
-        notify(context, "$name on ${host.label}", mine ?: text, chat(context, host, session), Messages.CHANNEL, id = id,
+        notify(context, "$name on ${host.label}", mine.lastOrNull() ?: text, chat(context, host, session), Messages.CHANNEL, id = id,
             message = Message("$name on ${host.label}", text), agent = agent, mine = mine,
             reply = reply?.let { name to it })
     }
 
     private fun notify(context: Context, title: String, text: String, open: Intent, channel: String,
                        id: Int = (title + text + System.nanoTime()).hashCode(), message: Message? = null, agent: String = "",
-                       mine: String? = null, reply: Pair<String, PendingIntent>? = null) {
+                       mine: List<String> = emptyList(), reply: Pair<String, PendingIntent>? = null) {
         val manager = context.getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(channel,
             if (channel == Files.CHANNEL) "Files from your crew" else "Messages from your crew", NotificationManager.IMPORTANCE_HIGH))
@@ -280,8 +281,8 @@ object HostPush {
             val them = android.app.Person.Builder().setName(message.sender)
                 .setIcon(android.graphics.drawable.Icon.createWithResource(context, MainActivity.avatarOf(agent))).setImportant(true).build()
             val style = Notification.MessagingStyle(you).addMessage(message.text, System.currentTimeMillis(), them)
-            if (mine != null) style.addMessage(mine, System.currentTimeMillis(), null as android.app.Person?)  // yours
-            built.setCategory(message.category).setStyle(style).setOnlyAlertOnce(mine != null)
+            for (line in mine) style.addMessage(line, System.currentTimeMillis(), null as android.app.Person?)  // yours
+            built.setCategory(message.category).setStyle(style).setOnlyAlertOnce(mine.isNotEmpty())
         }
         reply?.let { (who, intent) ->
             built.addAction(Notification.Action.Builder(null, "Reply", intent)
@@ -303,17 +304,33 @@ class HostReplyReceiver : android.content.BroadcastReceiver() {
         val session = intent.getStringExtra("session") ?: return
         if (words.isNullOrEmpty() || !HostPush.takesReply(session)) return
         val app = context.applicationContext
+        val agent = intent.getStringExtra("agent") ?: "handsfree"
+        val text = intent.getStringExtra("text") ?: ""
+        val before = intent.getStringArrayListExtra("mine") ?: arrayListOf()  // replies typed in it already
         val pending = goAsync()
         Thread {
             var host: Host? = null
+            val paired = try { HostRegistry.of(app).get(hostId) } catch (e: Exception) { null }
             try {
-                host = HostRegistry.of(app).get(hostId)?.takeIf { !it.revocationPending } ?: return@Thread
-                Store(app).use { HostOutbox.enqueue(it, host!!, session, words) }
+                val target = paired?.takeIf { !it.revocationPending }
+                if (target == null) {  // never a spinner left turning: said in the notification, or it goes
+                    if (paired != null) HostPush.postText(app, paired, agent, session, text,
+                        before + "$words  (not sent: ${paired.label} is being removed)")
+                    else app.getSystemService(android.app.NotificationManager::class.java).cancel("$hostId $session".hashCode())
+                    return@Thread
+                }
+                try {
+                    Store(app).use { HostOutbox.enqueue(it, target, session, words) }
+                } catch (e: Exception) {
+                    android.util.Log.w("Henchline", "reply to ${hostId.take(8)} not queued: ${e.javaClass.simpleName}")
+                    HostPush.postText(app, target, agent, session, text, before + "$words  (not sent: couldn't keep it on this phone)")
+                    return@Thread
+                }
+                host = target
                 HostLists.markSeen(app, hostId, session)  // replying means reading
-                HostPush.postText(app, host!!, intent.getStringExtra("agent") ?: "handsfree", session,
-                    intent.getStringExtra("text") ?: "", mine = words)
+                HostPush.postText(app, target, agent, session, text, before + words)
             } catch (e: Exception) {
-                android.util.Log.w("Henchline", "reply to ${hostId.take(8)} not queued: ${e.javaClass.simpleName}")
+                android.util.Log.w("Henchline", "reply to ${hostId.take(8)}: ${e.javaClass.simpleName}")
             } finally {
                 pending.finish()  // queued (or not): the rest may outlive the receiver's few seconds
             }

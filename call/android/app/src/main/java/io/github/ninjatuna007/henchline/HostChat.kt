@@ -36,6 +36,28 @@ data class ChatSummary(val sessionId: String, val name: String, val current: Boo
     }
 }
 
+/** What a chat event is drawn as (HostChatActivity): an agent's text, a message from this phone, a line said on a
+ *  call (yours or the agent's), or nothing (a kind this app doesn't know yet: kept in place, not shown). */
+enum class EventLook { AGENT_TEXT, MINE, CALL_YOU, CALL_THEM, NONE }
+
+/** A page of a chat's events asks for the call lines too (with=call_lines: a computer without them ignores it). */
+object HostChatQuery {
+    fun of(cursor: String?) = listOfNotNull("limit" to "200", "with" to "call_lines", cursor?.let { "cursor" to it })
+}
+
+object ChatEvents {
+    fun lookOf(e: JSONObject): EventLook = when (e.optString("kind")) {
+        "agent_text" -> EventLook.AGENT_TEXT
+        "message" -> EventLook.MINE
+        "call_line" -> if (e.optString("from").equals("you", ignoreCase = true)) EventLook.CALL_YOU else EventLook.CALL_THEM
+        else -> EventLook.NONE
+    }
+
+    /** A call line's identity among the ones told live (CallService.HostLines): the same words from the same speaker,
+     *  so the kept copy replaces the live one rather than showing twice. */
+    fun callKey(from: String, text: String) = from.lowercase() + "\u0000" + text
+}
+
 /** One computer's chats over the signed v1 API. */
 @RequiresApi(MultiHost.MIN_SDK)
 class HostChat(private val client: HostClient, private val hostId: String) {
@@ -64,8 +86,7 @@ class HostChat(private val client: HostClient, private val hostId: String) {
     /** That chat's events after cursor (null: from the start), and the cursor for more (null: none). */
     fun events(sessionId: String, cursor: String? = null): Pair<List<JSONObject>, String?> {
         client.require("chat")
-        val answer = client.call("GET", listOf("api", "v1", "chats", sessionId, "events"),
-            listOfNotNull("limit" to "200", cursor?.let { "cursor" to it }))
+        val answer = client.call("GET", listOf("api", "v1", "chats", sessionId, "events"), HostChatQuery.of(cursor))
         if (answer.code != 200) throw java.io.IOException("events: ${answer.code} ${answer.errorCode}")
         val page = answer.json()
         val list = page.optJSONArray("events") ?: return emptyList<JSONObject>() to null

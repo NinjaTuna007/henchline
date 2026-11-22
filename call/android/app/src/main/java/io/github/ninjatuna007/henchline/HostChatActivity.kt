@@ -283,13 +283,26 @@ class HostChatActivity : Activity() {
         private fun draw(fresh: List<Pair<Int, org.json.JSONObject>>, rows: List<QueuedRow>) {
             val atBottom = !drawnOnce || !scroll.canScrollVertically(1)
             fresh.forEach { (at, e) ->
-                if (e.optString("kind") == "agent_text") {
-                    events.addView(theirs(e.optString("agent").replaceFirstChar { it.uppercase() }.ifEmpty { "Agent" }, e.optString("text")), at)
-                    drawnTexts += e.optString("event_id")
-                } else {
-                    val text = e.optJSONObject("content")?.optString("text") ?: ""
-                    events.addView(bubble(text, if (e.optString("state") == "delivered") "✓ delivered" else "not delivered: ${e.optString("note")}"), at)
-                    onHost += e.optString("client_message_id")
+                // One view per event, always (the timeline's positions count them): an unknown kind is an empty one
+                when (ChatEvents.lookOf(e)) {
+                    EventLook.AGENT_TEXT -> {
+                        events.addView(theirs(e.optString("agent").replaceFirstChar { it.uppercase() }.ifEmpty { "Agent" }, e.optString("text")), at)
+                        drawnTexts += e.optString("event_id")
+                    }
+                    EventLook.MINE -> {
+                        val text = e.optJSONObject("content")?.optString("text") ?: ""
+                        events.addView(bubble(text, if (e.optString("state") == "delivered") "✓ delivered" else "not delivered: ${e.optString("note")}"), at)
+                        onHost += e.optString("client_message_id")
+                    }
+                    // What was said on a call, as the computer kept it: drawn as the live lines are, in its place; the
+                    // live copy of the same line (this screen's call) goes, so it isn't shown twice
+                    EventLook.CALL_YOU, EventLook.CALL_THEM -> {
+                        val from = e.optString("from"); val text = e.optString("text")
+                        events.addView(if (ChatEvents.lookOf(e) == EventLook.CALL_YOU) bubble(text, "said on the call")
+                            else theirs(from.ifEmpty { "Agent" }, text), at)
+                        dropLive(ChatEvents.callKey(from, text))
+                    }
+                    EventLook.NONE -> events.addView(View(activity).apply { visibility = View.GONE }, at)
                 }
             }
             val waiting = rows.filter { it.clientMessageId !in onHost }
@@ -359,6 +372,15 @@ class HostChatActivity : Activity() {
         }
         private val callLines = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }  // this screen's call only
         private var shownSeq = -1  // main thread: the last call line drawn here
+        // main thread: kept call lines drawn before their live copy came (a replay): each absorbs one live copy
+        private val keptAhead = HashMap<String, Int>()
+
+        /** A call line the computer kept is drawn: its live copy goes (the first one this screen shows), or, not shown
+         *  yet, the next one that comes is skipped. A line said twice is two lines either way. */
+        private fun dropLive(key: String) {
+            for (i in 0 until callLines.childCount) if (callLines.getChildAt(i).tag == key) { callLines.removeViewAt(i); return }
+            keptAhead[key] = (keptAhead[key] ?: 0) + 1
+        }
 
         fun say(words: String) = show(words)
 
@@ -437,8 +459,11 @@ class HostChatActivity : Activity() {
                 if (seq <= shownSeq) return  // drawn already (told live, then replayed on coming back)
                 shownSeq = seq
                 val atBottom = !scroll.canScrollVertically(1)
-                callLines.addView(if (line.optString("from") == "you") bubble(line.optString("text"), "said on the call")
-                    else theirs(line.optString("from").ifEmpty { "Agent" }, line.optString("text")))
+                val key = ChatEvents.callKey(line.optString("from"), line.optString("text"))
+                val ahead = keptAhead[key] ?: 0
+                if (ahead > 0) { keptAhead[key] = ahead - 1; return }  // the computer's kept copy is drawn already
+                callLines.addView((if (line.optString("from") == "you") bubble(line.optString("text"), "said on the call")
+                    else theirs(line.optString("from").ifEmpty { "Agent" }, line.optString("text"))).apply { tag = key })
                 if (callLines.childCount > CallService.HostLines.MAX) callLines.removeViewAt(0)  // as many as are kept
                 empty.visibility = View.GONE
                 if (atBottom) scroll.post { scroll.scrollTo(0, list.height) }
