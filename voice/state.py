@@ -211,6 +211,10 @@ JARVIS_MODEL = HANDSFREE_DATA / "hey_jarvis_v0.1.onnx"  # openWakeWord's publish
 JARVIS_PERSONAL = HANDSFREE_DATA / "hey_jarvis_personal.pkl"  # the user's own "hey Jarvis", preferred when there
 WAKE_SAMPLES = HANDSFREE_DATA / "samples"  # "hey Claude" takes; other words' in a folder each (samples/jarvis)
 ECHO_SET = HANDSFREE_DATA / "echo-set"  # talk-over recordings, one folder per session
+# Speaker verification (handsfree/core/voiceprint.py): the user's recordings and their voiceprint stay private here
+VOICE_ID = SHARE / "henchline/voice-id"
+VOICEPRINT = VOICE_ID / "voiceprint.json"  # per-path centroids built by `handsfree voiceprint enrol` (0600)
+VOICEPRINT_MODEL = Path.home() / ".cache/henchline-voiceid/nemo_en_titanet_small.onnx"  # sherpa-onnx's TitaNet-small
 EC_SOURCE = "talkback_ec_source"  # the echo-cancelled mic hands-free listens to
 EC_UNIT = "talkback-echo-cancel.service"
 EC_CONF = Path.home() / ".config/pipewire/talkback-echo-cancel.conf"

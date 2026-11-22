@@ -10,6 +10,7 @@ recording to acting on the words, is turn.py.
 from __future__ import annotations
 
 import collections
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from sensing import (FRAME, PER_SECOND, RATE, EarbudButton, EchoWatch, Load, Out
                      mic_stream, read_frame, start_canceller)
 from talkover import CALL_SUSTAIN, CAREFUL_NEW_WORDS, NEW_WORDS, SUSTAIN, TalkOver, Verdict
 from turn import Mode, Turn
+import voiceprint
 from voicegate import VoiceGate
 from voice.speech import whisper, whistle
 from voice.spool import queued
@@ -74,6 +76,8 @@ class Listener:
         self.transcriber = transcriber
         self.stream, self.source, self.opened, self.frames_read = None, "", 0.0, 0
         self.talkover = TalkOver(self.transcriber.quick_text)
+        self.voiceprint = self.load_voiceprint(cfg)
+        self.talkover.voiceprint = self.voiceprint
         self.turns = Turn(cfg, self.transcriber, self.talkover, self.read, self.show, self.echo_slipped, stop)
         self.whistle = None  # confirms wake words while Whisper is on the CPU (battery)
         if whistle.available():
@@ -100,6 +104,26 @@ class Listener:
         self.room, self.echo = collections.deque(maxlen=FLOOR_SPAN), collections.deque(maxlen=FLOOR_SPAN)
         self.preroll = collections.deque(maxlen=PREROLL)
         self.gate = VoiceGate()
+
+    @staticmethod
+    def load_voiceprint(cfg: whisper.Config) -> voiceprint.Voiceprint | None:
+        """The user's voiceprint, a soft signal (voiceprint.py): on when enrolled, unless config.json says
+        "voiceprint": false. The model loads in the background, so the first check doesn't wait for it."""
+        if not getattr(cfg, "voiceprint", True):
+            log(HANDSFREE_LOG, "voiceprint: off in config.json")
+            return None
+        model = voiceprint.Model()
+        found = voiceprint.Voiceprint.load(model=model)
+        if found is None:
+            log(HANDSFREE_LOG, "voiceprint: not enrolled (handsfree voiceprint enrol): words alone")
+            return None
+        threading.Thread(target=model.warm, daemon=True).start()
+        log(HANDSFREE_LOG, f"voiceprint: on ({', '.join(found.centroids)})")
+        return found
+
+    def print_path(self) -> str:
+        """Which voiceprint the mic is scored against: the phone's mic on a call is a plain mic, as the laptop's raw."""
+        return voiceprint.RAW if self.calling else voiceprint.EC
 
     # --- the loop -----------------------------------------------------------
 
@@ -245,6 +269,7 @@ class Listener:
         # The laptop's canceller is not in that path, so the phone's mic says nothing about it: no echo
         # watching (a loud street restarted it mid-call, 2026-11-15)
         calling = self.calling = in_call()
+        self.talkover.print_path = self.print_path()
         # On a call the phone's own canceller keeps our voice out of its mic: less voice is needed before the words are
         # looked at, so the user cuts in sooner (2026-11-21: "you need to stop sooner"). Not on its loudspeaker in clear
         # sound, or without its canceller: our voice can reach its mic there, and it is judged with care
@@ -396,6 +421,7 @@ class Listener:
             by, woke = "whisper", self.transcriber.run(self.wake.confirm)
         if woke:
             log(HANDSFREE_LOG, f"wake word confirmed by {by} in {time.monotonic() - began:.2f}s")
+            woke = self.sounds_like_user(by)
         if not woke:
             near = f", nearest {self.wake.near:.2f}" if self.wake.near is not None else ""
             log(HANDSFREE_LOG, f"wake candidate rejected ({self.wake.word}{near})")
@@ -403,6 +429,27 @@ class Listener:
         log(HANDSFREE_LOG, f"woke ({self.wake.word})")
         self.turn([], Heard.WOKE, floor)
         return True
+
+    def sounds_like_user(self, by: str) -> bool:
+        """After a wake word was confirmed: a voice unlike the user's must also pass Whisper with no hint of the word.
+        Never a lockout: the user said it clearly enough, it passes; no score, or Whisper failing, passes too."""
+        if not self.voiceprint:
+            return True
+        check = self.voiceprint.check(self.wake.audio, self.print_path(), min_seconds=voiceprint.WAKE_MIN_SECONDS)
+        if check is None:
+            return True
+        log(HANDSFREE_LOG, f"{check.said()}, wake word ({self.voiceprint.took * 1000:.0f} ms)")
+        if not check.unlike or (by == "whisper" and not self.wake.hinted):  # Whisper unhinted already: as strict
+            return True
+        began = time.monotonic()
+        try:
+            again = self.transcriber.run(self.wake.recheck)
+        except Exception as exc:
+            log(HANDSFREE_LOG, f"stricter wake check failed ({exc}): let through")
+            return True
+        log(HANDSFREE_LOG, f"voice unlike the user's: Whisper with no hint {'heard' if again else 'did not hear'} "
+                           f"the word ({time.monotonic() - began:.2f}s)")
+        return bool(again)
 
     # --- one turn -----------------------------------------------------------
 

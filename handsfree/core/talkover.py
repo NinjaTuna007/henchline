@@ -13,6 +13,10 @@ doesn't say (THIN_NEW_WORDS) and a voice nearly as loud as our playback in
 the last PERSIST_SPAN (or, with no echo verdict, after many starts, two of
 them that loud and recent); voice summed across scraps
 never counts toward SUSTAIN's trust or UNSURE_LIMIT.
+
+When the words leave it open (too few to tell, or a thin voice short of the
+words it needs), a voice that sounds like the user's (voiceprint.py) stops the
+clip; the clip's own words always keep it playing, whatever the voiceprint says.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from typing import Callable
 import numpy as np
 
 from sensing import FRAME, RATE
+from voiceprint import EC, Check, Voiceprint
 from voice.state import BY_HANDSFREE, HANDSFREE_LOG, PLAYING as PLAYING_PATH, Playing, log
 
 CHECK_EVERY = 3  # frames between voice checks (90 ms)
@@ -174,6 +179,8 @@ class TalkOver:
     gap: float = GAP
     strict: bool = False  # the laptop busy: more voice before a look, and the words always decide
     log_to: Path = HANDSFREE_LOG
+    voiceprint: Voiceprint | None = None  # whose voice it is, when the words leave it open; None: words alone
+    print_path: str = EC  # which of the user's voiceprints the mic is scored against (raw on a phone call)
 
     def track_onset(self, played_db: float | None) -> None:
         now = self.clock()
@@ -275,16 +282,24 @@ class TalkOver:
         # them from leaked echo, "Thanks for watching"), and a thin voice more of them and a recent loud one
         if echo is False and not why and (self.strict or thin) and not (fresh and (loud or not thin)):
             waiting = True
+        # Never against the clip's own words, a busy laptop (its canceller leaks whole sentences, unmeasured) or an
+        # attempt already judged our echo: there the audio holds our voice and the words alone decide
+        if waiting and echo is not True and not self.strict and not over.echoes and self.voiceprint:
+            check = self.voice_check(over, "words unsure")
+            if check and check.user:
+                waiting, why = False, f", too few words to tell but the user's voice ({check.said()})"
         if waiting:
             over.next_check = over.voiced + (STRICT_RECHECK if self.strict else RECHECK)
             return Verdict.WAITING
-        if echo is None and over.part < UNSURE_LIMIT:
+        if echo is None and over.part < UNSURE_LIMIT and not why:
             why = ", too few words to tell but a voice as loud as ours, again and again"
         log(self.log_to, f"talking over: {over.voiced:.1f}s of voice in {over.speaking_for():.1f}s"
                            f"{self.starts_said(over, now)}: "
                            + ("the clip's own words, our echo: kept playing" if echo else f"stopping the clip{why}")
                            + f" (first: {over.first}{', on ' + self.out if self.out else ''})")
         if echo:  # the attempt goes on: the user may still be talking under our echo
+            if self.voiceprint:  # only logged, to tune by: what our echo scores (the clip plays on, so no delay)
+                self.voice_check(over, "the clip's own words")
             over.echoes += 1
             over.next_check = over.voiced + (max(ECHO_RECHECK, STRICT_RECHECK) if self.strict else ECHO_RECHECK)
             over.user_from = max(0, len(over.frames) - round(LATEST * RATE / FRAME))
@@ -310,12 +325,26 @@ class TalkOver:
         n = over.recent_starts(now)
         return (f", {n} starts" if n > 1 else "") + (", one as loud as ours" if over.loud(now) else "")
 
+    @staticmethod
+    def looked_at(over: Overlap) -> np.ndarray:
+        """The audio a look judges: all of it at first, only the newest LATEST seconds after an echo verdict."""
+        return np.concatenate(over.frames[-round(LATEST * RATE / FRAME):] if over.echoes else over.frames)
+
     def heard_text(self, over: Overlap) -> str:
-        """What was said over the clip: all of it at first, only the newest LATEST seconds after an echo verdict."""
+        """What was said over the clip."""
         if not over.clip_text:
             return ""
-        frames = over.frames[-round(LATEST * RATE / FRAME):] if over.echoes else over.frames
-        return self.quick_text(np.concatenate(frames))
+        return self.quick_text(self.looked_at(over))
+
+    def voice_check(self, over: Overlap, why: str) -> Check | None:
+        """The voiceprint of what the words were judged on, logged in numbers; None: no opinion (fail open)."""
+        try:
+            check = self.voiceprint.check(self.looked_at(over), self.print_path)
+        except Exception:  # check() doesn't raise; a stand-in might
+            return None
+        if check:
+            log(self.log_to, f"{check.said()}, talking over ({why}, {self.voiceprint.took * 1000:.0f} ms)")
+        return check
 
     @staticmethod
     def echo_of_text(text: str, clip_text: str) -> bool | None:

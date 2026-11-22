@@ -348,6 +348,8 @@ class Wake:
         self.due = 0  # 30 ms frames still to take in before the nominated words are checked
         self.word = ""  # the word Whisper confirmed last
         self.near: float | None = None  # how near the nearest heard word came to an unhinted name
+        self.audio = np.zeros(0, dtype=np.float32)  # the last checked two seconds, for a stricter second look
+        self.hinted = False  # whether that check told the transcriber which word to expect
 
     @classmethod
     def available(cls) -> Wake | None:
@@ -389,7 +391,8 @@ class Wake:
                 detector.armed, detector.run = True, 0
         self.word = "/".join(words)
         hints = " ".join(d.word for d in self.detectors if d.hint and d.word in words) or None
-        audio = np.concatenate(self.ring).astype(np.float32) / 32768
+        audio = self.audio = np.concatenate(self.ring).astype(np.float32) / 32768
+        self.hinted = bool(hints)
         text = hear(audio, hints)
         close = {d.word for d in self.detectors if not d.hint}  # unhinted names are spelled freely; "Claude" exact
         heard = next((word for word in words
@@ -398,6 +401,15 @@ class Wake:
         # A number, never the words: how near a rejected unhinted name came, to tune CLOSE from the room
         self.near = max((closeness(word, text) for word in words if word in close), default=None)
         return bool(heard)
+
+    def recheck(self, whisper) -> bool:
+        """A stricter second look at the audio confirm_by() last accepted: Whisper with no hint which word to expect
+        (told to expect "Claude", it hears it in far more). For a voice that didn't sound like the user's."""
+        text = " ".join(seg.text for seg in whisper.transcribe(self.audio, language="en", beam_size=1,
+                                                                vad_filter=False)[0])
+        close = {d.word for d in self.detectors if not d.hint}
+        word = self.word
+        return bool(said(word, text) if word in close else re.search(rf"\b{word}\b", text, re.I))
 
 
 class EarbudButton(threading.Thread):

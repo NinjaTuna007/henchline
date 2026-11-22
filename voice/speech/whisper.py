@@ -34,6 +34,8 @@ class Config:
     early_end: bool = True
     hotwords: list[str] = field(default_factory=lambda: list(DEFAULT_HOTWORDS))
     chime: bool = True
+    # Hands-free leans on the user's voiceprint when enrolled (handsfree/core/voiceprint.py); false: words alone
+    voiceprint: bool = True
     chime_sound: str = "/usr/share/sounds/freedesktop/stereo/complete.oga"
     keys: list[str] = field(default_factory=lambda: ["F23"])  # the laptop Copilot key
     chords: list[list[str]] = field(default_factory=lambda: [["RIGHTCTRL", "RIGHTSHIFT"]])

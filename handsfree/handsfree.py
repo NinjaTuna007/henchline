@@ -5,6 +5,9 @@
     handsfree switch AGENT [WORKSPACE] hand the user over to that agent, announced
     handsfree listen [SECONDS]         keep listening that long (default 180)
     handsfree close                    stop listening until the wake word
+    handsfree voiceprint enrol | status
+                                       build the user's voiceprint from their private recordings (a soft
+                                       signal for talking over a clip and for wake words; see voiceprint.py)
     handsfree hangup                   end the phone call (call/), once talkback has finished speaking
     handsfree ring [--done] [--now] [--urgent] [--no-wait] [--check] [--as SESSION] [WHY]
                                        ring the user's phone (Henchline full-screen, else an ntfy notification
@@ -750,6 +753,9 @@ def main() -> int:
     if command == "close":
         CLOSE.touch()
         return 0
+    if command == "voiceprint":
+        import voiceprint
+        return voiceprint.main(args)
     active = subprocess.run(["systemctl", "--user", "is-active", UNIT], capture_output=True, text=True).stdout
     print(f"hands-free {'on' if active.strip() == 'active' else 'off'}")
     return 0
