@@ -2767,9 +2767,12 @@ class MainActivity : Activity() {
             text = "Each agent its own, one voice for all, or surprise me."
             textSize = 13f; setTextColor(getColor(R.color.muted)); setPadding(dp(20), 0, dp(20), dp(10))
         })
-        list.addView(line("Speak on the phone", TextView(this).apply {
-            text = if (PhoneVoice.ready(this@MainActivity) && PhoneVoice.enabled(this@MainActivity)) "On" else "Off"
-        }) { PhoneVoiceSheet(this).show() })
+        val voiceValue = TextView(this)
+        fun showVoice() {
+            voiceValue.text = if (PhoneVoice.ready(this@MainActivity) && PhoneVoice.enabled(this@MainActivity)) "On" else "Off"
+        }
+        showVoice()
+        list.addView(line("Speak on the phone", voiceValue) { PhoneVoiceSheet(this) { runOnUiThread { showVoice() } }.show() })
         list.addView(TextView(this).apply {
             text = "On calls, this phone makes the agents' voices itself: a weak signal cuts no words off."
             textSize = 13f; setTextColor(getColor(R.color.muted)); setPadding(dp(20), 0, dp(20), dp(10))

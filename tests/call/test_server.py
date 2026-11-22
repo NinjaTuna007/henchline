@@ -194,3 +194,14 @@ class ClosedHow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SilentWhilePhoneSpeaks(unittest.TestCase):
+    """The speaker monitor's idle silence isn't sent while the phone speaks talkback itself (2026-11-22 stall)."""
+
+    def test_zero_chunks_skipped_only_while_the_phone_renders(self):
+        from call import server
+        quiet, sound = bytes(640), b"\x00\x01" * 320
+        self.assertTrue(server.silent_while_phone_speaks(quiet, True))
+        self.assertFalse(server.silent_while_phone_speaks(sound, True))
+        self.assertFalse(server.silent_while_phone_speaks(quiet, False))

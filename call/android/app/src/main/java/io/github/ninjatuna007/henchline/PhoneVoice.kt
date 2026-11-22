@@ -258,10 +258,17 @@ object PhoneVoice {
             val renderer = Thread({
                 try { for (n in 0 until pieces.length()) {
                     if (over.get() || stopped.contains(id) || !running) break
-                    val samples = engine.generate(pieces.getString(n), sid, 1.0f).samples
+                    val text = pieces.getString(n)
+                    log("render $id #$n start (${text.length} chars)")
+                    val began = System.currentTimeMillis()
+                    val samples = engine.generate(text, sid, 1.0f).samples
+                    log("render $id #$n done: ${samples.size} samples in ${System.currentTimeMillis() - began} ms")
                     val trimmed = trim(samples, lead = n in joined, tail = (n + 1) in joined)
+                    val offered = System.currentTimeMillis()
                     while (!over.get() && running && !ready.offer(n to trimmed, 100, TimeUnit.MILLISECONDS)) Unit
+                    log("$id #$n ready, waited ${System.currentTimeMillis() - offered} ms for room")
                 } } catch (_: InterruptedException) {
+                    log("render $id interrupted (${if (over.get()) "clip over" else "not over"})")
                 } catch (e: Throwable) {  // a thread's uncaught error would end the whole app, the call with it
                     android.util.Log.w("Henchline", "phone voice: rendering failed: $e")
                 }
@@ -282,23 +289,38 @@ object PhoneVoice {
                     val gap = if (n == 0) 0f else if (n in joined) JOIN else PAUSE
                     val audio = pcm(next.second, gap)
                     ack(id, piece = n)
+                    log("$id #$n playing, queued=${queued()}")
                     var at = 0
+                    var told = false
                     while (at < audio.size) {
-                        if (stopped.remove(id)) return
-                        while (queued() > AHEAD_CHUNKS) { if (stopped.remove(id)) return; Thread.sleep(10) }
+                        if (stopped.remove(id)) { log("$id stopped at #$n"); return }
+                        val blocked = System.currentTimeMillis()
+                        while (queued() > AHEAD_CHUNKS) {
+                            if (stopped.remove(id)) { log("$id stopped at #$n"); return }
+                            if (!told && System.currentTimeMillis() - blocked > 500) {
+                                told = true
+                                log("$id #$n blocked at speaker, queued=${queued()}")
+                            }
+                            Thread.sleep(10)
+                        }
                         val end = minOf(audio.size, at + CHUNK * 2)
                         enqueue(audio.copyOfRange(at, end))
                         at = end
                     }
+                    log("$id #$n queued ${audio.size / (CHUNK * 2)} chunks")
                 }
                 while (queued() > 0 && !stopped.contains(id)) Thread.sleep(20)  // done when it has been heard
                 ack(id, done = true)
+                log("$id done")
             } finally {
                 over.set(true)
                 renderer.interrupt()
             }
         }
     }
+
+    /** One line per step of a clip, so a stall shows where it happened (adb logcat -s Henchline). */
+    private fun log(line: String) { try { android.util.Log.i("Henchline", "phone voice: $line") } catch (_: RuntimeException) {} }
 
     // --- shared with the laptop's rules (tests/fixtures/phone-voice-trim.json) ---------------------------------
 

@@ -10,7 +10,7 @@ import android.widget.TextView
 
 /** "Speak on the phone": the voice model's download (from the laptop, checked file by file), the switch, and room to
  *  delete it again. While it is off or missing, calls stream the laptop's audio as always. */
-class PhoneVoiceSheet(activity: Activity) : BottomPanel(activity) {
+class PhoneVoiceSheet(activity: Activity, private val changed: () -> Unit = {}) : BottomPanel(activity) {
     @Volatile private var download: PhoneVoice.Download? = null
     private var status: TextView? = null
     private var body: LinearLayout? = null
@@ -26,6 +26,7 @@ class PhoneVoiceSheet(activity: Activity) : BottomPanel(activity) {
     }
 
     private fun draw() {
+        changed()  // the settings row says On or Off as this sheet now stands (it showed Off after a switch on)
         val content = body ?: return
         content.removeAllViews()
         val ready = PhoneVoice.ready(activity)
@@ -49,7 +50,7 @@ class PhoneVoiceSheet(activity: Activity) : BottomPanel(activity) {
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(Switch(activity).apply {
                 isChecked = ready && PhoneVoice.enabled(activity); isEnabled = ready
-                setOnCheckedChangeListener { _, on -> PhoneVoice.setEnabled(activity, on) }
+                setOnCheckedChangeListener { _, on -> PhoneVoice.setEnabled(activity, on); changed() }
             })
         }, wide(8))
         content.addView(TextView(activity).apply {

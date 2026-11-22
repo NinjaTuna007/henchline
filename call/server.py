@@ -179,6 +179,12 @@ class Devices:
                 pactl("unload-module", module)
 
 
+
+def silent_while_phone_speaks(data: bytes, phone_renders: bool) -> bool:
+    """A chunk of the speaker monitor that is all zeros, while the phone speaks talkback itself: not sent, so the
+    phone's queue isn't kept full of the laptop's silence (2026-11-22: the phone voice stalled after one piece)."""
+    return phone_renders and not data.strip(b"\0")
+
 class Ear:
     """What the phone says it played, every 2 s: the laptop cannot hear the phone, so a clip lost on the
     way (suspended audio, dropped chunks, the page in the background) only shows up here."""
@@ -2448,10 +2454,15 @@ async def call(request: web.Request) -> web.WebSocketResponse:
         LIVE.append(ws)
 
         async def to_phone() -> None:
+            renders, asked = False, 0.0  # whether the phone speaks talkback: read at most twice a second
             while not ws.closed:
                 data = await speaker.stdout.read(CHUNK)
                 if not data:
                     return
+                if time.monotonic() - asked > 0.5:
+                    renders, asked = phonevoice.phone_renders(), time.monotonic()
+                if silent_while_phone_speaks(data, renders):
+                    continue  # the idle monitor: it would only queue silence ahead of the phone's own voice
                 await ws.send_bytes(data)
 
         async def watch_proc(name: str, proc) -> None:

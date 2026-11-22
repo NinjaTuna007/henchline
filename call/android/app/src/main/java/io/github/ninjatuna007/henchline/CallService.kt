@@ -146,6 +146,9 @@ class CallService : Service() {
     val callStartedAt get() = startedAt  // the call bar's timer counts from here, whichever screen shows it
     @Volatile var lastSession = ""  // the chat a typed line was last sent in (its ticks are kept there)
     private val heard = LinkedBlockingDeque<ByteArray>()  // the agents' voices, waiting to be played
+    // The phone's own voice (PhoneVoice), queued apart and played first: PhoneVoice paces itself on this queue alone.
+    // Sharing `heard` stalled it after one piece, the laptop's idle monitor keeping that queue full (2026-11-22)
+    private val spoken = LinkedBlockingDeque<ByteArray>()
     private val audio by lazy { getSystemService(AudioManager::class.java) }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -183,7 +186,7 @@ class CallService : Service() {
                 .apply { setReferenceCounted(false); acquire() }
         } catch (e: Exception) { null }
         if (PhoneVoice.enabled(this) && PhoneVoice.ready(this)) {
-            phoneVoice = PhoneVoice.Speaker(this, enqueue = { heard.offer(it) }, queued = { heard.size },
+            phoneVoice = PhoneVoice.Speaker(this, enqueue = { spoken.offer(it) }, queued = { spoken.size },
                 send = { socket?.send(it) })
             Thread { PhoneVoice.load(this) }.start()  // about 2.4 s: ready before the first reply
         }
@@ -283,6 +286,7 @@ class CallService : Service() {
         recorder?.interrupt()
         player?.interrupt()
         heard.clear()
+        spoken.clear()
         synchronized(audioLock) {  // after any sound switch under way, so it can't set call mode again after this
             focus?.let { audio.abandonAudioFocusRequest(it) }
             if (Build.VERSION.SDK_INT >= 31) audio.clearCommunicationDevice()
@@ -559,7 +563,9 @@ class CallService : Service() {
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 if (me != link) return
-                heard.offer(bytes.toByteArray())
+                val chunk = bytes.toByteArray()
+                if (spoken.isNotEmpty() && silent(chunk)) return  // the laptop's idle stream while the phone is speaking itself (after a fallback the laptop's pauses are kept)
+                heard.offer(chunk)
                 got.incrementAndGet()
                 while (heard.size > MAX_BEHIND) { heard.poll(); dropped.incrementAndGet() }  // over a second behind: drop the oldest
             }
@@ -667,7 +673,7 @@ class CallService : Service() {
                             reported = System.currentTimeMillis()
                             report(track)
                         }
-                        val chunk = heard.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                        val chunk = nextChunk() ?: continue
                         if (loud(chunk)) loudMs.addAndGet(chunk.size / 2 * 1000L / SPEAKER_RATE)
                         val written = track.write(chunk, 0, chunk.size)
                         if (written < 0) {
@@ -704,8 +710,9 @@ class CallService : Service() {
      *  own fifth of a second) is dropped, so a clip they cut stops at once here too (2026-11-21). */
     private fun flushSpeaker() {
         phoneVoice?.stopAll()  // the user is talking: a clip the phone speaks stops as the laptop's would
-        val dropped = heard.size
+        val dropped = heard.size + spoken.size
         heard.clear()
+        spoken.clear()
         playing?.let { track ->
             try {
                 if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
@@ -724,6 +731,19 @@ class CallService : Service() {
     private val got = java.util.concurrent.atomic.AtomicInteger()
     private val dropped = java.util.concurrent.atomic.AtomicInteger()
     private val loudMs = java.util.concurrent.atomic.AtomicLong()
+
+    /** All zeros: a PipeWire monitor with nothing playing. */
+    private fun silent(chunk: ByteArray): Boolean = chunk.all { it.toInt() == 0 }
+
+    /** What the speaker plays next: the phone's own voice first, and for each of its chunks one quiet chunk of
+     *  the laptop's goes (its idle monitor would otherwise build up behind); the laptop's loud ones are kept. */
+    private fun nextChunk(): ByteArray? {
+        spoken.poll()?.let { mine ->
+            heard.peek()?.let { theirs -> if (!loud(theirs) && heard.removeFirstOccurrence(theirs)) dropped.incrementAndGet() }
+            return mine
+        }
+        return heard.poll(if (phoneVoice != null) 20L else 200L, TimeUnit.MILLISECONDS)
+    }
 
     private fun loud(chunk: ByteArray): Boolean {
         var sum = 0L
