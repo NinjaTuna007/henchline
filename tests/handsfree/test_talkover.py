@@ -111,6 +111,172 @@ class EchoKeepsTheAttempt(unittest.TestCase):
         self.assertEqual(f.voice_for(1.0), [Verdict.USER])
 
 
+class Scraps:
+    """A clip with a voice in scraps, as the canceller leaves double-talk: (start, seconds of voice, margin in dB)
+    per scrap, one positive voice check every 90 ms, the first of each scrap a full check (strong) at that margin."""
+
+    def __init__(self, heard: list[str], scraps: list[tuple[float, float, float | None]], strict: bool = False):
+        self.f = Fixture(heard)
+        self.f.over.strict = strict
+        if strict:
+            self.f.over.new_words_needed = talkover.CAREFUL_NEW_WORDS
+        self.scraps = scraps
+
+    def play(self, until: float) -> tuple[Verdict | None, float, list[Verdict]]:
+        """(the stopping verdict or None, when, every verdict that wasn't WAITING)."""
+        checks = {}
+        for start, seconds, margin in self.scraps:
+            for k in range(max(1, round(seconds / talkover.STEP))):
+                checks[round((start + k * talkover.STEP) / 0.03)] = (k == 0, margin)
+        verdicts = []
+        for i in range(round(until / 0.03)):
+            self.f.now[0] = i * 0.03
+            strong, margin = checks.get(i, (False, None))
+            v = self.f.over.feed(FRAME, i in checks, [FRAME], "a voice", CLIP, clip="clip-1", strong=strong,
+                                 margin=margin if strong else None)
+            if v is not Verdict.WAITING:
+                verdicts.append(v)
+            if v is Verdict.USER:
+                return v, self.f.now[0], verdicts
+        return None, self.f.now[0], verdicts
+
+
+# 2026-11-22 20:29, a 25 s clip on the laptop speakers: four starts, 13.0-20.6 s in, each "then quiet"
+BULLDOZED = [(13.0, 0.1, -14.0), (14.6, 0.2, -8.0), (18.0, 0.3, -3.0), (20.6, 0.1, 7.0)]
+
+
+class TalkingOverInScraps(unittest.TestCase):
+    def test_the_2029_talk_over_stops_at_its_first_loud_start(self):
+        # Looked at from the second start; stopped at the third, 3 dB under our playback, saying words we don't
+        verdict, at, _ = Scraps(["hey stop please listen to me"], BULLDOZED).play(25.0)
+        self.assertIs(verdict, Verdict.USER)
+        self.assertAlmostEqual(at, 18.0, delta=0.1)  # was: never (the clip played to its end)
+
+    def test_the_2029_talk_over_stops_even_when_the_words_stay_too_few(self):
+        # Whisper makes nothing of the chopped voice: four starts in 8 s, one as loud as our playback, stop anyway
+        verdict, at, _ = Scraps(["uh"], BULLDOZED).play(25.0)
+        self.assertIs(verdict, Verdict.USER)
+        self.assertAlmostEqual(at, 20.6, delta=0.1)
+
+    def test_one_loud_start_alone_still_waits_for_enough_voice(self):
+        # At 100% volume our echo came within 6 dB too: loudness alone never asks Whisper about 0.3 s of audio
+        f = Scraps(["train lift"], [(5.0, 0.3, -3.0)])
+        verdict, _, _ = f.play(10.0)
+        self.assertIsNone(verdict)
+        self.assertEqual(f.f.looks, 0)
+
+    def test_the_turn_keeps_every_scrap(self):
+        f = Scraps(["hey stop please listen to me"], BULLDOZED)
+        f.play(25.0)
+        self.assertGreater(len(f.f.over.taken.frames), round(1.5 / 0.03))  # the first scrap and the quiet after
+
+
+class EchoInScrapsKeepsPlaying(unittest.TestCase):
+    """Our own echo in scraps (the memory notes: -33 dB median, -20 at worst healthy, -8 and -10 once wary)."""
+
+    def test_echo_scraps_saying_the_clips_words(self):
+        scraps = [(3.0, 0.2, -14.0), (4.6, 0.3, -10.0), (6.5, 0.2, -8.0), (8.0, 0.3, -12.0), (9.9, 0.2, -10.0)]
+        verdict, _, verdicts = Scraps(["the weather today is sunny"], scraps).play(15.0)
+        self.assertIsNone(verdict)
+        self.assertIn(Verdict.ECHO, verdicts)
+
+    def test_echo_scraps_too_mangled_for_words_never_stop_it(self):
+        # Many starts but none as loud as our voice: too few words is never enough
+        scraps = [(3.0 + 1.5 * k, 0.2, -12.0 - k % 3) for k in range(8)]
+        verdict, _, verdicts = Scraps(["uh"], scraps).play(16.0)
+        self.assertIsNone(verdict)
+        self.assertEqual(verdicts, [])
+
+    def test_scattered_scraps_far_apart_are_never_looked_at(self):
+        scraps = [(3.0, 0.1, -15.0), (9.0, 0.1, -14.0), (15.0, 0.1, -15.0)]
+        f = Scraps(["hey stop please"], scraps)
+        verdict, _, _ = f.play(20.0)
+        self.assertIsNone(verdict)
+        self.assertEqual(f.f.looks, 0)
+
+    def test_a_loud_echo_burst_saying_our_words(self):
+        verdict, _, verdicts = Scraps(["sunny with a light breeze"], [(4.0, 1.0, -8.0), (5.5, 0.5, -6.0)]).play(9.0)
+        self.assertIsNone(verdict)
+        self.assertIn(Verdict.ECHO, verdicts)
+
+    # The reviewer's repro: wary echo below LOUD_MARGIN that passes the full gate, 0.2 s every 3 s, joined by REJOIN
+    ECHO_EVERY_3S = [(3.0 * k, 0.2, -12.0) for k in range(1, 15)]
+
+    def test_far_apart_echo_scraps_too_mangled_for_words_never_add_up_to_a_stop(self):
+        verdict, _, _ = Scraps(["uh"], self.ECHO_EVERY_3S).play(46.0)
+        self.assertIsNone(verdict)
+
+    def test_far_apart_echo_scraps_whisper_writes_words_for_never_stop_it(self):
+        verdict, _, _ = Scraps(["thanks for watching"], self.ECHO_EVERY_3S).play(46.0)
+        self.assertIsNone(verdict)
+
+    def test_one_loud_scrap_long_ago_doesnt_make_later_quiet_ones_persistent(self):
+        scraps = [(3.0, 0.2, -3.0)] + [(3.0 + 2.5 * k, 0.2, -13.0) for k in range(1, 9)]
+        for heard in (["uh"], ["you"]):
+            verdict, _, _ = Scraps(heard, scraps).play(28.0)
+            self.assertIsNone(verdict, heard)
+
+    def test_loud_echo_bursts_whisper_invents_words_for_never_stop_it(self):
+        # Speakers at 100%: our echo within 6 dB of the playback, in scraps; Whisper's inventions are short
+        scraps = [(4.0, 0.2, -4.0), (5.8, 0.2, -3.0), (7.5, 0.2, -5.0)]
+        for heard in (["train lift"], ["thanks for watching"]):
+            verdict, _, _ = Scraps(heard, scraps).play(10.0)
+            self.assertIsNone(verdict, heard)
+
+    def test_a_scrap_on_the_next_clip_starts_afresh(self):
+        f = Scraps(["hey stop please"], [(3.0, 0.1, -14.0)])
+        f.play(3.5)
+        f.f.now[0] = 3.6
+        f.f.over.feed(FRAME, False, [], "a voice", "another clip entirely", clip="clip-2")
+        self.assertIsNone(f.f.over.over)
+        self.assertIsNone(f.f.over.parked)
+
+
+class BusyLaptop(unittest.TestCase):
+    """Load over the limit: talking over is still judged, strictly, instead of not at all."""
+
+    def test_a_voice_that_keeps_talking_with_its_own_words_still_stops_it(self):
+        f = Fixture(["hang on stop talking please"])
+        f.over.strict, f.over.new_words_needed = True, talkover.CAREFUL_NEW_WORDS
+        verdicts = f.voice_for(talkover.STRICT_SUSTAIN + 0.3)
+        self.assertEqual(verdicts, [Verdict.USER])
+        self.assertGreaterEqual(f.over.taken.voiced, talkover.STRICT_SUSTAIN)
+
+    def test_scraps_and_length_alone_never_stop_it(self):
+        verdict, _, _ = Scraps(["uh"], BULLDOZED, strict=True).play(25.0)
+        self.assertIsNone(verdict)
+        f = Fixture(["um"])
+        f.over.strict = True
+        self.assertNotIn(Verdict.USER, f.voice_for(4.0))
+
+    def test_two_words_the_clip_doesnt_say_are_not_enough(self):
+        f = Fixture(["thanks watching"])
+        f.over.strict, f.over.new_words_needed = True, talkover.CAREFUL_NEW_WORDS
+        self.assertNotIn(Verdict.USER, f.voice_for(4.0))
+
+    def test_looks_are_further_apart(self):
+        looks = {}
+        for strict in (False, True):
+            f = Fixture(["the weather today is sunny"])
+            f.over.strict = strict
+            f.voice_for(4.0)
+            looks[strict] = f.looks
+        self.assertLessEqual(looks[True] * 1.5, looks[False])
+
+    def test_our_echo_still_keeps_playing(self):
+        f = Fixture(["the weather today is sunny", "sunny with a light breeze from the west"])
+        f.over.strict = True
+        self.assertNotIn(Verdict.USER, f.voice_for(6.0))
+
+    def test_the_log_says_it_is_judged_strictly(self):
+        import sensing
+        loads = [20.0]
+        load = sensing.Load(cores=22, loadavg=lambda: (loads[0], 0, 0))
+        with mock.patch.object(sensing, "log") as said:
+            self.assertTrue(load.high())
+        self.assertIn("judged strictly", said.call_args[0][1])
+
+
 class Words(unittest.TestCase):
     def test_new_words(self):
         self.assertEqual(talkover.new_words("the weather is sunny", CLIP), 0)
@@ -124,7 +290,7 @@ class Words(unittest.TestCase):
 
 class Wary(unittest.TestCase):
     def fake(self, until: float = 0.0, calling: bool = False):
-        return SimpleNamespace(restart_due=False, wary_until=until, calling=calling,
+        return SimpleNamespace(restart_due=False, wary_until=until, calling=calling, load=SimpleNamespace(busy=False),
                                echo_watch=SimpleNamespace(may_restart=lambda: False))
 
     def test_never_on_a_call(self):

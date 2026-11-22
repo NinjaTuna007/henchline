@@ -63,7 +63,8 @@ def replay(folder: Path, take: dict, transcriber: whisper.Transcriber, sustain: 
                               clock[0] - take["clip_start"] > BARGE_GRACE, False)
         if not over.over:
             echo_floor.append(db)
-        verdict = over.feed(frame, speech or gate.still_speaking(), list(preroll), "replay", take["text"])
+        verdict = over.feed(frame, speech or gate.still_speaking(), list(preroll), "replay", take["text"],
+                            strong=speech, margin=gate.margin if speech else None)
         if verdict is Verdict.ECHO:
             echoes += 1
         elif verdict is Verdict.USER:

@@ -221,7 +221,9 @@ class Load:
     """Is the laptop too busy for the canceller: 1-minute load over LIMIT, read at most once a second.
 
     At load 20-32 (22 cores) the canceller let whole sentences of ours through, with dozens of xruns (2026-11-21);
-    a restart can't help while it lasts, so echo is not judged: only the wake word or the earbud button stops a clip.
+    a restart can't help while it lasts, so talking over is judged strictly (talkover.py STRICT_SUSTAIN, three words
+    the clip doesn't say) and the wake word stops a clip as well; not judging it at all left the user unable to stop
+    a clip by talking (2026-11-22).
     """
 
     SHARE = 0.55  # of the cores: about 12 on this 22-core laptop
@@ -242,9 +244,10 @@ class Load:
             busy = self.last > self.limit
             if busy != self.busy:
                 self.busy = busy
-                log(HANDSFREE_LOG, f"laptop busy (load {self.last:.1f} over {self.limit:.0f}): echo not judged, "
-                                   "only the wake word or the button stops a clip" if busy else
-                                   f"load back to {self.last:.1f}: talking over clips judged again")
+                log(HANDSFREE_LOG, f"laptop busy (load {self.last:.1f} over {self.limit:.0f}): talking over judged "
+                                   "strictly (1 s of voice, 3 words the clip doesn't say), the wake word also stops "
+                                   "a clip"
+                                   if busy else f"load back to {self.last:.1f}: talking over judged as usual")
         return self.busy
 
 

@@ -182,7 +182,7 @@ class Listener:
         if self.calling:  # the phone's mic: says nothing about the laptop's canceller
             log(HANDSFREE_LOG, f"{why} (on a call: not stricter)")
             return
-        self.restart_due |= self.echo_watch.may_restart()
+        self.restart_due |= self.echo_watch.may_restart() and not self.load.busy  # busy: a fresh one breaks too
         now = time.monotonic()
         if now < self.wary_until:
             log(HANDSFREE_LOG, f"{why} (already stricter, {self.wary_until - now:.0f}s left)")
@@ -250,8 +250,12 @@ class Listener:
         # sound, or without its canceller: our voice can reach its mic there, and it is judged with care
         careful = not calling or self.call_sound_leaks()
         self.talkover.sustain = SUSTAIN if careful else CALL_SUSTAIN
-        self.talkover.new_words_needed = CAREFUL_NEW_WORDS if calling and careful else NEW_WORDS
-        busy_laptop = not calling and self.load.high()  # echo not judged: a restart can't help while it lasts
+        # Laptop busy: its canceller leaks more and a restart can't help while it lasts, so talking over is judged
+        # strictly (more voice, three words the clip doesn't say, never length alone) and the wake word also stops a
+        # clip. Not judged at all, the user couldn't stop a clip by talking (2026-11-22)
+        busy_laptop = not calling and self.load.high()
+        self.talkover.strict = busy_laptop
+        self.talkover.new_words_needed = CAREFUL_NEW_WORDS if (calling and careful) or busy_laptop else NEW_WORDS
         self.tell_busy(playing, busy_laptop, calling)
         if self.play_started and not playing and not calling:
             if busy_laptop:
@@ -283,10 +287,12 @@ class Listener:
         if playing and not calling and not busy_laptop and time.monotonic() - self.play_started > BARGE_GRACE:
             self.echo_watch.add(max(self.gate.levels), self.playback.loudest())
         unknown = self.output.on_speakers() and self.playback.loudest() is None
-        # Our own notice, playback level unknown, or the laptop too busy for the canceller: only the wake word
-        if playing and (self.talkover.notice_playing() or unknown or busy_laptop):
+        # Our own notice, or playback level unknown: only the wake word
+        if playing and (self.talkover.notice_playing() or unknown):
             history.append(db)
             return self.woke(samples, turn_floor)
+        if playing and busy_laptop and self.woke(samples, turn_floor):  # busy: the wake word as well as talking over
+            return True
         speech = self.talking(frame, db, floor, playing)
         if playing or self.talkover.over:
             return self.talking_over(frame, speech, turn_floor, history, db)
@@ -298,11 +304,11 @@ class Listener:
         return True
 
     def tell_busy(self, playing: bool, busy_laptop: bool, calling: bool) -> None:
-        """Once a busy spell, over a clip and never on a call: why talking over it doesn't work now (said after the
+        """Once a busy spell, over a clip and never on a call: why talking over it is slower now (said after the
         clip it began in)."""
         if playing and busy_laptop and not self.busy_told:
             self.busy_told = True
-            routing.say("The laptop's busy, so say the wake word to interrupt me.")
+            routing.say("The laptop's busy, so talking over me takes a little longer. The wake word works at once.")
         elif not busy_laptop and not calling:
             self.busy_told = False
 
@@ -336,7 +342,8 @@ class Listener:
         playing = self.talkover.clip()
         self.talkover.out = self.output_now()
         verdict = self.talkover.feed(frame, speech or self.gate.still_speaking(), list(self.preroll), how,
-                                     playing.text if playing else "", playing.clip if playing else "")
+                                     playing.text if playing else "", playing.clip if playing else "",
+                                     strong=speech, margin=self.gate.margin if speech else None)
         if verdict is Verdict.ECHO:
             self.echo_slipped("talking over was the clip's own words")
             return False
@@ -360,7 +367,7 @@ class Listener:
         margin = self.gate.margin
         if not playing or calling or margin is None or self.gate.checked:  # no check over a clip ran on this frame
             return speech
-        near_miss = not speech and not in_call() and self.echo_watch.near_miss(margin)
+        near_miss = not speech and not in_call() and not self.load.busy and self.echo_watch.near_miss(margin)
         self.restart_due |= near_miss
         # In numbers (never audio), so a talk-over, or a false one, can be explained
         self.last_check = (f"mic {margin + played:.0f} dB, playing {played:.0f} dB, floor {floor:.0f} dB, "
