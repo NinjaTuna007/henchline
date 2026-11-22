@@ -28,7 +28,7 @@ from aiohttp import web
 
 from call import auth
 from call.auth import ApiError, SignedRequest
-from call.canonical import b64url, pairing_bytes, unb64url
+from call.canonical import b64url, pairing_bytes, rfc3339, unb64url
 from call.host_config import HostConfig
 from call.host_store import Device, HostStore
 
@@ -417,7 +417,7 @@ async def send_message(request: web.Request, api: Api, signed_request: SignedReq
     got, why = await asyncio.get_running_loop().run_in_executor(None, api.host.deliver, text, session_id)
     now = time.time()
     event = {"client_message_id": client_message_id, "state": "delivered" if got else "failed",
-             "content": {"type": "text", "text": text}, "created_at": utc(now),
+             "content": {"type": "text", "text": text}, "created_at": rfc3339(now),
              **({"delivered_to": got} if got else {"note": why})}
     event_id = await asyncio.get_running_loop().run_in_executor(
         None, lambda: api.store.append_event(session_id, "message", json.dumps(event).encode(), now=now))
@@ -425,8 +425,6 @@ async def send_message(request: web.Request, api: Api, signed_request: SignedReq
                                **event}, status=201 if got else 200)
 
 
-def utc(at: float) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
 
 
 
@@ -447,7 +445,7 @@ def record_call_line(api: Api, chat: dict[str, Any], now: float | None = None) -
             or not isinstance(text, str) or not text.strip()):
         return None
     at = time.time() if now is None else now
-    body = {"from": str(chat.get("from", ""))[:MAX_FROM], "text": text[:MAX_TEXT], "created_at": utc(at)}
+    body = {"from": str(chat.get("from", ""))[:MAX_FROM], "text": text[:MAX_TEXT], "created_at": rfc3339(at)}
     clip = chat.get("clip")
     source = f"clip:{clip}" if isinstance(clip, str) and clip else None
     return api.store.append_event(session, "call_line", json.dumps(body).encode(), now=at, source=source)
@@ -466,7 +464,7 @@ def ingest(api: Api, now: float | None = None) -> int:
                 or not SESSION_ID.fullmatch(session) or not isinstance(at, (int, float)) or isinstance(at, bool)
                 or at < cutoff):
             continue
-        body = {"agent": str(record.get("agent", "")), "text": words, "text_id": tid, "created_at": utc(at)}
+        body = {"agent": str(record.get("agent", "")), "text": words, "text_id": tid, "created_at": rfc3339(at)}
         if api.store.append_event(session, "agent_text", json.dumps(body).encode(), now=float(at),
                                   source=f"text:{tid}") is not None:
             added += 1

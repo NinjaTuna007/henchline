@@ -36,5 +36,43 @@ class DeadWindow(unittest.TestCase):
         self.assertFalse((folder / "2.sock").exists())
 
 
+
+class Answers(unittest.TestCase):
+    """The bridge's answer comes back with the call, as a reason code can branch on (server.py's stop)."""
+
+    def test_the_bridges_words_become_a_reason(self):
+        from voice.delivery import Refusal
+        self.assertIs(Refusal.from_bridge("not working"), Refusal.NOT_WORKING)
+        self.assertIs(Refusal.from_bridge("another chat is selected"), Refusal.OTHER_CHAT_SELECTED)
+        self.assertIs(Refusal.from_bridge("something new"), Refusal.BRIDGE_SAID)
+        self.assertIs(Refusal.from_bridge(""), Refusal.NO_ANSWER)
+
+    def test_a_chat_no_window_has_is_refused_with_why(self):
+        from unittest import mock
+        from voice.delivery import Refusal
+        chat = "12345678-1234-1234-1234-123456789abc"
+        with mock.patch.object(cursor_bridge, "owner_of", return_value="proj"), \
+                mock.patch.object(cursor_bridge, "windows_of", return_value=[]):
+            got = cursor_bridge.ask_window(chat, {"open": chat})
+        self.assertFalse(got)
+        self.assertIs(got.refusal, Refusal.NO_WINDOW)
+        with mock.patch.object(cursor_bridge, "owner_of", return_value=""):
+            self.assertIs(cursor_bridge.ask_window(chat, {"open": chat}).refusal, Refusal.UNKNOWN_CHAT)
+
+    def test_a_stop_on_a_chat_that_just_finished_says_so(self):
+        from unittest import mock
+        from voice.delivery import Delivery, Refusal
+        chat = "12345678-1234-1234-1234-123456789abc"
+        cdp = cursor_bridge.cursor_cdp
+        with mock.patch.object(cursor_bridge, "workspace_of", return_value="ws"), \
+                mock.patch.object(cdp, "available", return_value=True), \
+                mock.patch.object(cdp, "focus_chat", return_value=True), \
+                mock.patch.object(cdp, "chat_status", return_value="idle"), \
+                mock.patch.object(cursor_bridge, "ask_window", return_value=Delivery.done()) as asked:
+            got = cursor_bridge.ask_selected(chat, {"stop": chat})
+        self.assertIs(got.refusal, Refusal.NOT_WORKING)
+        asked.assert_called_once()  # opened, never stopped
+
+
 if __name__ == "__main__":
     unittest.main()

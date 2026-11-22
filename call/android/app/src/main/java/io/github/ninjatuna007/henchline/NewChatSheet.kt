@@ -624,7 +624,7 @@ class ModelPicker(
     }
 }
 
-/** The + in the message box (the Claude app's "Add context"): Camera, Photos, Files, as tiles. */
+/** The + in the message box ("Add context"): Camera, Photos, Files, as tiles. */
 class AddSheet(activity: Activity, private val picked: (String) -> Unit) : BottomPanel(activity) {
     fun show() {
         val sheet = open("Add", "For the agent whose chat this is")

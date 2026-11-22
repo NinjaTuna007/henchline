@@ -25,10 +25,26 @@ class Routes(AioHTTPTestCase):
         app.router.add_get("/chat/minions", server.chat_minions)
         app.router.add_post("/chat/minions/view", server.chat_minion_view)
         app.router.add_post("/chat/minions/decide", server.chat_minion_decide)
+        app.router.add_post("/crew/stop", server.crew_stop)
         return app
 
     def origin(self):
         return {"Origin": f"https://{self.server.host}:{self.server.port}"}
+
+    async def test_a_stop_says_why_cursor_refused_from_the_bridges_own_answer(self):
+        from voice.delivery import Delivery, Refusal
+        from voice.state import Speaker
+        chat = "12345678-1234-1234-1234-123456789abc"
+        editor = Speaker(f"cursor-{chat}", "cursor", "job")
+        notes = {Refusal.NOT_WORKING: "just finished", Refusal.NOT_A_CHAT_ID: "older Henchline bridge",
+                 Refusal.OTHER_CHAT_SELECTED: "Another chat is selected", Refusal.NO_WINDOW: "Couldn't stop it"}
+        for refusal, note in notes.items():
+            with mock.patch.object(server, "recent_speakers", return_value=[editor]), \
+                    mock.patch.object(server.cursor_bridge, "working", return_value=True), \
+                    mock.patch.object(server.cursor_bridge, "ask_selected", return_value=Delivery.refused(refusal)):
+                answer = await self.client.post("/crew/stop", json={"session": editor.session}, headers=self.origin())
+            self.assertEqual(answer.status, 409, refusal)
+            self.assertIn(note, (await answer.json())["note"])
 
     async def test_another_sites_page_is_refused(self):
         answer = await self.client.post("/text", json={"text": "hi", "session": "claude-1"},
@@ -116,7 +132,7 @@ class ToAgent(unittest.TestCase):
                 mock.patch.object(server.routing, "switch_to") as switch, \
                 mock.patch.object(server.routing, "deliver", return_value=True) as deliver:
             self.assertEqual(server.to_agent("hi", "claude-1", server.Heard.TEXTED, False), ("Claude", ""))
-            deliver.assert_called_once_with("hi", server.Heard.TEXTED, to=target, urgent=False)
+            deliver.assert_called_once_with("hi", server.Heard.TEXTED, to=target, urgent=False, sender=None)
             switch.assert_not_called()
 
 

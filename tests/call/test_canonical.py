@@ -110,5 +110,27 @@ class Base64Url(unittest.TestCase):
         self.assertEqual(canonical.unb64url("AQ"), b"\x01")
 
 
+
+class Timestamps(unittest.TestCase):
+    """rfc3339() goes into signed descriptors, pairing codes and events: its exact bytes are pinned here."""
+
+    def test_the_exact_form(self):
+        self.assertEqual(canonical.rfc3339(0), "1970-01-01T00:00:00Z")
+        self.assertEqual(canonical.rfc3339(1795000200), "2026-11-18T11:10:00Z")
+        self.assertEqual(canonical.rfc3339(1795000200.999), "2026-11-18T11:10:00Z")  # fractions dropped, not rounded
+        self.assertEqual(canonical.rfc3339(951782400), "2000-02-29T00:00:00Z")
+
+    def test_now_and_every_caller_spell_it_the_same(self):
+        import datetime as dt
+        from unittest import mock
+        from call import host_config
+        with mock.patch.object(canonical.time, "time", return_value=1795000200.5):
+            self.assertEqual(canonical.rfc3339(), "2026-11-18T11:10:00Z")
+            self.assertEqual(host_config.utc_now(), "2026-11-18T11:10:00Z")
+        at = 1795000200
+        old = dt.datetime.fromtimestamp(at, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # the form it replaced
+        self.assertEqual(canonical.rfc3339(at), old)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,34 +6,63 @@ pause, then Enter), so it reaches Claude, Cursor and Codex alike. A one-off time
 own Enter failed for Cursor (the wake-up call, 2026-11-17: the line sat unsent for an hour).
 
 A reminder can keep the laptop awake until it is delivered (keep_awake): the server then holds a sleep inhibitor.
+
+A due one is claimed (pending → sending) under the lock before it is typed, so a cancel either lands first (and
+nothing is typed) or finds it already on its way; only the claim is then settled or put back for later.
 """
 
 from __future__ import annotations
 
-import fcntl
 import json
 import re
 import secrets
 import time
-from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from voice.state import STATE
+from enum import Enum
+
+from voice.state import STATE, file_lock, write_json
 
 FILE = STATE / "reminders.json"
 LOCK = STATE / "reminders.lock"
 RETRY_FOR = 3600  # seconds a due reminder keeps being tried (the agent not reachable yet), then it is given up
 KEEP = 7 * 86400  # delivered or given-up reminders stay listed this long
+SEND_FOR = 300  # a claim older than this was left by a server that died mid-delivery: due again
 
 
-@contextmanager
+class ReminderState(str, Enum):
+    PENDING = "pending"
+    SENDING = "sending"  # claimed, being typed: no longer cancellable
+    DELIVERED = "delivered"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class Reminder:
+    """A reminder as the call server delivers it (the file and the phone keep the plain JSON)."""
+
+    id: str
+    at: float
+    session: str
+    words: str
+    by: str = ""  # "phone": the user set it (the phone's /later); "agent": `handsfree remind`, an agent or a script
+    sender: str = ""  # the agent that set it ("claude in henchline"), when one did
+
+    @classmethod
+    def of(cls, item: dict) -> Reminder:
+        return cls(str(item["id"]), float(item.get("at", 0)), str(item.get("session", "")),
+                   str(item.get("words", "")), str(item.get("by", "")), str(item.get("sender", "")))
+
+    @property
+    def users(self) -> bool:
+        """Set by the user on the phone: typed as they wrote it, a slash command included. Anything else (an agent,
+        a script, an older record that doesn't say) is never typed as a command."""
+        return self.by == "phone"
+
+
 def _locked():
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK.open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    return file_lock(LOCK)
 
 
 def _read() -> list[dict]:
@@ -41,15 +70,17 @@ def _read() -> list[dict]:
         data = json.loads(FILE.read_text())
     except (OSError, ValueError):
         return []
-    return [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+    return [r for r in data if isinstance(r, dict) and "id" in r] if isinstance(data, list) else []
+
+
+def _open(item: dict) -> bool:
+    """Still to be delivered: pending, or on its way."""
+    return item.get("state") in (ReminderState.PENDING, ReminderState.SENDING)
 
 
 def _write(items: list[dict]) -> None:
     now = time.time()
-    items = [r for r in items if r.get("state") == "pending" or now - r.get("at", now) < KEEP]
-    aside = FILE.with_suffix(".new")
-    aside.write_text(json.dumps(items, indent=1))
-    aside.replace(FILE)
+    write_json(FILE, [r for r in items if _open(r) or now - r.get("at", now) < KEEP])
 
 
 def when(text: str, now: datetime | None = None) -> float:
@@ -76,9 +107,9 @@ def when(text: str, now: datetime | None = None) -> float:
     return at.timestamp()
 
 
-def add(at: float, session: str, words: str, by: str = "", keep_awake: bool = False) -> dict:
+def add(at: float, session: str, words: str, by: str = "", keep_awake: bool = False, sender: str = "") -> dict:
     item = {"id": secrets.token_hex(4), "at": at, "session": session, "words": words, "by": by,
-            "keep_awake": keep_awake, "state": "pending", "made": time.time()}
+            "sender": sender, "keep_awake": keep_awake, "state": ReminderState.PENDING.value, "made": time.time()}
     with _locked():
         _write(_read() + [item])
     return item
@@ -91,44 +122,74 @@ def listed(session: str = "") -> list[dict]:
 def cancel(rid: str) -> bool:
     with _locked():
         items = _read()
-        hit = [r for r in items if r.get("id") == rid and r.get("state") == "pending"]
+        hit = [r for r in items if r.get("id") == rid and r.get("state") == ReminderState.PENDING]
         for r in hit:
-            r["state"] = "cancelled"
-        _write(items)
+            r["state"] = ReminderState.CANCELLED.value
+        if hit:
+            _write(items)
     return bool(hit)
 
 
 BACKOFF = [60, 120, 300, 600]  # seconds before the next try when one fails, then every 10 minutes
 
 
-def due(now: float | None = None) -> list[dict]:
+def due(now: float | None = None) -> list[Reminder]:
+    """Pending reminders whose time (and backoff) has come. A claim a dead server left behind counts again."""
     now = now or time.time()
-    return [r for r in _read() if r.get("state") == "pending" and r.get("at", 0) <= now
+    with _locked():
+        items = _read()
+        stale = [r for r in items if r.get("state") == ReminderState.SENDING
+                 and now - float(r.get("claimed", 0)) > SEND_FOR]
+        for r in stale:
+            r["state"] = ReminderState.PENDING.value
+        if stale:
+            _write(items)
+    return [Reminder.of(r) for r in items if r.get("state") == ReminderState.PENDING and r.get("at", 0) <= now
             and r.get("next", 0) <= now]
 
 
-def later(rid: str) -> None:
-    """A try that failed (the agent not reachable yet): the next one after a backoff, not every 10 s."""
+def claim(rid: str) -> Reminder | None:
+    """Right before typing it: the reminder, still pending, now marked as on its way (a cancel no longer takes it);
+    None when it was cancelled or settled meanwhile, and then nothing may be typed."""
     with _locked():
         items = _read()
         for r in items:
-            if r.get("id") == rid:
-                tries = r.get("tries", 0)
-                r["tries"], r["next"] = tries + 1, time.time() + BACKOFF[min(tries, len(BACKOFF) - 1)]
-        _write(items)
+            if r.get("id") == rid and r.get("state") == ReminderState.PENDING:
+                r["state"], r["claimed"] = ReminderState.SENDING.value, time.time()
+                _write(items)
+                return Reminder.of(r)
+    return None
 
 
-def settle(rid: str, state: str, note: str = "") -> None:
-    """A due reminder delivered ("delivered"), or given up ("failed", with why)."""
+def _change(rid: str, change) -> bool:
+    """`change` applied to the claimed reminder only: one cancelled or settled meanwhile is left as it is."""
     with _locked():
         items = _read()
-        for r in items:
-            if r.get("id") == rid:
-                r["state"], r["note"], r["settled"] = state, note, time.time()
-        _write(items)
+        hit = [r for r in items if r.get("id") == rid and r.get("state") == ReminderState.SENDING]
+        for r in hit:
+            change(r)
+        if hit:
+            _write(items)
+    return bool(hit)
+
+
+def later(rid: str) -> bool:
+    """A claimed try that failed (the agent not reachable yet): pending again, the next try after a backoff, not
+    every 10 s."""
+    def again(r: dict) -> None:
+        tries = r.get("tries", 0)
+        r["state"] = ReminderState.PENDING.value
+        r["tries"], r["next"] = tries + 1, time.time() + BACKOFF[min(tries, len(BACKOFF) - 1)]
+    return _change(rid, again)
+
+
+def settle(rid: str, state: ReminderState, note: str = "") -> bool:
+    """A claimed reminder delivered (DELIVERED), or given up (FAILED, with why)."""
+    if state not in (ReminderState.DELIVERED, ReminderState.FAILED):
+        raise ValueError(f"not how a reminder ends: {state}")
+    return _change(rid, lambda r: r.update(state=ReminderState(state).value, note=note, settled=time.time()))
 
 
 def keep_awake_until() -> float:
-    """The latest due time among pending reminders that keep the laptop awake (0: none)."""
-    return max((r.get("at", 0) + 300 for r in _read() if r.get("state") == "pending" and r.get("keep_awake")),
-               default=0.0)
+    """The latest due time among open reminders that keep the laptop awake (0: none)."""
+    return max((r.get("at", 0) + 300 for r in _read() if _open(r) and r.get("keep_awake")), default=0.0)

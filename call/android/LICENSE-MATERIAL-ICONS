@@ -1,5 +1,5 @@
-The icons app/src/main/res/drawable/ic_menu, ic_phone, ic_call_end, ic_send, ic_sound, ic_link and ic_attach are
-Material Design icons by Google (https://github.com/google/material-design-icons), used under the
+The icons app/src/main/res/drawable/ic_menu, ic_phone, ic_call_end, ic_send, ic_sound, ic_link, ic_attach, ic_add,
+ic_back, ic_close, ic_camera, ic_headset and ic_mic are Material Design icons by Google (https://github.com/google/material-design-icons), used under the
 Apache License 2.0 below. Everything else in call/android/ is this repository's own (MIT).
 
 

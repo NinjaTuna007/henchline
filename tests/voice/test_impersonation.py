@@ -1,0 +1,119 @@
+"""One agent can't pass for another: the process tree backs the session a caller claims, `remind --to` reaches only
+the caller's own chain, and an agent's reminder is tagged with who set it and never typed as a slash command."""
+
+import importlib.util
+import unittest
+from unittest import mock
+
+from tests import sandbox  # first: a throwaway HOME
+import routing
+from voice import agents, chains, reminders
+from voice.agents import Process
+from voice.desktop import Tab
+from voice.state import SPEAKERS, Speaker
+
+hf_spec = importlib.util.spec_from_file_location("handsfree_remind", sandbox.REPO / "handsfree/handsfree.py")
+handsfree = importlib.util.module_from_spec(hf_spec)
+hf_spec.loader.exec_module(handsfree)
+
+BOSS = "claude-11111111-1111-4111-8111-111111111111"
+CHILD = "claude-22222222-2222-4222-8222-222222222222"
+OTHER = "claude-33333333-3333-4333-8333-333333333333"
+
+
+class Vouched(unittest.TestCase):
+    def test_a_child_claiming_its_bosses_session_is_refused(self):
+        me = Process(4242, ["claude"])
+        with mock.patch.object(agents, "nearest_agent", return_value=me), \
+                mock.patch.object(agents, "ancestors", return_value=[Process(9, ["bash"]), me]), \
+                mock.patch.object(agents, "in_cursor_sandbox", return_value=False), \
+                mock.patch("voice.resume.claude_record", return_value=CHILD.removeprefix("claude-")):
+            self.assertEqual(agents.vouched("claude", CHILD), "")
+            self.assertIn("another claude session", agents.vouched("claude", BOSS))
+
+    def test_another_kind_of_agent_or_none_at_all_is_refused(self):
+        with mock.patch.object(agents, "in_cursor_sandbox", return_value=False):
+            with mock.patch.object(agents, "nearest_agent", return_value=Process(1, ["codex"])):
+                self.assertIn("run by codex", agents.vouched("claude", BOSS))
+            with mock.patch.object(agents, "nearest_agent", return_value=None):
+                self.assertIn("not run by an agent", agents.vouched("claude", BOSS))
+
+    def test_a_folder_key_must_be_that_process_folder(self):
+        me = mock.Mock(agent="codex", is_editor=False, folder=sandbox.REPO, pid=1)
+        with mock.patch.object(agents, "nearest_agent", return_value=me), \
+                mock.patch.object(agents, "in_cursor_sandbox", return_value=False):
+            self.assertEqual(agents.vouched("codex", agents._key("codex", str(sandbox.REPO))), "")
+            self.assertTrue(agents.vouched("codex", agents._key("codex", "/elsewhere")))
+
+    def test_the_cli_refuses_an_unbacked_caller(self):
+        with mock.patch.object(handsfree, "caller", return_value=Speaker(BOSS, "claude")), \
+                mock.patch("voice.agents.vouched", return_value="nope"):
+            self.assertIsNone(handsfree.vouched_caller())
+
+
+class RemindTo(unittest.TestCase):
+    def setUp(self):
+        for path in chains.CHAINS.glob("*.jsonl") if chains.CHAINS.is_dir() else []:
+            path.unlink()
+        reminders.FILE.unlink(missing_ok=True)
+        chain = chains.open(BOSS)
+        chains.append(chain, "launch", parent=BOSS, pane="%7", pid=7, depth=2, agent="claude", where="job")
+        chains.bind(CHILD, "%7", 7)
+        patches = [mock.patch.object(handsfree.subprocess, "run", return_value=mock.Mock(returncode=0)),
+                   mock.patch("voice.agents.run_by_agent", return_value=True)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def remind(self, me, to):
+        target = Speaker(to, "claude", "elsewhere")
+        with mock.patch.object(handsfree, "vouched_caller", return_value=me), \
+                mock.patch.object(handsfree.routing, "find", return_value=target):
+            return handsfree.remind(["--to", "claude in elsewhere", "in", "20m", "/compact"])
+
+    def test_an_agent_reaches_its_boss_and_its_helpers_only(self):
+        boss, child = Speaker(BOSS, "claude", "boss"), Speaker(CHILD, "claude", "job")
+        self.assertEqual(0, self.remind(child, BOSS))
+        self.assertEqual(0, self.remind(boss, CHILD))
+        self.assertEqual(self.remind(child, OTHER), 1)
+        made = reminders.listed()
+        self.assertEqual(len(made), 2)
+        self.assertEqual({r["by"] for r in made}, {"agent"})
+        self.assertEqual({r["sender"] for r in made}, {"claude in job", "claude in boss"})
+
+    def test_a_script_with_no_agent_may_remind_anyone(self):
+        with mock.patch("voice.agents.run_by_agent", return_value=False):
+            self.assertEqual(0, self.remind(None, OTHER))
+        self.assertEqual(reminders.listed()[0]["sender"], "")
+
+    def test_an_agent_the_tree_does_not_back_sets_nothing(self):
+        self.assertEqual(self.remind(None, BOSS), 1)
+        self.assertEqual(reminders.listed(), [])
+
+
+class AgentsReminder(unittest.TestCase):
+    def typed(self, text, sender):
+        speaker = Speaker(OTHER, "claude", "job", Tab("tmux", "%1"))
+        terms = mock.Mock()
+        terms.agent_running.return_value = True
+        terms.type_line.return_value = True
+        with mock.patch.object(routing, "place", return_value=""), \
+                mock.patch.object(routing, "desktop", return_value=mock.Mock(terminals=terms)), \
+                mock.patch.object(routing, "is_command", return_value=True):
+            self.assertTrue(routing.deliver(text, routing.Heard.SCHEDULED, to=speaker, sender=sender))
+        return terms.type_line.call_args.args[1]
+
+    def test_never_a_slash_command_and_tagged_with_who_set_it(self):
+        self.assertEqual(self.typed("/compact", "claude in job"),
+                         "[henchline · scheduled · from claude in job] /compact")
+        self.assertEqual(self.typed("/compact", ""), "[henchline · scheduled] /compact")
+        self.assertEqual(self.typed("/compact", None), "/compact")  # the user's own, from the phone
+
+    def test_the_reminder_record_says_whose_it_is(self):
+        self.assertTrue(reminders.Reminder.of({"id": "1", "by": "phone"}).users)
+        self.assertFalse(reminders.Reminder.of({"id": "1", "by": "agent", "sender": "x"}).users)
+        self.assertFalse(reminders.Reminder.of({"id": "1", "by": "user"}).users)  # an older --to record
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,8 +1,8 @@
 """``handsfree deploy``, ``report`` and ``end``: a boss starts a child, and the child reports back.
 
 Laptop only. The boss is whoever is running the command (``handsfree.caller``).
-A child is started with ``tmux.start`` (never resume), in a folder ``call.server``
-already accepts, and registered in the same spawned list as a new chat. The ask
+A child is started with ``tmux.start`` (never resume), only in a folder that agent
+already trusts (a deploy never answers a trust question), and registered in the same spawned list as a new chat. The ask
 is typed in with a note to report back. The chain log stores the pane and pid;
 the session id is bound later, when the child is known.
 """
@@ -55,8 +55,10 @@ def _deploy_args(args: list[str]) -> tuple[str, str, str]:
     return agent, folder, " ".join(ask).strip()
 
 
-def _folder(given: str, known: list[Path], typed):
-    """A folder the call server already allows: one it trusts, or one ``typed_folder`` accepts."""
+def _folder(given: str, known: list[Path]):
+    """The trusted folder the boss named, or None. Only folders the child agent already trusts: a deploy never
+    answers a trust question, so a prompt-injected boss can't start a child in a folder whose own settings (hooks,
+    MCP servers) would then run, and leave it trusted for good."""
     raw = Path(given).expanduser()
     try:
         resolved = raw.resolve()
@@ -69,7 +71,40 @@ def _folder(given: str, known: list[Path], typed):
             same = False
         if same or str(folder) == given:
             return Path(folder)
-    return typed(given)
+    return None
+
+
+def _codex_trusted() -> list[Path]:
+    """The folders Codex itself trusts: `trust_level = "trusted"` under [projects."<path>"] in its config."""
+    import tomllib
+    try:
+        projects = tomllib.loads((Path.home() / ".codex/config.toml").read_text()).get("projects", {})
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not isinstance(projects, dict):
+        return []
+    return [Path(p) for p, v in projects.items() if isinstance(v, dict) and v.get("trust_level") == "trusted"]
+
+
+def _trusted(agent: str, server) -> list[Path]:
+    """Where a child of that agent may start. Codex keeps its own list; Claude's list (the one the phone's new
+    chat offers) stands for Claude and Cursor."""
+    if agent == "codex":
+        return _codex_trusted()
+    return [Path(p) for p in server.trusted_folders(limit=None)]
+
+
+def _trust_question_up(tab: Tab, agent: str, wait: float) -> bool:
+    """The agent's own trust question is on screen (looked for up to `wait` seconds): the folder wasn't trusted
+    after all, and the ask must not be typed into it (Codex's default answer is yes)."""
+    import time
+    until = time.monotonic() + wait
+    while True:
+        if _still_asking(tab, agent):
+            return True
+        if time.monotonic() >= until:
+            return False
+        time.sleep(0.5)
 
 
 def _pane(speaker: Speaker) -> str:
@@ -93,22 +128,38 @@ def deploy(args: list[str], caller) -> int:
     depth = 2 if chains.parent_of(boss.session) else 1
     chain = chains.open(boss.session)
     from voice.desktop import tmux
-    # A child that exited by itself (/exit, a crash) has no ended line: its pane is gone, so its slot is freed here
-    refused = chains.allow(chain, boss.session, depth, alive=tmux.pane_pids())
+    # A child that exited by itself (/exit, a crash) has no ended line: its pane is gone, so its slot is freed here.
+    # The slot is held from this check on: the launch line is only written once the ask is typed, seconds later
+    refused, slot = chains.reserve(chain, boss.session, depth, alive=tmux.pane_pids())
     if refused:
         print(refused)
         return 1
+    launched = False
+    try:
+        launched = _launch(chain, slot, boss, depth, agent, folder, ask) == 0
+    finally:
+        if not launched:
+            chains.release(chain, slot)
+    return 0 if launched else 1
+
+
+def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder: str, ask: str) -> int:
+    """Start the child in its reserved slot; 0 once its launch line (which takes over the slot) is written."""
+    from voice.desktop import tmux
     server = _server()
-    known = [Path(p) for p in server.trusted_folders()]
-    match = _folder(folder, known, server.typed_folder)
+    match = _folder(folder, _trusted(agent, server))
     if match is None:
-        print(f"not a folder this laptop can start an agent in: {folder}")
+        print(f"not started: {agent} doesn't trust {folder} yet, and a deploy never says yes to that question. "
+              f"Start {agent} there yourself once (or from the phone's new chat) and answer it, then deploy again.")
         return 1
     from voice import permissions, resume
     from voice.desktop import current as desktop
     # No more than the boss may do itself, from the boss's own record; ask mode when that can't be read
-    boss_level = permissions.level(boss.agent, resume.chat_id(boss.session), bool(boss.in_editor))
-    flags = permissions.child_flags(agent, boss_level)
+    boss_chat = resume.chat_id(boss.session)
+    boss_level = permissions.level(boss.agent, boss_chat, bool(boss.in_editor))
+    # A Codex boss's own -a and -s go to a Codex child, so it never gets more than its boss runs with
+    boss_codex = permissions.codex_turn(boss_chat) if boss.agent == "codex" else None
+    flags = permissions.child_flags(agent, boss_level, boss_codex)
     if flags is None:
         print(f"not started: Cursor's settings run every command without asking, and this agent asks first, so a "
               f"{agent} helper would get more than you have. Deploy claude or codex instead.")
@@ -117,23 +168,16 @@ def deploy(args: list[str], caller) -> int:
     if not tab:
         print(f"{agent} didn't start")
         return 1
-    # Claude's trust question defaults to exiting, and the ask would be typed into it. Answered first, the same
-    # way a new chat is, and only then is the ask typed. Codex may ask about any folder.
-    needs_trust = agent == "codex" or (agent == "claude" and match not in known)
-    accepted = tmux.accept_trust(tab, match, agent, 8.0 if agent == "codex" else 12.0) if needs_trust else True
-    if accepted and needs_trust:
-        server.notice(f"{agent.capitalize()} now trusts a folder",
-                      f"Started from a deploy, {agent.capitalize()}'s trust question was answered yes for {match.name}.")
-    # Not counted, and not registered, until the ask is actually typed. A trust question that is still
-    # on screen would swallow it, and a launch we then abandon must not hold a slot.
-    if needs_trust and not accepted and (agent == "claude" or _still_asking(tab, agent)):
-        tmux.end(tab)
-        print(f"{agent} started in {match.name} (tmux {tab.address}), but it is still asking about that folder, "
-              "so the ask was not typed")
-        return 1
-    # The box must be drawn first, and the ask must actually leave it: a multi-line paste can keep its Enter
+    # Never answered here: a folder the agent trusts asks nothing. If its question shows anyway, the ask would be
+    # typed into it (Codex's default answer is yes), so the child is closed instead. Claude's is looked for once
+    # its box is drawn; Codex's may take a moment to come.
     if agent == "claude":  # the layout read here is Claude's; the others would only wait out the timeout
         tmux.composer_ready(tab)
+    if _trust_question_up(tab, agent, 4.0 if agent == "codex" else 0.0):
+        tmux.end(tab)
+        print(f"not started: {agent} asked whether to trust {match.name}, and a deploy never answers that")
+        return 1
+    # The box was drawn first, and the ask must actually leave it: a multi-line paste can keep its Enter
     typed = desktop().terminals.type_line(tab, ASK_PREFIX + ask) and (
         agent != "claude" or tmux.submit_pending(tab, ASK_MARK))
     if not typed:
@@ -147,7 +191,7 @@ def deploy(args: list[str], caller) -> int:
                   f"From a deploy, in {match.name}. {permissions.child_runs(agent, boss_level)} "
                   "`tmux attach -t henchline` to watch or answer.")
     chains.append(chain, "launch", parent=boss.session, pane=tab.address, pid=pid, depth=depth + 1,
-                  agent=agent, where=match.name, ask=ask)
+                  agent=agent, where=match.name, ask=ask, reservation=slot)
     log(HANDSFREE_LOG, f"deployed {agent} in {match.name} (tmux {tab.address})")
     print(f"deployed {agent} in {match.name} (tmux {tab.address})")
     return 0
@@ -214,8 +258,9 @@ def report(args: list[str], caller) -> int:
     routing = _routing()
     # SCHEDULED so a failure isn't spoken into the room, and so this isn't the user answering the boss.
     # The text itself starts with the report marker, so it is typed as a report and not kept as a correction.
-    if not routing.deliver(f"{chains.REPORT} {body}", routing.Heard.SCHEDULED, to=target):
-        print(routing.why_not() or "couldn't deliver the report")
+    delivery = routing.deliver(f"{chains.REPORT} {body}", routing.Heard.SCHEDULED, to=target)
+    if not delivery:
+        print(delivery.why or "couldn't deliver the report")
         return 1
     chain = chains.chain_of(child.session)
     if chain:
@@ -331,14 +376,18 @@ def may_end(caller_session: str, target: str) -> bool:
     mine = chains.aliases(caller_session)
     if chains.canonical(target) in mine or target in mine:
         return True
-    if not chains.parent_of(target):
-        # A launch is stored by its pane and pid; the child's session is bound to it later. Bound here from the
-        # child's own record, the same way a report binds it, so its boss is known
-        known = _speaker(chains.canonical(target))
-        if known and known.tab and known.pid:
-            chains.bind(known.session, known.tab.address, int(known.pid))
     boss = chains.parent_of(target)
     return bool(boss) and boss in mine
+
+
+def _bind_child(target: str) -> None:
+    """A launch is stored by its pane and pid; the child's session is bound to it later. Bound here from the
+    child's own record, the same way a report binds it, so its boss is known before may_end asks."""
+    if not target or chains.parent_of(target):
+        return
+    known = _speaker(chains.canonical(target))
+    if known and known.tab and known.pid:
+        chains.bind(known.session, known.tab.address, int(known.pid))
 
 
 def end(args: list[str], caller=None) -> int:
@@ -351,6 +400,7 @@ def end(args: list[str], caller=None) -> int:
     if me is None or not me.session:
         print("couldn't tell which agent is ending it")
         return 1
+    _bind_child(target)
     if not may_end(me.session, target):
         print("only the agent that started it, or the agent itself, may end it")
         return 1

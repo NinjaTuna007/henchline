@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from call.canonical import RFC3339, rfc3339
+
 
 API_VERSION = "1.0"
 DEFAULT_CONFIG = Path.home() / ".config/henchline/host.json"
@@ -27,14 +29,14 @@ UTC_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 
 def utc_now() -> str:
     """RFC 3339 UTC to the second, the one form descriptors carry."""
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return rfc3339()
 
 
 def _utc_stamp(value: Any) -> str:
     text = str(value)
     if not UTC_STAMP.fullmatch(text):
         raise ValueError("updated_at must be RFC 3339 UTC to the second, like 2026-11-21T12:00:00Z")
-    dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")  # a real date and time
+    dt.datetime.strptime(text, RFC3339)  # a real date and time
     return text
 
 

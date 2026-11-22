@@ -1,5 +1,7 @@
 <h1 align="center"><img src="docs/hero.svg" width="800" alt="Henchline: talk to all your AI henchmen. By voice, by phone, by text."></h1>
 
+<p align="center"><b>Henchline 3.0: Minionception.</b> Your henchmen now hire henchmen.</p>
+
 <p align="center"><img src="docs/panels/boss.png" width="900" alt="You're the boss. Claude Code, Cursor and Codex are your crew, and Henchline is your line to all of them."></p>
 
 Talk to them at your desk without touching the keyboard, call them from your phone when you're out, and let them ring or text you when they need a decision. Every henchman has its own voice, its own ringtone, its own chat. And it all runs on your own machine.
@@ -33,11 +35,15 @@ Talk to them at your desk without touching the keyboard, call them from your pho
 
 **For your agents**
 
+- 🪆 **Minionception.** An agent can deploy helpers of its own: `handsfree deploy --agent claude|cursor|codex --folder PATH --ask "…"` starts one in its own terminal, and the helper answers with `handsfree report "…"`. On the phone each helper's chat sits under its boss, and hard hats show who runs a crew and who is on one. Only its boss, the helper itself, or you from the phone can end a helper.
+
+- ⏰ **Reminders for later.** An agent can set itself (or its boss or a helper it deployed) a reminder: `handsfree remind 08:30 "check the build"` (or `tomorrow 08:30`, `in 20m`) types the message into that agent when it's due, tagged `[henchline · scheduled · from <agent>]`; `handsfree remind list` and `cancel ID` manage them.
+
 One snippet (`agents/AGENTS-snippet.md`) teaches every agent (Claude Code, Cursor, Codex) how to speak, how your voice messages are tagged, and when to ring, text or send you something. Nothing to install inside the agents: Henchline types into their own terminal tabs and windows.
 
 ## Yours, and only yours
 
-- **Local.** Whisper and NVIDIA's Nemotron hear you and Kokoro speaks, on your machine. No cloud speech, no relay, no account.
+- **Local.** Whisper and NVIDIA's Nemotron hear you and Kokoro speaks (or Jenny, on the phone), on your own devices. No cloud speech, no relay, no account.
 - **Your network.** The phone reaches your computer over your own Tailscale; only your devices can.
 - **Any agent.** Not tied to one vendor: if it runs in a terminal or in Cursor, it's on the crew.
 - **Your voice stays yours.** Record the henchman phrases in your own voice; they stay on your phone, never in the repository.
@@ -95,6 +101,7 @@ Everything runs on your machine. These are the models Henchline uses, what each 
 | [NVIDIA Nemotron Speech Streaming](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b) (as [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s int8 export) | Hands-free turns and push-to-talk, written down while you talk (and the "over" at the end) | CPU | ~630 MB | [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/) | `./install.sh handsfree` |
 | [Whistle](https://cactuscompute.com/blog/whistle) ([Cactus Compute](https://github.com/cactus-compute/cactus)) | Confirms the wake word in about a tenth of a second | CPU | 17 MB | Apache-2.0 | `./install.sh handsfree` |
 | [Kokoro 82M](https://huggingface.co/hexgrad/Kokoro-82M) (via [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx)) | Talkback: every agent's voice | CPU | ~350 MB | Apache-2.0 | `./install.sh talkback` |
+| Piper Jenny (`vits-piper-en_GB-jenny_dioco-medium`, via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)), voice from the [Jenny (Dioco)](https://github.com/dioco-group/jenny-tts-dataset) dataset | Talkback made on the phone (Voices → Phone): one voice for every agent | the phone's CPU | ~64 MB | the [Jenny dataset's terms](https://github.com/dioco-group/jenny-tts-dataset): commercial use allowed, the voice credited as "Jenny (Dioco)" | `./install.sh call` prepares it on the laptop; the app downloads it from there |
 | [openWakeWord](https://github.com/dscripka/openWakeWord), with your own "hey Claude" / "hey Jarvis" detectors trained on it | Wake word detection | CPU | ~5 MB | Apache-2.0; its ready-made "hey Jarvis" model is [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) (non-commercial) | `./install.sh handsfree`; your detectors: `handsfree/tools/wakeword_collect.py`, then `wakeword_train.py` |
 | [Silero VAD](https://github.com/snakers4/silero-vad) (bundled with faster-whisper) | Is someone speaking: turn ends, talk-over | CPU | ~1 MB | MIT | with faster-whisper (pip) |
 
@@ -102,7 +109,7 @@ To fetch or refresh them all: `./install.sh all` (or the piece's name); `./docto
 
 ## Push-to-talk
 
-Hold the Copilot key (or any key you choose), speak, let go: it is written down on your machine as you speak and typed into the window in front, with Enter. A stressed word arrives as `*word*`, an unusual tone as `[tone: loud, fast]`. Right-click the tray icon for language, power and the hotkey. More: [ptt/README.md](ptt/README.md).
+Hold the Copilot key (or any key you choose), speak, let go: it is written down on your machine as you speak and typed into the window in front, with Enter. A stressed word arrives as `*word*`, an unusual tone as `[tone: loud, fast]`. Henchline's one tray icon shows what it's doing; click it for a status panel (each service's state and the last timings), right-click for language, power, the hotkey and a restart of each service (offered only when it can't cut off a call or words being heard). More: [ptt/README.md](ptt/README.md).
 
 ## Talkback
 
@@ -141,3 +148,5 @@ The call as a real app (Android 10+): it keeps going with the screen off, rings 
 MIT
 
 `install.sh handsfree` downloads [NVIDIA Nemotron Speech Streaming](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b) (as [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s int8 export) from its publishers; it is licensed by NVIDIA Corporation under the [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/), not MIT, and is not part of this repository.
+
+The phone's voice is Jenny (Dioco), from the [Jenny TTS dataset](https://github.com/dioco-group/jenny-tts-dataset) by Dioco, as Piper's `en_GB-jenny_dioco-medium` model in [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)'s packaging; `install.sh call` downloads it from sherpa-onnx's releases (pinned hash) and the app fetches it from your laptop. With it the laptop also serves a few files of [espeak-ng](https://github.com/espeak-ng/espeak-ng)'s English data (GPL-3.0); the app doesn't bundle them, it fetches them from your own laptop.

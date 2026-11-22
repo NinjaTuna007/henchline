@@ -30,7 +30,10 @@ the extension host alone keeps the old version).
   works with the screen locked. `./install.sh agents` adds `--remote-debugging-port=9333` to Cursor's launcher
   (`~/.local/share/applications/cursor.desktop`); it takes effect when Cursor next starts. The port listens on
   localhost, but while it is open any program or user on this computer can drive Cursor through it (agents
-  included, Cursor's own too). Focus inside Cursor moves to the chat box for that moment and is put back.
+  included, Cursor's own too). Driving Cursor is running code in it: the debugging port evaluates any JavaScript
+  in Cursor's window, which can read your files and start programs as you, with no password. So the port, and the
+  bridge that needs it, are for a computer only you log in to; on a shared machine leave the port off (remove the
+  flag from the launcher) and Henchline types into the raised window instead. Focus inside Cursor moves to the chat box for that moment and is put back.
 - Without the port (Cursor started another way), Henchline brings the window forward and types into it as before
   (the chat box, paste, Enter), which needs the screen unlocked.
 - The phone shows each chat's model (with its effort) from Cursor's store, and switches it with Cursor's own "Switch

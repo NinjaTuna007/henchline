@@ -6,14 +6,13 @@ knobs are max_depth 2 and slots 8 (live children, so an ended one frees a slot).
 
 The directory is voice.state.CHAINS, one ``<id>.jsonl`` per job. The first line
 is the chain (boss and knobs). After that the lines are launch, bound,
-correction, report, end_requested, end_kept, ended and replaced. A launch may only know the pane and its
-pid; a bound line attaches the session once it exists. No topic, token or folder
+correction, report, end_requested, end_kept, ended and replaced, and reserved/unreserved: a slot held while a
+child starts. A launch may only know the pane and its pid; a bound line attaches the session once it exists. No topic, token or folder
 path is written. Corrections and reports are the words themselves.
 """
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import secrets
@@ -21,15 +20,19 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-from voice.state import CHAINS
+from voice.state import CHAINS, file_lock, write_json
 
-KINDS = ("launch", "bound", "correction", "report", "end_requested", "end_chosen", "end_kept", "ended", "replaced")
+KINDS = ("launch", "bound", "correction", "report", "end_requested", "end_chosen", "end_kept", "ended", "replaced",
+         "reserved", "unreserved")
 DEFAULT_DEPTH = 2  # boss is 1, so a child is as deep as a chain allows
 DEFAULT_SLOTS = 8
 REPORT = "[henchline · report]"  # an internal report, not a correction from the user
 _LOCK = CHAINS.parent / "chains.lock"
 PHONE_VIEWS = CHAINS.parent / "chain-views.json"
 REAP_AFTER = 30.0  # seconds: a launch this young is never taken for gone
+# A slot held by reserve() while its child starts (tmux, a trust answer, the ask typed: ~12 s, more on a slow laptop).
+# A deploy that died before its launch or release line no longer holds it after this long
+RESERVE_FOR = 120.0
 _DROP = {"topic", "token", "secret", "password", "folder", "path"}
 
 
@@ -43,15 +46,8 @@ class _Chain:
     closed: bool = False
 
 
-@contextmanager
 def _locked():
-    _LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with _LOCK.open("a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    return file_lock(_LOCK)
 
 
 def _load_all() -> list[_Chain]:
@@ -250,8 +246,20 @@ def _closes(later: dict, launch: dict) -> bool:
     return _same_pid(int(launch.get("pid") or 0), int(later.get("pid") or 0))
 
 
-def _active(events: list[dict]) -> int:
-    """Launches with no later ended or replaced line for that same process."""
+def _active(events: list[dict], now: float | None = None) -> int:
+    """Launches with no later ended or replaced line for that same process, and slots reserved for a child still
+    starting (no launch or unreserved line with that reservation yet, and younger than RESERVE_FOR)."""
+    now = time.time() if now is None else now
+    held: dict[str, float] = {}
+    for event in events:
+        token = str(event.get("reservation") or "")
+        if not token:
+            continue
+        if event.get("kind") == "reserved":
+            held[token] = float(event.get("at") or 0)
+        elif event.get("kind") in ("launch", "unreserved"):
+            held.pop(token, None)
+    reserved = sum(1 for at in held.values() if now - at < RESERVE_FOR)
     live: dict[str, dict] = {}
     for index, event in enumerate(events):
         if event.get("kind") == "launch":
@@ -263,7 +271,7 @@ def _active(events: list[dict]) -> int:
             for key, launch in list(live.items()):
                 if _closes(event, launch):
                     del live[key]
-    return len(live)
+    return len(live) + reserved
 
 
 def _write(chain_id: str, item: dict) -> None:
@@ -405,24 +413,49 @@ def allow(chain: str, caller_session: str, depth: int, alive: dict[str, int] | N
     under a child, and a child is not the boss, so it may not deploy. ``alive`` (tmux panes and their first
     process) frees the slots of children that are gone before they are counted.
     """
+    return _allow(chain, caller_session, depth, alive, reserve=False)[0]
+
+
+def reserve(chain: str, caller_session: str, depth: int, alive: dict[str, int] | None = None) -> tuple[str, str]:
+    """allow(), and when allowed a slot held under the same lock: ``("", reservation)``, else ``(reason, "")``.
+
+    The child takes a while to start, and its launch line is only written once its ask is typed: without this, two
+    deploys from one boss could both pass with one slot left. Hand the reservation to the launch line
+    (``append(chain, "launch", reservation=...)``) or give it back with release(); one left behind by a deploy that
+    died stops counting after RESERVE_FOR.
+    """
+    return _allow(chain, caller_session, depth, alive, reserve=True)
+
+
+def release(chain: str, reservation: str) -> None:
+    """Give back a slot reserve() held, for a child that did not start."""
+    if reservation:
+        append(chain, "unreserved", reservation=reservation)
+
+
+def _allow(chain: str, caller_session: str, depth, alive, reserve: bool) -> tuple[str, str]:
     with _locked():
         found = _one(chain)
         if found is None:
-            return "no such chain"
+            return "no such chain", ""
         _reap(found, alive)
         if found.closed:
-            return "that chain has ended"
+            return "that chain has ended", ""
         if found.boss not in _renamed_as(caller_session):
-            return "only the boss may deploy"
+            return "only the boss may deploy", ""
         try:
             here = int(depth)
         except (TypeError, ValueError):
             here = found.max_depth
         if here >= found.max_depth:
-            return "too deep"
+            return "too deep", ""
         if _active(found.events) >= found.slots:
-            return "no slots left"
-        return ""
+            return "no slots left", ""
+        if not reserve:
+            return "", ""
+        token = secrets.token_hex(8)
+        _write(found.id, {"at": time.time(), "kind": "reserved", "reservation": token, "parent": caller_session})
+        return "", token
 
 
 def parent_of(session: str) -> str:
@@ -790,11 +823,7 @@ def note_phone_view(session: str) -> None:
         shown = {str(key): float(value) for key, value in shown.items()
                  if isinstance(value, (int, float)) and now - float(value) < 60}
         shown[session] = now
-        PHONE_VIEWS.parent.mkdir(parents=True, exist_ok=True)
-        temporary = PHONE_VIEWS.with_suffix(".tmp")
-        temporary.write_text(json.dumps(shown))
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, PHONE_VIEWS)
+        write_json(PHONE_VIEWS, shown, private=True)
 
 
 def phone_viewing(session: str, stale: float = 8.0) -> bool:

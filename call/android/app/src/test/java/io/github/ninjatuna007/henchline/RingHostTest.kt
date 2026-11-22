@@ -41,4 +41,17 @@ class RingHostTest {
         assertFalse(Ringing.mayAnswer(JSONObject(ring.toString()).apply { remove("answer_key") }, "h-b", "claude-1",
             "https://example.invalid/r1", ""))
     }
+
+    @Test fun onlyTheAppsOwnAnswerForTheLaptopsRingNowStartsItsCall() {
+        val laptop = JSONObject().put("agent", "claude").put("reply", "https://example.invalid/r2").put("answer_key", "k-9")
+        assertTrue(Ringing.mayAnswerLaptop(laptop, "k-9"))  // the full-screen ring's or the notification's Answer
+        // Another app sending ANSWER: no key, a guessed one; no ring sounding; another computer's ring and its key
+        assertFalse(Ringing.mayAnswerLaptop(laptop, ""))
+        assertFalse(Ringing.mayAnswerLaptop(laptop, "k-8"))
+        assertFalse(Ringing.mayAnswerLaptop(null, "k-9"))
+        assertFalse(Ringing.mayAnswerLaptop(ring, "k-123"))
+        // A laptop ring recorded with no key (before this check) never matches an empty one
+        assertFalse(Ringing.mayAnswerLaptop(JSONObject().put("agent", "claude"), ""))
+        assertEquals("k-9", Ringing.answerKey(laptop))
+    }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check each piece and say plainly what is missing, with the command that fixes it.
 
-    ./doctor.py [ptt|talkback|handsfree|agents ...]
+    ./doctor.py [ptt|talkback|handsfree|call|agents ...]
 
 Runs on the system Python with the standard library only, so it works when
 the venv itself is what is broken. Exit status 1 if anything failed.
@@ -23,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))  # voice/state.py: standard library only
 from voice.desktop import kde_session  # noqa: E402
+from voice.phonevoice import FILES as PHONE_VOICE_FILES, MODEL_DIR as PHONE_VOICE  # noqa: E402
 from voice.state import CALL_TLS  # noqa: E402
 from voice.state import EC_CONF as CANCELLER_CONF, EC_SOURCE, KOKORO_MODELS as KOKORO, VENV, WAKE_MODEL  # noqa: E402
 NEMOTRON = WAKE_MODEL.parent / "nemotron"  # voice/speech/nemotron.py
@@ -210,18 +211,22 @@ def agents() -> list[Check]:
 
 
 def call() -> list[Check]:
-    ok, err = venv_imports("aiohttp")
+    ok, err = venv_imports("aiohttp", "cryptography")
     enabled, active = unit_state("call.service")
+    phone_voice = all((PHONE_VOICE / name).is_file() for name in PHONE_VOICE_FILES)
     rc, ip = run("tailscale", "ip", "-4")
     _, served = run("tailscale", "serve", "status")
     return [
-        check("call", "web server package in the venv", ok, err, "./install.sh call"),
+        check("call", "web server packages in the venv", ok, err, "./install.sh call"),
         check("call", "Tailscale up (the phone reaches the page through it)", rc == 0, ip.splitlines()[0] if ip else "",
               "sudo tailscale up"),
         check("call", "the page's certificate", (CALL_TLS / "cert.pem").exists(), str(CALL_TLS), "./install.sh call"),
         check("call", "a proper address (tailscale serve, a real certificate)", ":8790" in served,
               next((line for line in served.splitlines() if line.startswith("https://")), "self-signed instead"),
               "sudo tailscale set --operator=$USER; systemctl --user restart call", warn_only=True),
+        check("call", "the phone's own voice (Piper Jenny, for the phone to download)", phone_voice,
+              "" if phone_voice else "missing: the phone can only play the laptop's voice",
+              f"{PYTHON} -m voice.phonevoice prepare (in {ROOT})", warn_only=True),
         check("call", "call page running", active == "active", f"{active}, {enabled} at login",
               "./install.sh call", warn_only=True),
     ]

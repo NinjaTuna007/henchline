@@ -340,5 +340,41 @@ class Placing(unittest.TestCase):
         self.assertIn("second", path.read_text())
 
 
+
+class Refusals(unittest.TestCase):
+    """deliver() answers why it didn't deliver, per call: no module or thread global to read back."""
+
+    def test_a_refusal_comes_back_with_its_reason_and_is_said_unless_quiet(self):
+        from voice.delivery import Refusal
+        with mock.patch.object(routing, "last_speaker", return_value=None), \
+                mock.patch.object(routing, "say") as said:
+            got = routing.deliver_words("hello", routing.Heard.TEXTED)
+            self.assertFalse(got)
+            self.assertIs(got.refusal, Refusal.NOBODY)
+            self.assertIn("no agent has spoken", got.why)
+            said.assert_called_once_with(got.why)
+            said.reset_mock()
+            quiet = routing.deliver_words("hello", routing.Heard.SCHEDULED)
+            self.assertIs(quiet.refusal, Refusal.NOBODY)
+            said.assert_not_called()
+
+    def test_two_threads_each_get_their_own_reason(self):
+        from voice.state import Speaker
+        gone = Speaker("claude-gone", "claude", "job", Tab("tmux", "%1"))
+        answers = {}
+        terms = mock.Mock()
+        terms.agent_running.return_value = False
+        with mock.patch.object(routing, "last_speaker", return_value=None), \
+                mock.patch.object(routing, "place", return_value=""), \
+                mock.patch.object(routing, "desktop", return_value=mock.Mock(terminals=terms)), \
+                mock.patch.object(routing, "say"):
+            one = threading.Thread(target=lambda: answers.update(
+                one=routing.deliver_words("a", routing.Heard.TEXTED, to=gone)))
+            two = threading.Thread(target=lambda: answers.update(two=routing.deliver_words("b", routing.Heard.TEXTED)))
+            one.start(), two.start()
+            one.join(5), two.join(5)
+        self.assertEqual((answers["one"].refusal.name, answers["two"].refusal.name), ("AGENT_GONE", "NOBODY"))
+
+
 if __name__ == "__main__":
     unittest.main()

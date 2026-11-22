@@ -29,7 +29,11 @@ per phone). It is off unless asked for, and it needs `~/.config/henchline/host.j
 - With `"legacy_routes": true` in host.json's capabilities, the server's other routes (texts, agents, the
   call...) also take a request signed by a paired phone, as that phone (revoking it cuts it off there too).
   Unsigned requests still need the call page's Origin, unless `--signed-only` is also given: then only paired
-  phones get in, and the browser call page stops working on this computer. A signed upload (a shared file, a
+  phones get in, and the browser call page stops working on this computer. The Origin is not a password: without
+  `--signed-only`, these routes trust any program that can reach the server and sends the call page's Origin, which
+  means every device on your tailnet and every process on this computer, and such a program can type into your
+  agents. Once the phone is paired, `--signed-only` closes that: only a request signed by a paired phone's key is
+  taken. A signed upload (a shared file, a
   voice message) is kept only if what arrived matches the digest the phone signed.
   host.json's `base_url` should be the call page's own `https://` address: notification links use it when the
   call page hasn't been opened yet. Unlike `/api/v1`, these routes keep no ledger of request ids: a signature

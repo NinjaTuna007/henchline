@@ -60,14 +60,20 @@ def text_from(words: list[str]) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="talkback", add_help=True, allow_abbrev=False)
+    parser = argparse.ArgumentParser(prog="talkback", add_help=True, allow_abbrev=False,
+                                     description="Speak text aloud in the calling agent's own voice (queued; returns at once).")
     mode = parser.add_mutually_exclusive_group()
-    for flag in ("--stop", "--worker", "--release", "--drop", "--wait"):
-        mode.add_argument(flag, action="store_true")
-    parser.add_argument("--agent", default="")
-    parser.add_argument("--session", default="")
-    parser.add_argument("--voice", default=os.environ.get("TALKBACK_VOICE", ""))
-    parser.add_argument("words", nargs="*")
+    for flag, about in (("--stop", "cut off everything and empty the queue"),
+                        ("--worker", "run the worker that speaks the queue (started by itself)"),
+                        ("--release", "play this session's held clips (the text first, if given)"),
+                        ("--drop", "throw away this session's held and queued clips"),
+                        ("--wait", "return once this text has been spoken")):
+        mode.add_argument(flag, action="store_true", help=about)
+    parser.add_argument("--agent", default="", help="speak as this agent (default: the one calling)")
+    parser.add_argument("--session", default="", help="speak as this agent session (default: the calling one)")
+    parser.add_argument("--voice", default=os.environ.get("TALKBACK_VOICE", ""),
+                        help="a Kokoro voice instead of the agent's own (or $TALKBACK_VOICE)")
+    parser.add_argument("words", nargs="*", help="what to say (default: stdin)")
     args, extra = parser.parse_known_args()  # text that happens to start with "-" is still text
     args.words += extra
     SPOOL.mkdir(parents=True, exist_ok=True)

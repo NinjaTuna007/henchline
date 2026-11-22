@@ -1,6 +1,7 @@
 """Talkback the phone speaks itself: the call's offer and fallback, clips and cuts sent once, the phone's acks."""
 
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -110,6 +111,37 @@ class RenderSpeed(unittest.TestCase):
         self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
         phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 99}})
         self.assertEqual(phonevoice.plan_rtf(), phonevoice.PHONE_RTF)
+
+    def test_an_ack_rewrites_the_speed_only_when_it_moved(self):
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION, "rtf": 0.4}})
+        phonevoice.send("c1", "claude", "af_heart", 0, ["Hello."], set(), [0])
+        with mock.patch.object(phonevoice, "write_json", wraps=phonevoice.write_json) as wrote:
+            phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 0.41}})  # 2.5%: noise
+            self.assertFalse([c for c in wrote.call_args_list if c.args[0] == phonevoice.CALL_TTS])
+            phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 0.5}})
+            self.assertEqual(len([c for c in wrote.call_args_list if c.args[0] == phonevoice.CALL_TTS]), 1)
+        self.assertAlmostEqual(phonevoice.plan_rtf(), 0.6)
+
+    def test_a_fallback_is_never_lost_to_an_ack_written_at_the_same_time(self):
+        phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION, "rtf": 0.4}})
+        phonevoice.send("c1", "claude", "af_heart", 0, ["Hello."], set(), [0])
+        reads = threading.Event()
+        real = phonevoice.read_json
+
+        def slow_read(path):  # an ack reads the offer, then the worker's fallback lands before it writes
+            found = real(path)
+            if path == phonevoice.CALL_TTS and not reads.is_set():
+                reads.set()
+                worker.start()
+                worker.join(0.3)  # blocked on the lock while the ack holds it
+            return found
+
+        worker = threading.Thread(target=phonevoice.offer, args=({"tts": "fallback", "reason": "no phonemizer"},))
+        with mock.patch.object(phonevoice, "read_json", side_effect=slow_read):
+            phonevoice.said({"said": {"id": "c1", "piece": 0, "rtf": 0.2}})
+        worker.join(5)
+        self.assertFalse(phonevoice.phone_renders())
+        self.assertEqual(phonevoice.plan_rtf(), phonevoice.PLAN_RTF_MIN)  # the ack's speed kept too
 
 
 class Clips(unittest.TestCase):
@@ -267,10 +299,6 @@ class Model(unittest.TestCase):
                 (Path(tmp) / name).parent.mkdir(parents=True, exist_ok=True)
                 (Path(tmp) / name).write_bytes(b"x")
             self.assertEqual(phonevoice.manifest(Path(tmp))["version"], phonevoice.VERSION)
-
-    def test_every_agent_is_jennys_one_speaker(self):
-        self.assertEqual(phonevoice.voice_id("af_heart"), 0)
-        self.assertEqual(phonevoice.voice_id("bm_george"), 0)
 
     def test_an_earlier_models_folder_is_stale(self):
         with tempfile.TemporaryDirectory() as tmp:

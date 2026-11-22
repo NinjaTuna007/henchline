@@ -183,6 +183,11 @@ install_call() {
     "$root/call/hooks/claude_hooks.py" add && say "Claude Code: hooks show your terminal prompts and its replies in a call's chat"
   fi
   pip_install call
+  # the phone's own voice (Piper Jenny, ~64 MB, hash pinned in voice/phonevoice.py): the laptop serves it, so the
+  # phone downloads it with no internet of its own; a rerun keeps the files already there
+  (cd "$root" && venv_python -m voice.phonevoice prepare >/dev/null 2>&1) &&
+    say "Phone voice: Jenny is ready for the phone (Voices, then Phone, in the app's call menu)" ||
+    say "The phone voice didn't download (offline?): the phone plays the laptop's voice. Run ./install.sh call again later."
   for tool in tailscale openssl; do
     command -v "$tool" >/dev/null || { say "The call page needs $tool"; exit 1; }
   done

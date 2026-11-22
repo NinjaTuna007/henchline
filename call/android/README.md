@@ -10,7 +10,13 @@ echo "sdk.dir=$HOME/Android/Sdk" > local.properties   # where your SDK is
 
 ## Settings and sound
 
-On first Call it asks for the page's address (`https://<laptop's Tailscale name>/`); the ⚙ button changes it, and "Clear voice" for the next call (on by default: media sound, with the phone's own echo canceller where it has one; off: the phone-call path, muffled but with the phone's call processing). The Sound button under the talk button switches the current call between the two.
+Hold your avatar for Settings: the laptop's address (`https://<laptop's Tailscale name>/`), how calls start (Clear sound or Call sound), Stay or check and Cut in for new calls, and the agents' voices. On a call, tapping the green call bar opens the call menu, which changes this call only:
+
+- **Sound:** Speaker or Earpiece (and Earbuds when some are connected); Clear sound (media sound, with the phone's own echo canceller where it has one; the default) or Call sound (the phone-call path, muffled but with the phone's call processing).
+- **The line:** Open line or Hold to talk; Stay on (no "are you still there?", no hang-up on a quiet line; with Hold to talk, a walkie-talkie) or Check on me; Cut in (what you say interrupts the agent's work) or Let it wait (it reaches the agent when it finishes; untouched, Cursor cuts in and the others wait).
+- **Voices:** where talkback is made, Laptop or Phone · Jenny, switchable mid-call with a line in the new voice, and each agent's laptop voice.
+
+Speak on the phone: Voices → Phone. Jenny (about 64 MB) downloads from your laptop, not the internet, once the laptop has prepared it (`./install.sh call` does; by hand, `~/.local/share/henchline/venv/bin/python -m voice.phonevoice prepare` in this repository).
 
 ## Hanging up
 
@@ -46,7 +52,7 @@ The app trusts only real certificates, so it needs the `tailscale serve` address
 
 ## Icons and drawings
 
-Its seven interface icons are Google's Material Design icons, under the Apache License 2.0 (`call/android/LICENSE-MATERIAL-ICONS`); the henchmen, and you as their boss next to your own messages, are drawn by `call/android/avatars.py`.
+Thirteen of its interface icons (listed in `call/android/LICENSE-MATERIAL-ICONS`) are Google's Material Design icons, under the Apache License 2.0; the henchmen, and you as their boss next to your own messages, are drawn by `call/android/avatars.py`.
 
 ## Files and chats
 
@@ -58,6 +64,17 @@ Off a call, an empty message box turns the send button into a mic. Hold it and s
 
 The round button on the chat list starts a new chat: the laptop offers the folders Claude Code already trusts (so its trust prompt never takes your first message), newest first, and the agents installed (Claude, Codex, the Cursor CLI). The agent starts in its own window of the tmux session `henchline` (`tmux attach -t henchline` to watch or type there), in a systemd scope of its own so restarting the call server leaves it running. Words reach it through a tmux paste buffer, so this works on any desktop. Agents started this way never wait for a keypress the phone can't give: Claude starts in auto mode, the Cursor CLI on Run Everything (`--force`), Codex sends its approvals to its own reviewer (`approvals_reviewer = "auto_review"` and `check_for_update_on_startup = false` in `~/.codex/config.toml`), and a folder trust question is answered yes only when that exact question, with that folder's path, is on screen (you get a notification when it is). Long-press a chat to clear it on the phone only, or, for an agent the phone started, to end it (asked first). Agents you started yourself are never ended from the phone.
 
-The bottom bar switches between Chats and Calls. Calls lists rings (who, why, answered, declined, missed or out of reach) and calls with their length; an ended call also leaves a line in its chat. Chat lines show their time, with a line between days.
+The bottom bar has three tabs, Usage, Chats and Calls; swipe sideways between them. Usage shows every agent's plan limits, reset times and context. Calls lists rings (who, why, answered, declined, missed or out of reach) and calls with their length; an ended call also leaves a line in its chat. Chat lines show their time, with a line between days.
 
 Messages from the phone off a call are tagged `[phone · text]`, `[phone · voice message]` or `[phone · shared]` (calls stay `[hands-free · call …]`), and the agents are told to answer those with `handsfree text`.
+
+## In the app
+
+- **Away:** tap your avatar (sunglasses on). Agents text you instead of speaking or ringing, and the laptop stops listening. Tap again to come back.
+- **Outbox and later:** a message typed while the laptop is out of reach waits with a clock and goes when it can. Hold send and slide up, or type `/later your words`, to pick a time to send it.
+- **Interrupt and ticks:** hold send (it turns amber) and let go to send now, interrupting the agent; slide left to cancel. One tick when sent, two once the agent takes it in.
+- **Plans:** a Plan tab in the chat shows the agent's steps and progress; the chip beside the message box puts Claude or the Cursor CLI into plan mode and back.
+- **Workflows:** while one of Claude's workflows runs, a strip above the chat shows its phase; tap it for a sheet with each phase and what its agents found.
+- **Commands:** type `/` for the agent's commands and skills, and the app's own (`/later`, `/usage`, `/away`, `/show` and more).
+- **Selecting:** long-press a message and choose Select, then tap more; copy, share or delete them. Swipe a message to reply to it.
+- **The crew:** a helper's chat sits under the agent that started it. A white hard hat runs a crew, a yellow one is on one, no hat works alone. Tap an avatar to see its helpers. A finished helper you were talking to, or that holds words not yet reported, waits for End or Keep.

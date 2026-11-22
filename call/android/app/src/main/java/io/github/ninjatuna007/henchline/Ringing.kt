@@ -16,9 +16,10 @@ object Ringing {
     fun started(context: Context, agent: String, why: String, reply: String?, host: RingHost? = null) {
         prefs(context).edit().putString(KEY, JSONObject().put("agent", agent).put("why", why).put("reply", reply ?: "")
             .put("until", System.currentTimeMillis() + RingService.RING_SECONDS * 1000)
-            .apply { host?.let { put("host_id", it.hostId).put("session", it.session).put("host_label", it.label)
-                // Only the app's own Answer carries it: the chat screen is reachable by links and other apps too
-                .put("answer_key", java.util.UUID.randomUUID().toString()) } }
+            .apply { host?.let { put("host_id", it.hostId).put("session", it.session).put("host_label", it.label) } }
+            // Every ring, the laptop's too: only the app's own Answer (RingService.answerIntent, an immutable explicit
+            // PendingIntent) carries it, since MainActivity and the chat screen are reachable by other apps and links
+            .put("answer_key", java.util.UUID.randomUUID().toString())
             .toString()).apply()
     }
 
@@ -35,7 +36,15 @@ object Ringing {
             key.isNotEmpty() && java.security.MessageDigest.isEqual(kept.toByteArray(), key.toByteArray())
     }
 
-    /** The key of the ring sounding now (another computer's), for its Answer. */
+    /** Whether MainActivity's ANSWER may start the laptop's call: the laptop's ring sounds now and the key is the one
+     *  only the app's own Answer carries (any installed app can send ANSWER to the exported MainActivity). */
+    fun mayAnswerLaptop(ring: JSONObject?, key: String): Boolean {
+        if (ring == null || hostOf(ring) != null || key.isEmpty()) return false
+        val kept = ring.optString("answer_key")
+        return kept.isNotEmpty() && java.security.MessageDigest.isEqual(kept.toByteArray(), key.toByteArray())
+    }
+
+    /** The key of the ring sounding now, for its Answer. */
     fun answerKey(ring: JSONObject?): String = ring?.optString("answer_key") ?: ""
 
     /** The ring sounding now if it is the laptop's: what the laptop's screens may answer. */

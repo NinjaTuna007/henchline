@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -56,6 +55,7 @@ from voice import phonevoice
 from call.auth import SIGNED  # noqa: E402  (a name only: the signed API itself loads with --api-v1)
 from voice import chains, commands, cursor_cli, files, minions, pickup, plans, reminders, snaps, spool, screenshot, subagents, usage, voices, workflows  # noqa: E402
 from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
+from voice.delivery import Refusal  # noqa: E402
 from voice.desktop import current as desktop, cursor_bridge, tmux  # noqa: E402
 from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CALL_SILENT, CALL_STAY_ON, CALL_HANGUP, CALL_MIRROR, CALL_ORIGIN,  # noqa: E402
                          CALL_DROPPED, REJOIN,
@@ -65,7 +65,7 @@ from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CA
                          CALL_RING, CALL_RINGER, CALL_TLS, HANDSFREE_LOG, HANDSFREE_MODE,
                          PHONE_MIC, PHONE_SPEAKER, PHONE_SPEAKER_MONITOR, Phase, Playing, SENT, SPEAKERS,
                          SPOOL, Sent, Speaker, in_call, last_speaker, log, phase_now, read_json,
-                         recent_speakers, turn_on_handsfree, write_json)
+                         recent_speakers, turn_on_handsfree, file_lock, write_json)
 
 MIC_RATE = 16000  # what the page sends: what hands-free listens at
 SPEAKER_RATE = 24000  # what the page plays: Kokoro's own rate
@@ -595,7 +595,8 @@ def typed(words: str, session: str, urgent: bool = False) -> tuple[bool, str]:
     return bool(got), note
 
 
-def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent: bool = False) -> tuple[str, str]:
+def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent: bool = False,
+             sender: str | None = None) -> tuple[str, str]:
     """Words for the agent whose chat the phone shows: (who got them, "") or ("", a note why nobody did).
 
     Another agent may have spoken since the phone last heard who is current: the chat shown wins, so the words
@@ -614,8 +615,10 @@ def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent
         current = last_speaker()
         if switch and (not current or current.session != session):
             routing.switch_to(target)
-    if not routing.deliver(words, heard, to=target, urgent=urgent):  # it says why out loud on the laptop, and keeps it
-        return "", "Not sent: " + (routing.why_not() or "the laptop couldn't type it into the agent.")
+    # sender: a reminder an agent or a script set (see routing.deliver_words)
+    delivery = routing.deliver(words, heard, to=target, urgent=urgent, sender=sender)  # said out loud on the laptop too
+    if not delivery:
+        return "", "Not sent: " + (delivery.why or "the laptop couldn't type it into the agent.")
     got = target or last_speaker()
     return (got.spoken() if got else "your agent"), ""
 
@@ -839,14 +842,8 @@ SPAWNED_LOCK = threading.Lock()  # SPAWNED is read, changed and written from the
 def spawned_locked():
     """SPAWNED for one read-change-write: this process's threads (SPAWNED_LOCK) and other processes (a lock file:
     `handsfree deploy` writes the same list from the command line while the server does)."""
-    with SPAWNED_LOCK:
-        SPAWNED.parent.mkdir(parents=True, exist_ok=True)
-        with open(SPAWNED.with_name(SPAWNED.name + ".lock"), "a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+    with SPAWNED_LOCK, file_lock(SPAWNED.with_name(SPAWNED.name + ".lock")):
+        yield
 
 
 def spawned(change=None) -> list[str]:
@@ -893,9 +890,10 @@ def owns(pane: str, pid: int = 0) -> bool:
     return False
 
 
-def trusted_folders() -> list[Path]:
+def trusted_folders(limit: int | None = 30) -> list[Path]:
     """Where a new chat can start: folders Claude Code already trusts (its own trust prompt would otherwise be the
-    first thing the phone's words answer), that still exist, most recently used first."""
+    first thing the phone's words answer), that still exist, most recently used first. limit=None: all of them
+    (a deploy checks its folder against these)."""
     try:
         projects = json.loads((Path.home() / ".claude.json").read_text()).get("projects", {})
     except (OSError, ValueError, AttributeError):
@@ -909,7 +907,7 @@ def trusted_folders() -> list[Path]:
             return 0.0
     # Not a hidden folder's insides (~/.claude/jobs/…: an agent's own scratch folders, which once showed up here)
     shown = (f for f in found if f.is_dir() and not any(part.startswith(".") for part in f.parts))
-    return sorted(shown, key=used, reverse=True)[:30]
+    return sorted(shown, key=used, reverse=True)[:limit]
 
 
 def notice(title: str, words: str) -> None:
@@ -2333,14 +2331,16 @@ async def crew_stop(request: web.Request) -> web.Response:
         if chat and not await loop.run_in_executor(None, cursor_bridge.working, chat):
             return web.json_response({"note": "That chat isn't working on anything, so nothing was stopped "
                                               "(its pending edits are left as they are)."}, status=409)
-        stopped = bool(chat) and await loop.run_in_executor(None, cursor_bridge.ask_selected, chat, {"stop": chat})
-        if not stopped and cursor_bridge.last_why == "not working":
+        answer = await loop.run_in_executor(None, cursor_bridge.ask_selected, chat, {"stop": chat}) if chat else None
+        stopped = bool(answer)
+        refusal = answer.refusal if answer is not None else None
+        if refusal is Refusal.NOT_WORKING:
             return web.json_response({"note": "That chat had just finished, so nothing was stopped "
                                               "(its pending edits are left as they are)."}, status=409)
-        if not stopped and cursor_bridge.last_why == "not a chat id":
+        if refusal is Refusal.NOT_A_CHAT_ID:
             return web.json_response({"note": "Cursor runs an older Henchline bridge: Reload Window in Cursor."},
                                      status=409)
-        if not stopped and cursor_bridge.last_why == "another chat is selected":
+        if refusal is Refusal.OTHER_CHAT_SELECTED:
             return web.json_response({"note": "Another chat is selected in Cursor, so nothing was stopped."},
                                      status=409)
     else:
@@ -2369,7 +2369,6 @@ async def crew_end(request: web.Request) -> web.Response:
     await asyncio.get_running_loop().run_in_executor(
         None, spawned, lambda alive: [e for e in alive if e.get("pane") != target.tab.address])
     # A deploy launch often has no session yet. Ending the pane from the phone still has to free that slot.
-    from voice import chains
     await asyncio.get_running_loop().run_in_executor(
         None, chains.close_child, session, target.tab.address, int(target.pid or 0))
     # Every name it went by: the same agent in the same pane may be known under its older key too (a Cursor CLI
@@ -2809,6 +2808,7 @@ def serve(address: str, port: int) -> bool:
 
 
 REMIND_EVERY = 10.0  # seconds between looks for due reminders
+WORKFLOWS_EVERY = 10.0  # seconds between looks at Claude's workflow runs
 
 
 async def watch_workflows(app: web.Application) -> None:
@@ -2845,7 +2845,29 @@ async def watch_workflows(app: web.Application) -> None:
             raise
         except Exception as exc:  # the loop must outlive any one run's files
             log(HANDSFREE_LOG, f"workflows: {exc}")
-        await asyncio.sleep(10)
+        await asyncio.sleep(WORKFLOWS_EVERY)
+
+
+def deliver_reminder(rid: str) -> None:
+    """One due reminder, claimed first (one cancelled meanwhile is never typed), then delivered, retried later, or
+    given up once it is an hour late."""
+    item = reminders.claim(rid)
+    if item is None:
+        return
+    late = time.time() - item.at
+    # One the user didn't set on the phone says who set it, and is never typed as a slash command
+    got, note = to_agent(item.words, item.session, Heard.SCHEDULED, False,
+                         sender=None if item.users else item.sender)
+    if got:
+        reminders.settle(item.id, reminders.ReminderState.DELIVERED,
+                         f"to {got}" + (f", {late / 60:.0f} min late" if late > 120 else ""))
+        log(HANDSFREE_LOG, f"reminder {item.id} delivered to {got}" + (f" ({late:.0f} s late)" if late > 30 else ""))
+    elif late > reminders.RETRY_FOR:
+        reminders.settle(item.id, reminders.ReminderState.FAILED, note)
+        log(HANDSFREE_LOG, f"reminder {item.id} given up: {note}")
+    else:
+        reminders.later(item.id)
+        log(HANDSFREE_LOG, f"reminder {item.id} not delivered yet ({note}): trying again later")
 
 
 async def deliver_reminders(app: web.Application) -> None:
@@ -2855,19 +2877,8 @@ async def deliver_reminders(app: web.Application) -> None:
     awake: list = [None]  # the sleep inhibitor, while one is wanted
     while True:
         try:
-            for item in reminders.due():
-                late = time.time() - item["at"]
-                got, note = await loop.run_in_executor(
-                    None, to_agent, item["words"], item["session"], Heard.SCHEDULED, False)
-                if got:
-                    reminders.settle(item["id"], "delivered", f"to {got}" + (f", {late / 60:.0f} min late" if late > 120 else ""))
-                    log(HANDSFREE_LOG, f"reminder {item['id']} delivered to {got}" + (f" ({late:.0f} s late)" if late > 30 else ""))
-                elif late > reminders.RETRY_FOR:
-                    reminders.settle(item["id"], "failed", note)
-                    log(HANDSFREE_LOG, f"reminder {item['id']} given up: {note}")
-                else:
-                    reminders.later(item["id"])
-                    log(HANDSFREE_LOG, f"reminder {item['id']} not delivered yet ({note}): trying again later")
+            for found in await loop.run_in_executor(None, reminders.due):
+                await loop.run_in_executor(None, deliver_reminder, found.id)
             until = reminders.keep_awake_until()
             if until > time.time() and awake[0] is None:
                 awake[0] = await asyncio.create_subprocess_exec(
@@ -2892,12 +2903,13 @@ async def deliver_reminders(app: web.Application) -> None:
             raise
 
 
-async def start_reminders(app: web.Application) -> None:
+async def start_watchers(app: web.Application) -> None:
+    """The server's own loops: due reminders delivered, and finished workflow runs told to the phone."""
     app["reminders"] = asyncio.create_task(deliver_reminders(app))
     app["workflows"] = asyncio.create_task(watch_workflows(app))
 
 
-async def stop_reminders(app: web.Application) -> None:
+async def stop_watchers(app: web.Application) -> None:
     app["reminders"].cancel()
     app["workflows"].cancel()
 
@@ -3050,7 +3062,14 @@ def main() -> int:
     if sys.argv[1:2] in (["pair"], ["devices"]):
         from call import pair
         return (pair.main if sys.argv[1] == "pair" else pair.devices_main)(sys.argv[2:])
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        prog="voice-call", description="The call server: the phone's call page and the Henchline app's laptop side.",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""also (each with its own --help):
+  voice-call pair [--json]            show a five-minute code that pairs a phone
+  voice-call devices list | revoke ID the paired phones, and removing one
+  voice-call backup --output FILE     a private copy of the host database
+  voice-call directory enroll | status | heartbeat | withdraw
+                                      this host in a directory of hosts (a preview)""")
     parser.add_argument("--port", type=int, default=CALL_PORT)
     parser.add_argument("--cert", type=Path, help="serve https with this certificate (and --key): a self-signed one\n"
                         "works when `tailscale serve` is not available; the phone accepts it once")
@@ -3140,8 +3159,8 @@ def main() -> int:
     app.router.add_get("/reminders", reminders_list)
     app.router.add_post("/reminders", reminders_add)
     app.router.add_post("/reminders/cancel", reminders_cancel)
-    app.on_startup.append(start_reminders)
-    app.on_cleanup.append(stop_reminders)
+    app.on_startup.append(start_watchers)
+    app.on_cleanup.append(stop_watchers)
     app.router.add_post("/crew/model", crew_model)
     app.router.add_get("/files/{secret}/{name}", sent_file)
     if args.api_v1 and (why := mount_api_v1(app, args.directory_heartbeat, args.signed_only)):

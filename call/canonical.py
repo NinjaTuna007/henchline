@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import re
+import time
 from typing import Any, Iterable
 from urllib.parse import quote_from_bytes, unquote_to_bytes
 
@@ -19,6 +20,16 @@ UNRESERVED = "-._~"
 MAX_SAFE_INTEGER = 2 ** 53 - 1
 B64URL = re.compile(r"[A-Za-z0-9_-]+")
 BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
+RFC3339 = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def rfc3339(at: float | None = None) -> str:
+    """A moment (seconds since the epoch; now when None) as the one timestamp form descriptors, pairing codes and
+    events carry: RFC 3339 UTC to the second, "2026-11-21T12:00:00Z" (fractions dropped). It goes into signed
+    bytes: never change its spelling."""
+    return time.strftime(RFC3339, time.gmtime(time.time() if at is None else at))
 
 
 def b64url(data: bytes) -> str:

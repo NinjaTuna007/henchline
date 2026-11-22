@@ -8,13 +8,11 @@ MAX_AGE is let go (the file stays in Downloads/Henchline): it must not join a tu
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import time
 from pathlib import Path
 
 from voice import files
-from voice.state import CALL_SNAPS, read_json, write_json
+from voice.state import CALL_SNAPS, file_lock, read_json, write_json
 
 WAIT = 45.0  # seconds a photo waits for a spoken turn before it is sent on its own
 TRIES = 3  # failed deliveries on their own before a photo is let go
@@ -22,12 +20,8 @@ MAX_AGE = 600.0  # seconds after which it is no longer "just taken": dropped fro
 LOCK = CALL_SNAPS.with_suffix(".lock")
 
 
-@contextlib.contextmanager
 def _locked():
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with LOCK.open("a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)  # released as the file closes
-        yield
+    return file_lock(LOCK)
 
 
 def _read(now: float) -> list[dict]:

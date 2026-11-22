@@ -91,8 +91,25 @@ def delivered(meta: dict) -> None:
 
 
 # Where credentials live: an agent steered by something it read must not be able to put these on the phone
+# Henchline's own: the host's signing key and pairing database (~/.local/share/henchline/keys, host.sqlite3), and
+# ~/.config/henchline (host.json, and signing.properties with the release keystore's passwords)
 PRIVATE = (".ssh", ".gnupg", ".aws", ".kube", ".docker", ".password-store", ".config/notify-user", ".config/ptt",
-           ".local/share/keyrings", ".mozilla", ".config/google-chrome", ".config/chromium", ".netrc", ".pgpass")
+           ".local/share/keyrings", ".mozilla", ".config/google-chrome", ".config/chromium", ".netrc", ".pgpass",
+           ".config/henchline", ".local/share/henchline/keys", ".local/share/henchline/host.sqlite3")
+# Keys and keystores by their names: the host's and the directory's keys (*.ed25519, wherever their configs put
+# them), an Android release keystore (*.jks, *.keystore)
+KEY_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".kdbx", ".ed25519", ".jks", ".keystore")
+
+
+def configured_secrets() -> list[Path]:
+    """The host key and database where ~/.config/henchline/host.json moved them, if it did."""
+    try:
+        raw = read_json(Path.home() / ".config/henchline/host.json")
+    except OSError:
+        return []
+    if not isinstance(raw, dict):
+        return []
+    return [Path(raw[k]).expanduser().resolve() for k in ("key_file", "database") if isinstance(raw.get(k), str) and raw[k]]
 
 
 def private(path: Path) -> bool:
@@ -100,7 +117,9 @@ def private(path: Path) -> bool:
     path, home = path.resolve(), Path.home().resolve()
     if any(path == home / p or home / p in path.parents for p in PRIVATE):
         return True
-    return path.suffix in (".pem", ".key", ".p12", ".pfx", ".kdbx") or path.name.startswith("id_")
+    if path in configured_secrets():
+        return True
+    return path.suffix in KEY_SUFFIXES or path.name.startswith("id_")
 
 
 def find(secret: str, name: str) -> Path | None:

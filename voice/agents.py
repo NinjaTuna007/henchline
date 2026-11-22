@@ -182,7 +182,57 @@ def identity(agent: str = "", session: str = "") -> tuple[str, str]:
                    or (os.environ.get("CURSOR_TRACE_ID") if agent == "cursor" else None)
                    or (editor_workspace() if agent == "cursor" and in_cursor_sandbox() else None)
                    or str(agent_folder()))
-    return agent, re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{agent}-{session}")[-120:]
+    return agent, _key(agent, session)
+
+
+def run_by_agent() -> bool:
+    """Is an agent behind this command, by the process tree (or Cursor's sandbox, which hides it)? Never by the
+    environment: a variable anyone can set must not make an agent's command pass for a timer's or a script's."""
+    return nearest_agent() is not None or in_cursor_sandbox()
+
+
+def vouched(agent: str, session: str) -> str:
+    """"" when the process tree backs the caller's claim to be that agent session, else why not. The session comes
+    from environment variables a child can set to another's (CLAUDE_CODE_SESSION_ID), so the agent process this
+    command runs under must itself be that chat: Claude's own record of its pid, or the id the process carries
+    (resume._is_chat), or, for a folder key, that process's folder."""
+    from voice import resume
+    if agent == "cursor" and in_cursor_sandbox():
+        # Cursor's editor sandbox hides the tree; nothing started outside it (a terminal agent) runs inside it
+        return ""
+    mine = nearest_agent()
+    if mine is None:
+        return "not run by an agent"
+    if mine.agent != agent:
+        return f"run by {mine.agent}, not {agent}"
+    if mine.is_editor:  # one Cursor editor process serves all its chats: the chat can't be told from the tree
+        return ""
+    wrong = f"this command runs under another {agent} session than {session}"
+    chat = resume.chat_id(session)
+    if chat:
+        if agent == "claude":
+            # The nearest Claude that keeps a record decides (a background-session host may keep none of its own)
+            for up in (p for p in ancestors() if p.agent == "claude"):
+                if (record := resume.claude_record(up.pid)) is not None:
+                    return "" if record == chat else wrong
+        try:
+            environ = Path(f"/proc/{mine.pid}/environ").read_bytes()
+        except OSError:
+            environ = b""
+        try:
+            command = Path(f"/proc/{mine.pid}/cmdline").read_bytes()
+        except OSError:
+            command = b""
+        return "" if resume._is_chat(agent, chat, mine.pid, environ, command) else wrong
+    try:
+        folder = mine.folder
+    except OSError:
+        return wrong
+    return "" if session == _key(agent, str(folder)) else wrong
+
+
+def _key(agent: str, session: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{agent}-{session}")[-120:]
 
 
 def process(pid: int) -> Process | None:

@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from voice.agents import process
-from voice.desktop import Tab, Terminals, Window
+from voice.desktop import Tab, Terminals, Window, typeable
 
 OWNER = "tmux"
 SESSION = "henchline"  # where the phone's new chats run: `tmux attach -t henchline`
@@ -416,8 +416,9 @@ class WithTmux(Terminals):
             return self.inner.type_line(tab, text, again=again, taken=taken)
         # Through a paste buffer from stdin: the words are never tmux arguments, so a leading "-" or a trailing ";"
         # (tmux's command separator) can't be read as tmux's own, and a newline doesn't send early
+        # Control characters gone first: an ESC[201~ in the words would end the paste early and type the rest as keys
         buffer = f"henchline-{os.getpid()}-{time.monotonic_ns()}"
-        loaded = tmux("load-buffer", "-b", buffer, "-", given=text)
+        loaded = tmux("load-buffer", "-b", buffer, "-", given=typeable(text))
         pasted = loaded and loaded.returncode == 0 and tmux("paste-buffer", "-d", "-p", "-b", buffer, "-t", tab.address)
         if not pasted or pasted.returncode != 0:
             tmux("delete-buffer", "-b", buffer)

@@ -464,10 +464,7 @@ def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
     phone falls back (behind, hot, low battery), what's left goes back to the spool and the laptop says it."""
     plan = pieces(list(clip.sentences), intro, rtf=phonevoice.plan_rtf(), min_chars=PHONE_MIN_CHARS)
     name = clip.voice or (VOICES[clip.agent] if clip.agent in SYSTEM else chosen_voice(clip.agent))
-    sid = phonevoice.voice_id(name)
-    if sid is None:  # a voice the phone lacks: said by the laptop
-        phonevoice.offer({"tts": "fallback", "reason": f"no voice {name} on the phone"})
-        return
+    sid = phonevoice.SPEAKER  # every agent is Jenny, the phone voice's one speaker, whichever voice the laptop uses
     # Phonemes made here: the phone's engine has no text front end for its voice, it speaks only these
     dropped: set[str] = set()
     ph = phonevoice.phonemes([TAGS.sub("", piece).strip() for piece in plan.pieces], dropped)

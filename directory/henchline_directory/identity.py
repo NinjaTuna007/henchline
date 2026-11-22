@@ -122,4 +122,4 @@ class Identity:
 
 
 def expires(lifetime: float) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + lifetime))
+    return canonical.rfc3339(time.time() + lifetime)

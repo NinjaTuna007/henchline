@@ -22,8 +22,8 @@ android {
         applicationId = "io.github.ninjatuna007.henchline"
         minSdk = 29
         targetSdk = 35
-        versionCode = 8
-        versionName = "2.5"
+        versionCode = 9
+        versionName = "3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += "arm64-v8a" }  // the phones this app is for; keeps sherpa-onnx's other libraries out
     }

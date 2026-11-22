@@ -30,7 +30,7 @@ import threading
 import time
 from pathlib import Path
 
-from voice.state import STATE, read_json, write_json
+from voice.state import STATE, file_lock, read_json, write_json
 
 # The model's name is the format's version: a phone holding another model (Kokoro, before 2026-11-22) isn't offered
 # this one's files under its old folder, it downloads these afresh, and the laptop takes only this model's offers
@@ -52,6 +52,10 @@ FILES = (ONNX, "tokens.txt", "MODEL_CARD") + ESPEAK  # all the phone loads (MODE
 SPEAKER = 0  # Jenny is the model's only speaker
 
 CALL_TTS = STATE / "call.tts"
+# Every change to CALL_TTS holds this: the call server (offers, acks) and the talkback worker (its own fallbacks) both
+# change it, and an ack's speed written over a fallback would leave the laptop thinking the phone speaks
+CALL_TTS_LOCK = STATE / "call.tts.lock"
+RTF_STEP = 0.05  # an ack's render speed is written only when it moved more than this fraction
 PHONE_SAY = STATE / "phone-say"
 PHONE_RTF = 0.5  # until the phone reports its own: Jenny rendered at 0.14 on the phone's little cores, 2026-11-22
 PLAN_RTF_MIN = 0.3  # never planned faster than this: a render also waits for the call's own threads
@@ -119,11 +123,6 @@ def prepare(root: Path = ROOT) -> Path:
     return target
 
 
-def voice_id(name: str) -> int | None:
-    """A voice's id on the phone: Jenny is its one speaker, whichever agent's voice the laptop would use."""
-    return SPEAKER
-
-
 def stale(root: Path = ROOT) -> list[Path]:
     """Folders of models the phone no longer uses (Kokoro's), left by an earlier prepare."""
     return [p for p in root.iterdir() if p.is_dir() and p.name != VERSION] if root.is_dir() else []
@@ -142,24 +141,27 @@ def offer(message: dict) -> None:
     voice mid-call ({"tts": "laptop"}): after either of the last two, this call streams the laptop's audio again."""
     tts = message.get("tts")
     if tts == "laptop":  # kept as a fallback with its own reason: the phone's measured speed stays for a switch back
-        state = read_json(CALL_TTS) if CALL_TTS.exists() else {}
-        if state:
-            state["fallback"] = CHOSE_LAPTOP
-            write_json(CALL_TTS, state)
+        with file_lock(CALL_TTS_LOCK):
+            state = read_json(CALL_TTS) if CALL_TTS.exists() else {}
+            if state:
+                state["fallback"] = CHOSE_LAPTOP
+                write_json(CALL_TTS, state)
         return
     if isinstance(tts, dict):
-        if tts.get("model") == VERSION and tts.get("engine") == ENGINE:
-            state = {"engine": tts["engine"], "model": tts["model"], "fallback": ""}
-            if _rtf(tts.get("rtf")):
-                state["rtf"] = _rtf(tts.get("rtf"))
-            write_json(CALL_TTS, state)
-        else:
-            CALL_TTS.unlink(missing_ok=True)
+        with file_lock(CALL_TTS_LOCK):
+            if tts.get("model") == VERSION and tts.get("engine") == ENGINE:
+                state = {"engine": tts["engine"], "model": tts["model"], "fallback": ""}
+                if _rtf(tts.get("rtf")):
+                    state["rtf"] = _rtf(tts.get("rtf"))
+                write_json(CALL_TTS, state)
+            else:
+                CALL_TTS.unlink(missing_ok=True)
     elif tts == "fallback":
-        state = read_json(CALL_TTS) if CALL_TTS.exists() else {}
-        if state:
-            state["fallback"] = str(message.get("reason") or "the phone asked")[:200]
-            write_json(CALL_TTS, state)
+        with file_lock(CALL_TTS_LOCK):
+            state = read_json(CALL_TTS) if CALL_TTS.exists() else {}
+            if state:
+                state["fallback"] = str(message.get("reason") or "the phone asked")[:200]
+                write_json(CALL_TTS, state)
         clip = str(message.get("id") or "")
         if ID.fullmatch(clip):
             heard = message.get("heard")
@@ -210,7 +212,8 @@ def phone_renders() -> bool:
 
 def call_over() -> None:
     """The call ended: the offer goes, and so do clips nobody will speak (the worker texts or keeps its own)."""
-    CALL_TTS.unlink(missing_ok=True)
+    with file_lock(CALL_TTS_LOCK):
+        CALL_TTS.unlink(missing_ok=True)
     if PHONE_SAY.is_dir():
         for path in PHONE_SAY.iterdir():
             path.unlink(missing_ok=True)
@@ -360,13 +363,21 @@ def said(message: dict) -> None:
         return
     rtf = _rtf(ack.get("rtf"))
     if rtf and CALL_TTS.exists():  # the phone's running render speed: the next clip is cut for it
-        state = read_json(CALL_TTS)
-        if state and state.get("rtf") != rtf:
-            state["rtf"] = rtf
-            write_json(CALL_TTS, state)
+        _note_rtf(rtf)
     piece = ack.get("piece")
     _progress(str(ack["id"]), spoken=piece + 1 if isinstance(piece, int) and piece >= 0 else None,
               done=bool(ack.get("done")))
+
+
+def _note_rtf(rtf: float) -> None:
+    """The phone's render speed, kept when it moved by more than RTF_STEP: nearly every ack carries one, and a
+    rewrite each time would only race the other writers (they hold the same lock, so none is lost either way)."""
+    with file_lock(CALL_TTS_LOCK):
+        state = read_json(CALL_TTS) if CALL_TTS.exists() else {}
+        known = _rtf(state.get("rtf"))
+        if state and (not known or abs(rtf - known) > RTF_STEP * known):
+            state["rtf"] = rtf
+            write_json(CALL_TTS, state)
 
 
 def _progress(clip: str, spoken: int | None = None, done: bool = False, fallback: str = "",

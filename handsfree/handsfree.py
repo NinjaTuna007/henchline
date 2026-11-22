@@ -6,14 +6,16 @@
     handsfree listen [SECONDS]         keep listening that long (default 180)
     handsfree close                    stop listening until the wake word
     handsfree hangup                   end the phone call (call/), once talkback has finished speaking
-    handsfree ring [--done] [--now] [--no-wait] [--check] [--as SESSION] [WHY]
+    handsfree ring [--done] [--now] [--urgent] [--no-wait] [--check] [--as SESSION] [WHY]
                                        ring the user's phone (Henchline full-screen, else an ntfy notification
                                        whose Answer opens Henchline) and wait up to a minute for what happened:
                                        exit 0 answered, 2 rang but not answered, 3 declined, 4 answered but the
-                                       call couldn't reach the laptop, 5 never reached the phone, 1 not rung.
+                                       call couldn't reach the laptop, 5 never reached the phone, 6 not rung
+                                       because the user is away (text them instead), 1 not rung.
                                        Unless answered, a missed call with WHY is left in ntfy (the topic is
                                        read from ~/.config/ptt/ntfy-topic). --now: past the 2-minute limit,
-                                       for a ring the user asked for. --no-wait: ring and return. --done: the
+                                       for a ring the user asked for. --urgent: past Away, for something that
+                                       truly can't wait. --no-wait: ring and return. --done: the
                                        ring reports finished work. --check: the call asks after them if they
                                        go quiet (a wake-up, or an answer is needed). The usual call stays on.
                                        --as SESSION: ring as
@@ -31,15 +33,18 @@
     handsfree text-status ID            sent, delivered (on the phone) or read (opened, or replied to)
     handsfree remind [--keep-awake] [--to "AGENT [in WORKSPACE]"] TIME WORDS
                                        type WORDS into an agent at TIME (08:30, tomorrow 08:30,
-                                       2026-11-18 08:30, in 20m), tagged [henchline · scheduled]: yourself by
-                                       default, or the agent named. The call server delivers it, through the
+                                       2026-11-18 08:30, in 20m), tagged [henchline · scheduled · from
+                                       <you>]: yourself by default, or the agent named (from an agent: only
+                                       its boss or its own helpers). Never typed as a slash command. The
+                                       call server delivers it, through the
                                        same path as a phone message, even to Cursor. --keep-awake: the laptop
                                        doesn't sleep by itself until it is delivered (a wake-up call); a
                                        closed lid still suspends it. Prints its id
     handsfree remind list | cancel ID   the reminders set, and taking one back
     handsfree deploy --agent claude|cursor|codex --folder PATH --ask WORDS
                                        start that agent in a new tmux pane in PATH
-                                       (not a resumed chat) and type WORDS. The
+                                       (a folder that agent already trusts; never
+                                       a resumed chat) and type WORDS. The
                                        caller is the boss. The child reports with
                                        `handsfree report`
     handsfree report WORDS             the caller is a child: WORDS go to the boss
@@ -53,9 +58,10 @@
                                        be pushed) that saves and opens it. Any type; kept 7 days. Exit 0 sent,
                                        1 not
     handsfree show [--screen | --window 0xID] [WORDS]
-                                       "show me": a picture of this terminal, one window, or the whole screen
-                                       tmux's own text, works with the screen locked), or with --screen the whole
-                                       screen (also when it isn't in tmux), sent as `handsfree send` does
+                                       "show me": a picture of this terminal pane (drawn from tmux's own text,
+                                       works with the screen locked), with --window that window's own picture
+                                       (also locked), or with --screen the whole screen (also when it isn't in
+                                       tmux), sent as `handsfree send` does
 
 The built-in mic runs through the echo canceller (sensing.py). The listener
 (listener.py) records a turn when the user talks after a clip, over a clip,
@@ -202,6 +208,22 @@ def caller(register: bool = False) -> Speaker | None:
     speaker.pin()
     speaker.save(SPEAKERS / f"{session}.json")
     speaker.replaces_found()  # found running from a new chat before it texted: that chat follows it
+    return speaker
+
+
+def vouched_caller(register: bool = False) -> Speaker | None:
+    """`caller`, refused (None, with why printed) when the process tree doesn't back its claim to be that session:
+    for commands that act as one agent on others (deploy, report, end, remind), so a child can't pass for its boss
+    by setting the boss's session id in its environment."""
+    from voice.agents import vouched
+    speaker = caller(register)
+    if speaker is None:
+        return None
+    why = vouched(speaker.agent, speaker.session)
+    if why:
+        log(HANDSFREE_LOG, f"refused {speaker.session[:40]}'s command: {why}")
+        print(f"refused: {why}")
+        return None
     return speaker
 
 
@@ -597,6 +619,13 @@ def remind(args: list[str]) -> int:
     if not words:
         print("nothing to say: handsfree remind TIME WORDS")
         return 1
+    from voice import chains
+    from voice.agents import run_by_agent
+    # The process tree, not the environment, says whether an agent is asking: a timer or a script may send to anyone
+    me = vouched_caller(register=True) if run_by_agent() else None
+    if run_by_agent() and me is None:
+        print("couldn't tell which agent is asking, so no reminder was set")
+        return 1
     if to:
         parts = re.split(r"\s+in\s+", to, maxsplit=1)
         target = routing.find(parts[0].strip(), parts[1].strip() if len(parts) > 1 else None)
@@ -604,13 +633,22 @@ def remind(args: list[str]) -> int:
             print(f"no agent heard lately matches {to!r}")
             return 1
         session = target.session
+        # An agent reaches only its own chain: itself, the boss that started it, or a child it started
+        if me is not None:
+            mine, boss = chains.aliases(me.session), chains.parent_of(me.session)
+            own = session in mine or (boss and session in chains.aliases(boss)) \
+                or chains.parent_of(session) in mine
+            if not own:
+                print(f"an agent can only remind itself, its boss or its own helpers, not {target.spoken()}")
+                return 1
     else:
-        speaker = caller(register=True)
-        if speaker is None:
+        if me is None:
             print("couldn't tell which agent is asking: use --to")
             return 1
-        session = speaker.session
-    item = reminders.add(due, session, words, "agent" if not to else "user", keep_awake)
+        session = me.session
+    # Always an agent's (or a script's) reminder, never the user's: tagged with who set it, and never typed as a
+    # slash command when it is due
+    item = reminders.add(due, session, words, "agent", keep_awake, sender=(f"{me.agent} in {me.where}" if me.where else me.agent) if me else "")
     print(f"reminder {item['id']} for {time.strftime('%a %d %b %H:%M', time.localtime(due))} to {session}"
           + (" (the laptop stays awake until then)" if keep_awake else ""))
     if subprocess.run(["systemctl", "--user", "is-active", "--quiet", "call.service"]).returncode != 0:
@@ -652,13 +690,13 @@ def main() -> int:
         return remind(args)
     if command == "deploy":
         from voice.minions import deploy
-        return deploy(args, caller)
+        return deploy(args, vouched_caller)
     if command == "report":
         from voice.minions import report
-        return report(args, caller)
+        return report(args, vouched_caller)
     if command == "end":
         from voice.minions import end
-        return end(args, caller)
+        return end(args, vouched_caller)
     if command == "send":
         return send(args)
     if command == "show":

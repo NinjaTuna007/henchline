@@ -8,21 +8,20 @@ chat for an agent that lives there.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
-import threading
 import time
 from enum import Enum
 from pathlib import Path
 
 from voice import snaps
+from voice.delivery import Delivery, Refusal
 from voice.agents import SPOKEN_TO, identity, process, started
 from voice.desktop import Tab, current as desktop, cursor_bridge, cursor_cdp
-from voice.state import (AWAY, BY_HANDSFREE, CALL_CUT_IN, CALL_INTERRUPT, CALL_PINNED, CALL_TOLD, CHAT_KEY, HANDSFREE_LOG, INTRODUCED, LAST, LISTEN, SPEAKERS, STATE, Sent,
+from voice.state import (AWAY, BY_HANDSFREE, file_lock, CALL_CUT_IN, CALL_INTERRUPT, CALL_PINNED, CALL_TOLD, CHAT_KEY, HANDSFREE_LOG, INTRODUCED, LAST, LISTEN, SPEAKERS, STATE, Sent,
                          Speaker, in_call, last_speaker, log, recent_speakers, renamed)
 
 SAY = Path(__file__).resolve().parents[2] / "talkback/scripts/say.py"
@@ -46,6 +45,12 @@ class Heard(str, Enum):
     TEXTED = "text"  # typed in Henchline's chat, or in an agent's text notification
     VOICE_NOTE = "voice message"  # recorded in Henchline off a call, transcribed here: may be misheard
     SCHEDULED = "scheduled"  # a reminder the user (or an agent) set for this time: `handsfree remind`, the phone's /later
+
+    @staticmethod
+    def tagged(sender: str) -> str:
+        """A reminder an agent set: "[henchline · scheduled · from claude in henchline]" (a script's: no name)."""
+        name = re.sub(r"[\[\]\s]+", " ", sender).strip()
+        return f"[henchline · scheduled · from {name}]" if name else "[henchline · scheduled]"
 
     @property
     def tag(self) -> str:
@@ -382,8 +387,7 @@ def _claim(chat: str) -> tuple[str, str]:
     _RESUMING.mkdir(parents=True, exist_ok=True)
     if not path.exists():  # create only: touching an old reservation would make it look new, and its age matters
         path.touch()
-    with path.open("r+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    with file_lock(path, "r+") as handle:
         data = _load(handle)
         owner, address = str(data.get("owner") or ""), str(data.get("address") or "")
         tab = Tab(owner, address) if owner and address else Tab()
@@ -408,8 +412,7 @@ def _write_reservation(chat: str, tab: Tab, token: str, phase: str = "wait") -> 
     path = _RESUMING / chat
     if not path.exists():
         return
-    with path.open("r+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    with file_lock(path, "r+") as handle:
         data = _load(handle)
         if data.get("token") != token:
             return
@@ -426,8 +429,7 @@ def _clear_reservation(chat: str, token: str = "", *, force: bool = False) -> No
     path = _RESUMING / chat
     if not path.exists():
         return
-    with path.open("r+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    with file_lock(path, "r+") as handle:
         if not force and _load(handle).get("token") != token:
             return
         handle.seek(0)
@@ -605,21 +607,14 @@ def introduced(speaker: Speaker, heard: Heard) -> None:
         (INTRODUCED / speaker.session).touch()
 
 
-_why = threading.local()  # per thread: the call server delivers on several at once
-
-
-def why_not() -> str:
-    """Why this thread's last delivery didn't happen, for a text's sender (the phone) as well as the room."""
-    return getattr(_why, "words", "")
-
-
-def refuse(words: str) -> None:
-    """A delivery that can't happen: said out loud, and kept for the phone (it said only "the laptop says why",
-    out of the user's earshot, 2026-11-16)."""
-    _why.words = words
-    # A scheduled message failing (logged and retried) or the user away (the phone shows why): never said aloud
-    if not getattr(_why, "quiet", False) and not (AWAY.exists() and not in_call()):
+def refuse(refusal: Refusal, words: str, quiet: bool = False) -> Delivery:
+    """A delivery that can't happen: said out loud, and returned with its reason for the phone too (it said only
+    "the laptop says why", out of the user's earshot, 2026-11-16). quiet: a scheduled message or a report, whose
+    failure is logged and retried, never said in the room."""
+    # The user away (the phone shows why): never said aloud either
+    if not quiet and not (AWAY.exists() and not in_call()):
         say(words)
+    return Delivery.refused(refusal, words)
 
 
 _interrupted: dict[str, float] = {}  # tab → when "send now" last interrupted its agent
@@ -682,18 +677,19 @@ def is_command(text: str, speaker: Speaker | None) -> bool:
     return found.group(1) in {c["name"] for c in commands.listed(speaker.agent, project) if c["kind"] != "phone"}
 
 
-def deliver(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = False) -> bool:
+def deliver(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = False,
+            sender: str | None = None) -> Delivery:
     """`deliver_words`, with the photos the user took on the call screen since the last turn going along with these
     words (a spoken or typed turn on a call; a command, a text or a share carries none). Put back if not delivered."""
     from voice import chains
     # A child's report is not the user's turn: no call photos, and it does not move the pinned call.
-    if text.lstrip().startswith(chains.REPORT):
-        return deliver_words(text, heard, to, urgent)
+    if text.lstrip().startswith(chains.REPORT) or sender is not None:
+        return deliver_words(text, heard, to, urgent, sender=sender)
     speaker = to or last_speaker()
     if not in_call() or heard in PHONE or heard is Heard.SCHEDULED or speaker is None or is_command(text, speaker):
         return deliver_words(text, heard, to, urgent)
     photos = snaps.take(speaker.session)
-    delivered = False
+    delivered: Delivery | None = None
     try:
         delivered = deliver_words(text, heard, to, urgent, snaps.words(photos))
     finally:
@@ -702,31 +698,36 @@ def deliver(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = F
     return delivered
 
 
-def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = False, extra: str = "") -> bool:
+def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = False,
+                  extra: str = "", sender: str | None = None) -> Delivery:
     """Type the words, tagged with how they were heard, to `to`, or else to the agent that spoke last. When it
-    can't, says why out loud and leaves the reason in why_not(), for the phone to show too. urgent: the phone's
+    can't, says why out loud and returns the reason, for the phone to show too. urgent: the phone's
     "send now" (held send button): the agent's work is interrupted first, so the words reach it at once instead of
-    waiting in its queue (Escape in a terminal; in a Cursor chat, Enter again, which sends a queued message now)."""
+    waiting in its queue (Escape in a terminal; in a Cursor chat, Enter again, which sends a queued message now).
+    sender: the words are a reminder an agent (or a script, "") set, not the user: tagged with who set it and never
+    typed as a slash command, so one agent can't run another's commands or pass for the user."""
     from voice import chains
-    _why.words = ""
+    from voice.desktop import typeable
+    # No control characters from anywhere (a shared web page, a child's report, a reminder): an ESC or a carriage
+    # return would act in the agent's terminal as keys. Each typing path strips them again on its own.
+    text, extra = (typeable(text) if text else text), typeable(extra)
     # A report is typed as itself (it already carries its marker). A failure isn't spoken: nobody in the room asked.
-    report = bool(text) and str(text).lstrip().startswith(chains.REPORT)
-    _why.quiet = heard is Heard.SCHEDULED or report  # a scheduled message is retried later by the call server
+    report = sender is None and bool(text) and str(text).lstrip().startswith(chains.REPORT)
+    quiet = heard is Heard.SCHEDULED or report  # a scheduled message is retried later by the call server
     speaker = to or last_speaker()
     # A slash command ("/compact", "/rename …") is typed exactly as it is: an agent runs a line as a command only
     # when it starts with "/", so no tag, introduction or call note in front of it (none of those is then given)
-    command = report or is_command(text, speaker)
+    command = report or (sender is None and is_command(text, speaker))
+    tag = heard.tag if sender is None else Heard.SCHEDULED.tagged(sender)
     message = text.strip() if command \
-        else f"{heard.tag} {introduce(speaker, heard)}{on_a_call(speaker, heard)}{text}{extra}"
+        else f"{tag} {introduce(speaker, heard)}{on_a_call(speaker, heard)}{text}{extra}"
     if speaker is None:
         log(HANDSFREE_LOG, "nobody to send to")
-        refuse("I heard you, but no agent has spoken yet.")
-        return False
+        return refuse(Refusal.NOBODY, "I heard you, but no agent has spoken yet.", quiet)
     missing = place(speaker)
     if missing:
         log(HANDSFREE_LOG, f"place {speaker.session[:24]}: {missing}")
-        refuse(missing)
-        return False
+        return refuse(Refusal.NOT_PLACED, missing, quiet)
     tab = speaker.tab
     if speaker.in_editor:
         # That very chat brought to the front first, by Henchline's bridge in Cursor; without it, the window's
@@ -735,31 +736,30 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
         if chat and cursor_cdp.available(speaker.where):
             # Through Cursor's debugging port: that chat's box by its id, a real Enter, no keys on the desktop and
             # no window raised, so it works with the screen locked. Never then typed with keys: no second copy.
-            why = "" if cursor_bridge.open_chat(speaker.where, chat) else (
-                cursor_bridge.last_why or "the bridge couldn't open that chat")
+            opened = cursor_bridge.open_chat(speaker.where, chat)
+            why = opened.why or ("" if opened else "the bridge couldn't open that chat")
             why = why or cursor_cdp.send(speaker.where, chat, message, urgent=urgent)
             log(HANDSFREE_LOG, f"sent to cursor chat {chat[:8]} in {speaker.where} (debugging port)" if not why
                 else f"Cursor chat {chat[:8]} in {speaker.where}: {why}; nothing typed with keys")
             if why:
-                refuse(f"Cursor didn't take that: {why}.")
-                return False
+                return refuse(Refusal.CURSOR_REFUSED, f"Cursor didn't take that: {why}.", quiet)
             if not report:  # a child's report is not the user answering, and not a line in the call chat
                 Sent(speaker.agent, heard.value, session=speaker.session, words=text if in_call() else "").save()
             if not command:
                 introduced(speaker, heard)
                 told_on_call(speaker, heard)
-            return True
+            return Delivery.done()
         # Without the port: that chat to the front, then keys into the raised window (needs the screen unlocked)
         if chat and not cursor_bridge.open_chat(speaker.where, chat, strict=True):
             # Never into whatever chat is open instead: that may be another agent's
             log(HANDSFREE_LOG, f"Cursor bridge couldn't open chat {chat[:8]} in {speaker.where}: nothing typed")
-            refuse("I couldn't open that Cursor chat, so nothing was typed. Is its window still open?")
-            return False
+            return refuse(Refusal.CURSOR_CHAT_NOT_OPENED,
+                          "I couldn't open that Cursor chat, so nothing was typed. Is its window still open?", quiet)
         wid = cursor_window(speaker.where)
         if not wid:
             log(HANDSFREE_LOG, f"no Cursor window for {speaker.where}")
-            refuse("I heard you, but I can't find Cursor's window for that project.")
-            return False
+            return refuse(Refusal.NO_CURSOR_WINDOW, "I heard you, but I can't find Cursor's window for that project.",
+                          quiet)
         ok = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / "handsfree.py"),
                              "type-into-cursor", wid, message], timeout=20).returncode == 0
         log(HANDSFREE_LOG, f"sent to cursor window {speaker.where}" if ok else "Cursor delivery failed")
@@ -768,21 +768,20 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
         if ok and not command:
             introduced(speaker, heard)
             told_on_call(speaker, heard)
-        if not ok and desktop().locked():
-            refuse("The laptop's screen is locked, so I can't type into Cursor. "
-                   "Agents in a terminal still get your words.")
-        elif not ok:
-            refuse("I couldn't bring Cursor's window to the front, so I didn't type that anywhere. "
-                   "Click Cursor's window and say it again.")
-        return ok
+        if ok:
+            return Delivery.done()
+        if desktop().locked():
+            return refuse(Refusal.SCREEN_LOCKED, "The laptop's screen is locked, so I can't type into Cursor. "
+                          "Agents in a terminal still get your words.", quiet)
+        return refuse(Refusal.NOT_RAISED, "I couldn't bring Cursor's window to the front, so I didn't type that "
+                      "anywhere. Click Cursor's window and say it again.", quiet)
     if not tab:
         log(HANDSFREE_LOG, f"no terminal tab for {speaker.agent}")
-        refuse("I heard you, but I don't know which terminal to type that into.")
-        return False
+        return refuse(Refusal.NO_TAB, "I heard you, but I don't know which terminal to type that into.", quiet)
     if not desktop().terminals.agent_running(tab):
         log(HANDSFREE_LOG, f"no agent running in {tab.address}")
-        refuse("I heard you, but the agent I was talking to isn't running any more, so I didn't type it anywhere.")
-        return False
+        return refuse(Refusal.AGENT_GONE, "I heard you, but the agent I was talking to isn't running any more, so I "
+                      "didn't type it anywhere.", quiet)
     # Not twice within 2 s: a second Escape opens the agent's history picker (Claude) or edits the last message
     # (Codex), and the words would land there. Cursor is steered after the words are typed, not stopped.
     if urgent and not (speaker.agent == "cursor" and not speaker.in_editor) and time.time() - _interrupted.get(tab.address, 0.0) > 2 and desktop().terminals.interrupt(tab):
@@ -817,12 +816,11 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
             remember(text)
     if not typed:
         log(HANDSFREE_LOG, f"typing into {tab.address} failed")
-        refuse("I heard you, but that terminal is gone.")
-        return False
+        return refuse(Refusal.TERMINAL_GONE, "I heard you, but that terminal is gone.", quiet)
     log(HANDSFREE_LOG, f"sent to {speaker.agent} {tab.address}" + (" (enter until the queue is clear)" if again else ""))
     if not report:
         Sent(speaker.agent, heard.value, session=speaker.session, words=text if in_call() else "").save()
     if not command:
         introduced(speaker, heard)
         told_on_call(speaker, heard)
-    return True
+    return Delivery.done()

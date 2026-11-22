@@ -9,6 +9,7 @@ Another desktop, or Wayland, is one new module that fills in these methods.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -19,6 +20,19 @@ from functools import cache
 RAISE_TRIES = 3  # attempts to bring a window to the front before giving up
 RAISE_SETTLE = 0.4  # seconds for the window manager to bring a window forward
 KEY_SETTLE = 0.25  # seconds after each chord, for the window to act on it (open a chat box, take a paste)
+
+
+# Control characters a terminal or a TUI would act on instead of showing: C0 except tab and newline, DEL, and C1.
+# ESC above all: "ESC[201~" ends a bracketed paste early, and whatever follows arrives as keystrokes.
+_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x80-\x9f]")
+
+
+def typeable(text: str, raw: bool = False) -> str:
+    """Words safe to type into an agent: carriage returns become newlines (each path already types a newline as a
+    line break inside its paste), every other control character goes. raw: typed as plain keys with no paste
+    around them (Konsole's sendText), where a tab is a keystroke too, so it becomes a space."""
+    text = _CONTROLS.sub("", str(text).replace("\r\n", "\n").replace("\r", "\n"))
+    return text.replace("\t", " ") if raw else text
 
 
 @dataclass(frozen=True)
@@ -131,12 +145,12 @@ class Desktop(ABC):
 
         Nothing is pressed unless that window really is in front, checked before
         every chord: a window manager can refuse a background program's raise,
-        and keys then land in whatever has focus (a message once went into
-        Telegram, 2026-11-15).
+        and keys then land in whatever has focus (a message once went into a
+        chat app, 2026-11-15).
         """
         if self.locked():  # keys would go into the lock screen's password box (they did, 2026-11-15)
             return False
-        if not self.set_clipboard(text):
+        if not self.set_clipboard(typeable(text)):
             return False
         for _ in range(RAISE_TRIES):
             self.raise_window(window_id)

@@ -459,7 +459,7 @@ class MainActivity : Activity() {
         // The Quick Settings tile. Any app can open this screen, so only the tile's own key turns the mic on
         if (intent?.action == CALL_NOW) {
             intent.action = null
-            if (intent.getStringExtra(CALL_KEY) == callKey(this)) call()
+            if (java.security.MessageDigest.isEqual((intent.getStringExtra(CALL_KEY) ?: "").toByteArray(), callKey(this).toByteArray())) call()
             return
         }
         if (intent?.action == OPEN_FILE) {
@@ -468,6 +468,9 @@ class MainActivity : Activity() {
         }
         if (intent?.action == ANSWER) {  // Answer on IncomingActivity or the ring's banner: the user's own tap
             intent.action = null
+            // Any installed app can send ANSWER here: only the key of the laptop's ring sounding now, which only the
+            // app's own Answer carries (RingService.answerIntent), turns the mic on. Otherwise the app just opens
+            if (!Ringing.mayAnswerLaptop(Ringing.laptops(this), intent.getStringExtra(ANSWER_KEY) ?: "")) return
             Ringing.end(this)  // stop ringing, everywhere
             call(intent.getStringExtra(IncomingActivity.REPLY))
             return
@@ -4354,6 +4357,7 @@ class MainActivity : Activity() {
     companion object {
         const val HOLD_MS = 300L  // longer than this is a hold; shorter is a tap
         const val ANSWER = "io.github.ninjatuna007.henchline.ANSWER"  // from IncomingActivity's Answer
+        const val ANSWER_KEY = "answer_key"  // the ring's own key, with ANSWER (Ringing.mayAnswerLaptop)
         const val MIC_FOR_CALL = 2  // the permission request a call waits on
         const val PICK_FILES = 3  // the paperclip's picker
         const val TAKE_PHOTO = 5  // the + sheet's camera

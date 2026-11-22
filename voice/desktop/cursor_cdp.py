@@ -287,6 +287,7 @@ def send(where: str, chat: str, message: str, urgent: bool = False) -> str:
         return "Cursor's debugging port isn't open for that window"
     try:
         with FOCUS:
-            return asyncio.run(asyncio.wait_for(_send(url, chat, message, urgent), WHOLE_SEND))
+            from voice.desktop import typeable
+            return asyncio.run(asyncio.wait_for(_send(url, chat, typeable(message), urgent), WHOLE_SEND))
     except Exception as e:  # a page closed or reloaded mid-send, a timeout, a closed socket: refused, never raised
         return f"Cursor's debugging port: {str(e) or type(e).__name__}"

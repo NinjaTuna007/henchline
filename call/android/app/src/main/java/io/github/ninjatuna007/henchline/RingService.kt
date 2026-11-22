@@ -125,7 +125,8 @@ class RingService : PushService() {
             val ring = Ringing.now(context)
             val host = Ringing.hostOf(ring)
                 ?: return Intent(context, MainActivity::class.java).setAction(MainActivity.ANSWER)  // the laptop's ring, or none
-                    .putExtra(IncomingActivity.REPLY, reply).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    .putExtra(IncomingActivity.REPLY, reply).putExtra(MainActivity.ANSWER_KEY, Ringing.answerKey(ring))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
             // Another computer's ring sounds: only that ring's own Answer opens its call (a stale screen answers nothing)
             if (ring!!.optString("reply") != (reply ?: "") || android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU) return null
             return HostChatActivity.answer(context, ChatKey(host.hostId, host.session), reply, Ringing.answerKey(ring))

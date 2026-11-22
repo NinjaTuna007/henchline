@@ -18,6 +18,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from voice.delivery import Delivery, Refusal
 from voice.desktop import cursor_cdp
 from voice.state import STATE
 
@@ -40,9 +41,6 @@ def owner_of(chat: str) -> str:
     """The project (~/.cursor/projects/<project>) whose transcripts hold that chat; "" when none does."""
     found = list((Path.home() / ".cursor/projects").glob(f"*/agent-transcripts/{chat}"))
     return found[0].parent.parent.name if len(found) == 1 else ""
-
-
-last_why = ""  # what the bridge said when it said no ("not a chat id" from an older bridge, before a reload)
 
 
 def pid_alive(pid: object) -> bool:
@@ -69,17 +67,15 @@ def windows_of(project: str) -> list[tuple[Path, dict]]:
     return found
 
 
-def ask_window(chat: str, request: dict) -> bool:
-    """Sends one request to the one Cursor window that has the chat (see open_chat); True when it said yes."""
-    global last_why
-    last_why = ""
+def ask_window(chat: str, request: dict) -> Delivery:
+    """Sends one request to the one Cursor window that has the chat (see open_chat): ok when it said yes, else
+    why not (what the bridge said: "not a chat id" from an older bridge, before a reload)."""
     project = owner_of(chat)
     if not project:
-        return False
+        return Delivery.refused(Refusal.UNKNOWN_CHAT, "")
     owners = [note for note, _ in windows_of(project)]
     if len(owners) != 1:  # none, or two windows on that project: which has the chat can't be told, so neither
-        last_why = "no Cursor window has that project" if not owners else "more than one Cursor window has that project"
-        return False
+        return Delivery.refused(Refusal.NO_WINDOW if not owners else Refusal.TWO_WINDOWS)
     try:
         with socket.socket(socket.AF_UNIX) as conn:
             conn.settimeout(5)
@@ -92,18 +88,19 @@ def ask_window(chat: str, request: dict) -> bool:
                     break
                 answer += part
         said = json.loads(answer.decode() or "{}")
-        last_why = str(said.get("why", ""))
-        return bool(said.get("ok"))
     except (OSError, ValueError):
-        return False
+        return Delivery.refused(Refusal.NO_ANSWER, "")
+    if said.get("ok"):
+        return Delivery.done()
+    why = str(said.get("why", ""))
+    return Delivery.refused(Refusal.from_bridge(why), why)
 
 
-def ask_selected(chat: str, request: dict) -> bool:
+def ask_selected(chat: str, request: dict) -> Delivery:
     """A request for Cursor's commands that act on its selected chat (stop, model): the chat opened, then its box
     focused through the debugging port and seen to hold focus, so it is the selected one wherever its pane is
     ({"focused"}); without the port, the bridge's old rule (only the last chat listed) refuses rather than act on
     another."""
-    global last_why
     where = workspace_of(chat)
     if where and cursor_cdp.available(where):
         with cursor_cdp.FOCUS:  # nothing else moves focus in Cursor between proving it and acting on it
@@ -111,8 +108,7 @@ def ask_selected(chat: str, request: dict) -> bool:
                 # A stop again checked at the last moment: the chat may have finished meanwhile, and Cursor's stop
                 # on an idle chat rejects all its pending edits
                 if "stop" in request and cursor_cdp.chat_status(where, chat) != "generating":
-                    last_why = "not working"
-                    return False
+                    return Delivery.refused(Refusal.NOT_WORKING)
                 return ask_window(chat, {**request, "focused": True})
     return ask_window(chat, request)
 
@@ -194,10 +190,11 @@ def set_model(chat: str, model: str, params: list[dict]) -> str:
     before = chat_model(chat)
     if not before:
         return "Cursor's record of that chat can't be read, so a switch couldn't be checked: not switched."
-    if not ask_selected(chat, {"model": chat, "config": {"modelId": model, "params": picked}}):
-        if last_why == "not a chat id":
+    answer = ask_selected(chat, {"model": chat, "config": {"modelId": model, "params": picked}})
+    if not answer:
+        if answer.refusal is Refusal.NOT_A_CHAT_ID:
             return "Cursor runs an older Henchline bridge: Reload Window in Cursor, then try again."
-        return f"Cursor didn't take it ({last_why or 'no answer'}): still on {before}."
+        return f"Cursor didn't take it ({answer.why or 'no answer'}): still on {before}."
     want = {p["id"]: p["value"] for p in picked}
     got: dict = {}
     for _ in range(40):  # Cursor writes its store a while later: the model, and its settings a few seconds after
@@ -243,16 +240,18 @@ def params_of(chat: str) -> list[dict]:
     return [p for p in (picked.get("parameters") or []) if isinstance(p, dict) and "id" in p]
 
 
-def open_chat(workspace: str, chat: str, strict: bool = False) -> bool:
+def open_chat(workspace: str, chat: str, strict: bool = False) -> Delivery:
     """Brings that chat to the front in the one Cursor window that has it: the window whose workspace folder is
     the project holding the chat's transcript (Cursor's own commands say yes to any id, 2026-11-16). False when no
     window has it: then nothing may be typed, or the words would land in whatever chat is on screen. (workspace:
     the chat's label, kept for the callers; the transcript decides.) strict: about to type with keys, so that chat
     must be the focused one (the last of those open side by side), not only open."""
-    if not CHAT_ID.fullmatch(chat) or not ask_window(chat, {"open": chat, "strict": strict}):
-        return False
-    time.sleep(0.4)  # Cursor moving its focus to that chat, before anything is typed
-    return True
+    if not CHAT_ID.fullmatch(chat):
+        return Delivery.refused(Refusal.NOT_A_CHAT_ID)
+    answer = ask_window(chat, {"open": chat, "strict": strict})
+    if answer:
+        time.sleep(0.4)  # Cursor moving its focus to that chat, before anything is typed
+    return answer
 
 
 def rename(chat: str, name: str) -> str:
@@ -408,7 +407,7 @@ def open_anywhere(chat: str, folder: str, wait: float = 30.0) -> bool:
         while not windows_of(project_of(folder)) and time.monotonic() < until:
             time.sleep(1)
         time.sleep(2)  # the bridge listens a moment before Cursor's chats are loaded
-    return open_chat(Path(folder).name, chat)
+    return bool(open_chat(Path(folder).name, chat))
 
 
 def installed() -> bool:

@@ -7,6 +7,7 @@ from unittest import mock
 
 from tests import sandbox  # first: a throwaway HOME
 from voice import chains
+from voice.delivery import Delivery, Refusal
 from voice.desktop import Tab
 from voice.minions import _hand_up, deploy, end, end_session, report
 from voice.state import CALL_PINNED, LAST, RENAMED, SPEAKERS, Speaker
@@ -20,6 +21,10 @@ def BOSS():
 
 class Chains(unittest.TestCase):
     def setUp(self):
+        # Never the real tmux: a deploy looks for the agent's trust question on its new pane's screen
+        asking = mock.patch("voice.minions._trust_question_up", return_value=False)
+        asking.start()
+        self.addCleanup(asking.stop)
         if chains.CHAINS.is_dir():
             for path in chains.CHAINS.glob("*.jsonl"):
                 path.unlink()
@@ -184,7 +189,7 @@ class Chains(unittest.TestCase):
         CALL_PINNED.write_text("stay-with-boss")
 
         import routing
-        with mock.patch("routing.deliver", return_value=False):
+        with mock.patch("routing.deliver", return_value=Delivery.refused(Refusal.TERMINAL_GONE, "that terminal is gone")):
             self.assertEqual(report(["the pane is up"], lambda: child), 1)
         self.assertEqual(chains.corrections_since("child"), ["use the lock"])  # a failed delivery keeps it
         self.assertEqual(CALL_PINNED.read_text(), "stay-with-boss")
@@ -281,12 +286,8 @@ class Chains(unittest.TestCase):
                 recorded["alive"] = change([{"pane": "%old", "pid": 1}])
             return ["%7"]
 
-        def typed(given):
-            return folder if Path(given).expanduser().resolve() == folder else None
-
         server = mock.Mock()
-        server.trusted_folders.return_value = []
-        server.typed_folder.side_effect = typed
+        server.trusted_folders.return_value = [str(folder)]
         server.spawned.side_effect = spawned
         boss = Speaker("boss", "claude", "job", Tab("tmux", "%3"))
         with mock.patch("voice.desktop.tmux.composer_ready", return_value=True), \
@@ -294,11 +295,12 @@ class Chains(unittest.TestCase):
                 mock.patch("voice.desktop.tmux.start", return_value=Tab("tmux", "%7")) as start, \
                 mock.patch("voice.desktop.tmux.resume") as resume, \
                 mock.patch("voice.desktop.tmux.pane_pid", return_value=42), \
-                mock.patch("voice.desktop.tmux.accept_trust", return_value=True), \
+                mock.patch("voice.desktop.tmux.accept_trust", return_value=True) as accept, \
                 mock.patch("voice.desktop.current", return_value=desk), \
                 mock.patch("voice.minions._server", return_value=server):
             code = deploy(["--agent", "claude", "--folder", str(folder), "--ask", "fix the parser"], lambda: boss)
         self.assertEqual(code, 0)
+        accept.assert_not_called()  # a deploy never answers a trust question
         start.assert_called_once()
         self.assertEqual(start.call_args.args[0], "claude")
         self.assertEqual(start.call_args.args[1], folder)
@@ -574,7 +576,8 @@ class Chains(unittest.TestCase):
             closer.join(3)
         self.assertFalse(sender.is_alive())
         self.assertFalse(closer.is_alive())
-        self.assertEqual(outcomes, {"sent": True, "ended": 0})
+        self.assertEqual({k: bool(v) for k, v in outcomes.items()}, {"sent": True, "ended": False})
+        self.assertEqual(outcomes["ended"], 0)
         self.assertEqual(chains.pending_corrections("child"), [])
         kinds = [event["kind"] for event in chains.history(chain)]
         self.assertLess(kinds.index("correction"), kinds.index("ended"))
@@ -624,24 +627,60 @@ class Chains(unittest.TestCase):
         self.assertNotIn("new result", [h["text"] for h in shown[0]["handoffs"]])
         self.assertEqual(shown[1]["handoffs"][-1]["text"], "new result")
 
-    def test_a_trust_question_that_stays_up_does_not_take_a_slot(self):
+    def test_a_trust_question_that_shows_anyway_does_not_take_a_slot(self):
         folder = Path.home() / "workproj"
         folder.mkdir(exist_ok=True)
         server = mock.Mock()
-        server.trusted_folders.return_value = []
-        server.typed_folder.return_value = folder
+        server.trusted_folders.return_value = [str(folder)]
         boss = Speaker("boss", "claude", "job", Tab("tmux", "%3"))
+        terms = mock.Mock()
         with mock.patch("voice.desktop.tmux.composer_ready", return_value=True), \
                 mock.patch("voice.desktop.tmux.submit_pending", return_value=True), \
                 mock.patch("voice.desktop.tmux.start", return_value=Tab("tmux", "%7")), \
                 mock.patch("voice.desktop.tmux.end", return_value=True) as ended, \
-                mock.patch("voice.desktop.tmux.accept_trust", return_value=False), \
+                mock.patch("voice.desktop.tmux.accept_trust", return_value=True) as accept, \
+                mock.patch("voice.minions._trust_question_up", return_value=True), \
+                mock.patch("voice.desktop.current", return_value=mock.Mock(terminals=terms)), \
                 mock.patch("voice.minions._server", return_value=server):
             code = deploy(["--agent", "claude", "--folder", str(folder), "--ask", "go"], lambda: boss)
         self.assertEqual(code, 1)
         ended.assert_called_once()
+        accept.assert_not_called()
+        terms.type_line.assert_not_called()  # never typed into the question
         self.assertFalse(any(e.get("kind") == "launch" for e in chains.history(chains.chain_of("boss"))))
         server.spawned.assert_not_called()
+
+    def test_deploy_refuses_a_folder_the_agent_does_not_trust_yet(self):
+        """A prompt-injected boss can't start a child in ~/Downloads/evil-repo: its hooks would run, and the folder
+        stay trusted. The phone's typed-folder rule (any folder of the user's) does not apply to a deploy."""
+        folder = Path.home() / "Downloads" / "evil-repo"
+        folder.mkdir(parents=True, exist_ok=True)
+        server = mock.Mock()
+        server.trusted_folders.return_value = [str(Path.home() / "workproj")]
+        server.typed_folder.return_value = folder
+        boss = Speaker("boss", "claude", "job", Tab("tmux", "%3"))
+        for agent in ("claude", "cursor", "codex"):
+            with mock.patch("voice.desktop.tmux.start") as start, \
+                    mock.patch("voice.desktop.tmux.accept_trust") as accept, \
+                    mock.patch("voice.minions._codex_trusted", return_value=[]), \
+                    mock.patch("voice.minions._server", return_value=server):
+                code = deploy(["--agent", agent, "--folder", str(folder), "--ask", "look"], lambda: boss)
+            self.assertEqual(code, 1, agent)
+            start.assert_not_called()
+            accept.assert_not_called()
+
+    def test_codex_children_go_only_where_codex_trusts(self):
+        from voice import minions
+        config = Path.home() / ".codex/config.toml"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('model = "x"\n[projects."/home/u/trusted"]\ntrust_level = "trusted"\n'
+                          '[projects."/home/u/other"]\ntrust_level = "untrusted"\n')
+        try:
+            self.assertEqual(minions._codex_trusted(), [Path("/home/u/trusted")])
+            config.write_text("not toml [")
+            self.assertEqual(minions._codex_trusted(), [])
+        finally:
+            config.unlink()
 
     def test_report_without_a_boss_fails(self):
         self.assertEqual(report(["done"], lambda: Speaker("lone", "claude")), 1)
@@ -798,6 +837,7 @@ class AskSubmitted(unittest.TestCase):
         for agent in ("cursor", "codex"):
             Chains.setUp(self)
             with mock.patch("voice.desktop.tmux.submit_pending") as pending, \
+                    mock.patch("voice.minions._codex_trusted", return_value=[folder]), \
                     mock.patch("voice.desktop.tmux.composer_ready") as ready, \
                     mock.patch("voice.permissions.cursor_runs_everything", return_value=False), \
                     mock.patch("voice.desktop.tmux.start", return_value=Tab("tmux", "%7")) as start, \
@@ -827,6 +867,107 @@ class AskSubmitted(unittest.TestCase):
                           lambda: Speaker("boss", "claude", "job", Tab("tmux", "%3")))
         self.assertEqual(code, 1)
         start.assert_not_called()
+
+    def _deploy_mocks(self, folder, start, terms=None):
+        terms = terms or mock.Mock()
+        terms.type_line.return_value = True
+        server = mock.Mock()
+        server.trusted_folders.return_value = [str(folder)]
+        server.spawned.return_value = []
+        return [mock.patch("voice.desktop.tmux.submit_pending", return_value=True),
+                mock.patch("voice.desktop.tmux.composer_ready"),
+                mock.patch("voice.desktop.tmux.pane_pids", return_value=None),
+                mock.patch("voice.desktop.tmux.start", side_effect=start),
+                mock.patch("voice.desktop.tmux.pane_pid", return_value=42),
+                mock.patch("voice.desktop.tmux.accept_trust", return_value=True),
+                mock.patch("voice.minions._codex_trusted", return_value=[folder]),
+                mock.patch("voice.desktop.current", return_value=mock.Mock(terminals=terms)),
+                mock.patch("voice.minions._server", return_value=server)]
+
+    def test_a_codex_child_gets_its_codex_bosses_own_approval_and_sandbox(self):
+        folder = Path.home() / "workproj"
+        folder.mkdir(exist_ok=True)
+        Chains.setUp(self)
+        boss = Speaker("codex-11111111-2222-4333-8444-555555555555", "codex", "job", Tab("tmux", "%3"))
+        turn = {"approval_policy": "never", "sandbox": "workspace-write"}
+        start = mock.Mock(return_value=Tab("tmux", "%7"))
+        patches = self._deploy_mocks(folder, start) + [
+            mock.patch("voice.permissions.level", return_value=2),
+            mock.patch("voice.permissions.codex_turn", return_value=turn)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertEqual(deploy(["--agent", "codex", "--folder", str(folder), "--ask", "look"], lambda: boss), 0)
+        flags = start.call_args.kwargs["flags"]
+        self.assertEqual(flags[:4], ["-a", "never", "-s", "workspace-write"])
+
+    def test_two_deploys_racing_for_the_last_slot_start_one_child(self):
+        folder = Path.home() / "workproj"
+        folder.mkdir(exist_ok=True)
+        Chains.setUp(self)
+        chain = chains.open("boss")
+        for i in range(7):
+            chains.append(chain, "launch", parent="boss", session=f"c{i}", pane=f"%{i}", pid=i + 1, depth=2)
+        starting, go = threading.Event(), threading.Event()
+
+        def slow_start(*_args, **_kwargs):  # the first deploy is still starting its child (tmux, trust answer)
+            starting.set()
+            go.wait(5)
+            return Tab("tmux", "%7")
+
+        for p in self._deploy_mocks(folder, slow_start):
+            p.start()
+            self.addCleanup(p.stop)
+        boss = Speaker("boss", "claude", "job", Tab("tmux", "%3"))
+        codes = {}
+        first = threading.Thread(target=lambda: codes.update(first=deploy(
+            ["--agent", "claude", "--folder", str(folder), "--ask", "one"], lambda: boss)))
+        first.start()
+        self.assertTrue(starting.wait(5))
+        codes["second"] = deploy(["--agent", "claude", "--folder", str(folder), "--ask", "two"], lambda: boss)
+        go.set()
+        first.join(5)
+        self.assertEqual(codes, {"first": 0, "second": 1})
+        self.assertEqual(chains.allow(chain, "boss", 1), "no slots left")  # the reservation became the launch
+
+    def test_a_launch_that_fails_gives_its_reserved_slot_back(self):
+        folder = Path.home() / "workproj"
+        folder.mkdir(exist_ok=True)
+        Chains.setUp(self)
+        chain = chains.open("boss")
+        for i in range(7):
+            chains.append(chain, "launch", parent="boss", session=f"c{i}", pane=f"%{i}", pid=i + 1, depth=2)
+        for p in self._deploy_mocks(folder, lambda *a, **k: Tab()):  # tmux didn't start it
+            p.start()
+            self.addCleanup(p.stop)
+        boss = Speaker("boss", "claude", "job", Tab("tmux", "%3"))
+        self.assertEqual(deploy(["--agent", "claude", "--folder", str(folder), "--ask", "one"], lambda: boss), 1)
+        self.assertEqual(chains.allow(chain, "boss", 1), "")
+        kinds = [e["kind"] for e in chains.history(chain)]
+        self.assertEqual(kinds[-2:], ["reserved", "unreserved"])
+
+    def test_a_reservation_left_by_a_dead_deploy_stops_counting(self):
+        chain = chains.open("boss")
+        for i in range(7):
+            chains.append(chain, "launch", parent="boss", session=f"c{i}", pane=f"%{i}", pid=i + 1, depth=2)
+        refused, slot = chains.reserve(chain, "boss", 1)
+        self.assertEqual((refused, bool(slot)), ("", True))
+        self.assertEqual(chains.allow(chain, "boss", 1), "no slots left")
+        with mock.patch.object(chains.time, "time", return_value=__import__("time").time() + chains.RESERVE_FOR + 1):
+            self.assertEqual(chains.allow(chain, "boss", 1), "")
+
+    def test_a_failed_report_says_why(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="child", pane="%1", pid=1, depth=2)
+        Speaker("boss", "claude", "job", Tab("tmux", "%9")).save(SPEAKERS / "boss.json")
+        child = Speaker("child", "claude", "job", Tab("tmux", "%1"))
+        import io
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with mock.patch("routing.deliver", return_value=Delivery.refused(Refusal.AGENT_GONE, "the boss is gone")), \
+                redirect_stdout(out):
+            self.assertEqual(report(["done"], lambda: child), 1)
+        self.assertIn("the boss is gone", out.getvalue())
 
     def test_ready_once_the_box_is_drawn(self):
         from voice.desktop import tmux

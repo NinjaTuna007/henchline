@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import secrets
 import sys
 import time
@@ -34,6 +33,7 @@ from urllib.parse import urlsplit
 
 from call import canonical
 from call.host_config import DEFAULT_CONFIG, HostConfig
+from voice.state import write_json
 
 DIRECTORY_FILE = Path.home() / ".config/henchline/directory.json"
 HEARTBEAT_EVERY = 60
@@ -78,12 +78,7 @@ class Enrolment:
 
     def save(self, path: Path = DIRECTORY_FILE) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        partial = path.with_name(f".{path.name}.partial")
-        fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as output:
-            json.dump(asdict(self), output, indent=2, sort_keys=True)
-            output.write("\n")
-        os.replace(partial, path)
+        write_json(path, asdict(self), private=True)
 
     @classmethod
     def load(cls, path: Path = DIRECTORY_FILE) -> "Enrolment | None":
@@ -137,7 +132,7 @@ def enroll(code: dict, descriptor: dict, transport: Transport = https) -> Enrolm
     if answer.get("directory_id") != directory_id or answer.get("host_id") != descriptor.get("host_id"):
         raise DirectoryError("the directory's answer names another directory or host")
     return Enrolment(directory_id, base_url, parts.netloc.lower(), key,
-                     time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                     canonical.rfc3339())
 
 
 def signed_request(enrolment: Enrolment, host_id: str, signer: Any, method: str, route: str,

@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from voice.agents import CLAUDE_DAEMON, SHELLS, ancestors, cmdline_has, comm, nearest_agent, process
-from voice.desktop import Tab, Window
+from voice.desktop import Tab, Window, typeable
 from voice.desktop.generic_x11 import AnyTerminal, GenericX11
 
 KLIPPER = ("org.kde.klipper", "/klipper")
@@ -84,7 +84,8 @@ class Konsole(AnyTerminal):
         return foreground.isdigit() and any(p.agent for p in [process(int(foreground))] if p)
 
     def type_line(self, tab: Tab, text: str, again: bool = False, taken=None) -> bool:
-        for chunk in (text, "\r"):
+        # Plain keys, no paste around them: a carriage return in the words would submit early, so none get through
+        for chunk in (typeable(text, raw=True), "\r"):
             if not qdbus_ok(tab.owner, tab.address, "sendText", chunk):
                 return False
             time.sleep(TYPE_PAUSE)

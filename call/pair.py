@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from call.canonical import b64url, canonical_json, fingerprint
+from call.canonical import b64url, canonical_json, fingerprint, rfc3339
 from call.host_config import DEFAULT_CONFIG, HostConfig
 from call.host_store import PAIRING_LIFETIME, HostStore
 
@@ -57,7 +57,7 @@ class HostSigner:
         draft = self.descriptor(config, capabilities)
         content = {k: v for k, v in draft.items() if k not in ("descriptor_seq", "updated_at", "signature")}
         digest = hashlib.sha256(canonical_json(content)).hexdigest()
-        now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now = rfc3339()
         seq, updated_at = store.publish(digest, config.descriptor_seq, now)
         return self.descriptor(config, capabilities, seq=seq, updated_at=updated_at)
 
@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             "host_key_algorithm": "ed25519",
             "fingerprint": fingerprint(signer.public_bytes()),
             "nonce": nonce,
-            "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "expires_at": rfc3339(expires.timestamp()),
         }, separators=(",", ":")))
         return 0
     print(f"Pair a phone with {config.label}: in Henchline, Settings, Computers, Pair a computer.\n"

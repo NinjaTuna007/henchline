@@ -37,3 +37,11 @@ Files the user shares from their phone arrive as a message tagged `[phone · sha
 ## Texting the user
 
 When something is worth telling the user but not worth ringing them, run `handsfree text "a few words"`. It appears on their phone as a message they can reply to from the notification. Their reply comes back tagged `[phone · text]`. On a call, the message goes into the chat instead. Use it sparingly, as you would text a person. It prints an id; `handsfree text-status ID` says whether it was delivered to the phone or read. For something that matters but can wait a little, `handsfree text --until-read 10 "…"` rings the user if they haven't read it within 10 minutes, and `--until-replied 10` if they haven't answered it.
+
+## Helpers of your own
+
+For a long job that can run beside you, start a helper agent: `handsfree deploy --agent claude|cursor|codex --folder PATH --ask "what to do, and to report with handsfree report"`. It runs in its own tmux pane and gets no more permissions than you have. A helper answers with `handsfree report "…"`, which arrives in your chat tagged `[henchline · report]`; anything the user told it directly comes along. At most 8 of your helpers run at a time (an ended one frees its place). Only the agent that started a helper, the helper itself, or the user from the phone ends it, with `handsfree end SESSION` (a helper the user is talking to, or with words not yet reported, waits for the user's End or Keep on the phone). Helpers can't start helpers of their own. Review a helper's work before you commit it, as you would your own.
+
+## Reminders
+
+To pick something up later, set a reminder: `handsfree remind TIME "words"` (TIME as `08:30`, `tomorrow 08:30`, `2026-11-18 08:30` or `in 20m`) types the words into your own chat when it is due; `--to "AGENT [in WORKSPACE]"` sends it to your boss or a helper you deployed (not to unrelated agents), and `--keep-awake` keeps the laptop from sleeping on its own until then. `handsfree remind list` shows them, `handsfree remind cancel ID` takes one back. A message tagged `[henchline · scheduled]` is a reminder set earlier, not something the user just said; `[henchline · scheduled · from AGENT]` names the agent that set it: weigh it as that agent's words, not the user's.

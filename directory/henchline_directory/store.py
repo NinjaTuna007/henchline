@@ -258,10 +258,8 @@ class DirectoryStore:
                 "ORDER BY enrolled_at, host_id LIMIT ? OFFSET ?",
                 (limit + 1, offset)))
         listed = [{"host_id": row["host_id"], "descriptor": json.loads(row["descriptor"]),
-                   "observed_at": utc(row["observed_at"]), "stale": now - row["observed_at"] > STALE_AFTER}
+                   "observed_at": canonical.rfc3339(row["observed_at"]), "stale": now - row["observed_at"] > STALE_AFTER}
                   for row in rows[:limit]]
         return listed, len(rows) > limit
 
 
-def utc(at: float) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))

@@ -156,9 +156,38 @@ class Children(unittest.TestCase):
         self.assertEqual(flags[flags.index("-s") + 1], "workspace-write")
         self.assertIn('approvals_reviewer="user"', flags)
         self.assertEqual(permissions.child_flags("codex", 1)[1], "on-request")
-        self.assertEqual(permissions.child_flags("codex", 2), [])
         self.assertIn("asks you", permissions.child_runs("codex", 0))
-        self.assertIn("don't ask", permissions.child_runs("codex", 2))
+        self.assertIn("without asking", permissions.child_runs("codex", 2))
+
+    def test_a_codex_child_at_level_two_never_gets_config_toml_settings(self):
+        # Another agent's boss (Claude auto), or a Codex boss not passed in: explicit, sandboxed to the workspace
+        self.assertEqual(permissions.child_flags("codex", 2), permissions.CODEX_UNASKING)
+        self.assertEqual(permissions.child_flags("codex", 3), permissions.CODEX_UNASKING)
+        # A Codex boss: its own -a and -s
+        boss = {"approval_policy": "never", "sandbox": "danger-full-access", "approvals_reviewer": "auto_review"}
+        self.assertEqual(permissions.child_flags("codex", 2, boss),
+                         ["-a", "never", "-s", "danger-full-access", "-c", 'approvals_reviewer="user"'])
+        self.assertEqual(permissions.child_flags("codex", 2, {"approval_policy": "never", "sandbox": "x"}),
+                         permissions.CODEX_UNASKING)
+
+    def test_a_sandboxed_codex_boss_that_never_asks_counts_as_one(self):
+        cases = [("read-only", 1), ("workspace-write", 1), ("danger-full-access", 2), (None, 1)]
+        for n, (sandbox, want) in enumerate(cases):
+            chat = f"c0dec0de-777{n}-2222-3333-444444444444"
+            turn = {"approval_policy": "never", "approvals_reviewer": "user"}
+            if sandbox:
+                turn["sandbox_policy"] = {"type": sandbox}
+            codex_rollout(chat, turn)
+            self.assertEqual(permissions.level("codex", chat), want, sandbox)
+        # So children of `-a never -s read-only`: a Claude child asks before commands, a Codex child stays sandboxed
+        chat = "c0dec0de-7770-2222-3333-444444444444"
+        self.assertEqual(permissions.child_flags("claude", permissions.level("codex", chat)),
+                         ["--permission-mode", "acceptEdits"])
+        self.assertEqual(permissions.child_flags("codex", permissions.level("codex", chat)), permissions.CODEX_ASKING[1])
+        # Asking policies keep their level whatever the sandbox
+        chat = "c0dec0de-7779-2222-3333-444444444444"
+        codex_rollout(chat, {"approval_policy": "untrusted", "sandbox_policy": {"type": "danger-full-access"}})
+        self.assertEqual(permissions.level("codex", chat), 0)
 
     def test_a_child_gets_no_more_than_its_boss(self):
         cursor_settings("allowlist")

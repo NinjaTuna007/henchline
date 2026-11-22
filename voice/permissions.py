@@ -9,6 +9,12 @@ get more than it should is refused, not started. Codex's settings (`~/.codex/con
 overridden per launch with `-a`, `-s` and `-c`, which its own help says take precedence over that file.
 
 Levels: 0 asks before acting, 1 edits files without asking, 2 runs commands without asking, 3 bypasses every check.
+
+The cap really holds only at levels 0 and 1. From 2 up a child runs commands without asking, and a command can do
+anything its user can (Claude's auto mode and Cursor's --force have no sandbox), so "no more than its boss" is then
+only as strong as the boss's own lack of limits. That is why a Codex boss counts as 2 only with no sandbox at all
+(approval_policy never and danger-full-access): one in read-only or workspace-write counts as 1, so its children
+ask before commands instead of running them unsandboxed.
 """
 
 from __future__ import annotations
@@ -134,13 +140,19 @@ def level(agent: str, chat: str, in_editor: bool = False) -> int:
     if agent == "cursor" and not in_editor:
         return 2 if cursor_forced(chat) or cursor_runs_everything() else 0
     if agent == "codex":
-        return CODEX_LEVEL.get(codex_policy(chat), 0)
+        turn = codex_turn(chat)
+        found = CODEX_LEVEL.get(turn.get("approval_policy", ""), 0)
+        # Asking for nothing inside a sandbox (read-only, workspace-write) or an unread one: children get 1, never 2
+        return found if turn.get("sandbox") == "danger-full-access" else min(found, 1)
     return 0
 
 
 # Codex under a boss that asks: approvals go to the user (not Codex's own reviewer), writes stay in the workspace
 CODEX_ASKING = {0: ["-a", "untrusted", "-s", "workspace-write", "-c", 'approvals_reviewer="user"'],
                 1: ["-a", "on-request", "-s", "workspace-write", "-c", 'approvals_reviewer="user"']}
+# Codex under a boss that runs commands without asking whose own Codex settings aren't known (another agent, or a
+# Codex boss not passed in): commands without asking, but writes stay in the workspace, whatever config.toml says
+CODEX_UNASKING = ["-a", "never", "-s", "workspace-write", "-c", 'approvals_reviewer="user"']
 
 
 def resume_refusal(agent: str, chat: str) -> str:
@@ -174,9 +186,11 @@ def resume_flags(agent: str, chat: str) -> list[str]:
     return []
 
 
-def child_flags(agent: str, boss_level: int) -> list[str] | None:
+def child_flags(agent: str, boss_level: int, boss_codex: dict | None = None) -> list[str] | None:
     """The flags a deployed child starts with: no more than its boss may do. None when that agent can't be
-    started that low (a Cursor child under a boss that asks, while Cursor's settings run everything)."""
+    started that low (a Cursor child under a boss that asks, while Cursor's settings run everything).
+    boss_codex: a Codex boss's own last turn (codex_turn), whose -a and -s a Codex child at level 2 gets; without
+    it, CODEX_UNASKING. A Codex child always gets explicit -a and -s, never whatever config.toml says."""
     if agent == "claude":
         mode = "auto" if boss_level >= 2 else "acceptEdits" if boss_level == 1 else "default"
         return ["--permission-mode", mode]
@@ -185,7 +199,12 @@ def child_flags(agent: str, boss_level: int) -> list[str] | None:
             return ["--force"]
         return None if cursor_runs_everything() else []
     if agent == "codex":
-        return [] if boss_level >= 2 else list(CODEX_ASKING[max(0, boss_level)])
+        if boss_level < 2:
+            return list(CODEX_ASKING[max(0, boss_level)])
+        turn = boss_codex or {}
+        if turn.get("approval_policy") in CODEX_LEVEL and turn.get("sandbox") in CODEX_SANDBOXES:
+            return ["-a", turn["approval_policy"], "-s", turn["sandbox"], "-c", 'approvals_reviewer="user"']
+        return list(CODEX_UNASKING)
     return None
 
 
@@ -197,7 +216,7 @@ def child_runs(agent: str, boss_level: int) -> str:
             boss_level, "It runs commands without asking, as its boss does.")
     if agent == "codex":
         if boss_level >= 2:
-            return "It runs with Codex's own settings, which don't ask you."
+            return "It runs commands without asking, as its boss does."
         return "It asks you before commands outside its sandbox, and writes only in its folder."
     if boss_level >= 2:
         return "It runs commands without asking, as its boss does."

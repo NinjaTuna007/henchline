@@ -80,6 +80,36 @@ class Private(unittest.TestCase):
         for path in (home / "Pictures/a.png", Path("/tmp/report.pdf")):
             self.assertFalse(files.private(path), path)
 
+    def test_henchlines_own_keys_and_passwords_stay(self):
+        home = Path.home()
+        for path in (home / ".local/share/henchline/keys/host.ed25519", home / ".local/share/henchline/keys",
+                     home / ".local/share/henchline/host.sqlite3", home / ".config/henchline/signing.properties",
+                     home / ".config/henchline/host.json", home / ".config/henchline",
+                     home / "srv/state/keys/directory.ed25519", home / "release/henchline.jks", home / "x.keystore"):
+            self.assertTrue(files.private(path), path)
+        for path in (home / ".local/share/henchline/venv/bin/python", home / ".local/share/henchline"):
+            self.assertFalse(files.private(path), path)
+
+    def test_a_host_key_moved_by_host_json_stays(self):
+        home = Path.home()
+        config = home / ".config/henchline/host.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(config.unlink, missing_ok=True)
+        config.write_text('{"key_file": "~/elsewhere/signer", "database": "%s"}' % (home / "db/pairs"))
+        self.assertTrue(files.private(home / "elsewhere/signer"))
+        self.assertTrue(files.private(home / "db/pairs"))
+        self.assertFalse(files.private(home / "elsewhere/notes.txt"))
+        config.write_text("not json")
+        self.assertFalse(files.private(home / "elsewhere/signer"))
+
+    def test_typed_folder_refuses_henchlines_secret_folders(self):
+        from call import server
+        for folder in (".config/henchline", ".local/share/henchline/keys"):
+            (Path.home() / folder).mkdir(parents=True, exist_ok=True)
+            self.assertIsNone(server.typed_folder(str(Path.home() / folder)), folder)
+        (Path.home() / "projects/app").mkdir(parents=True, exist_ok=True)
+        self.assertEqual(server.typed_folder("~/projects/app"), (Path.home() / "projects/app").resolve())
+
 
 class Message(unittest.TestCase):
     def test_one_line_with_paths_types_and_words(self):

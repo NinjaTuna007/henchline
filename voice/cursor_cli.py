@@ -314,8 +314,9 @@ def _key(address: str, key: str) -> bool:
 
 def _paste(address: str, text: str) -> bool:
     from voice.desktop import tmux
+    from voice.desktop import typeable
     buffer = f"henchline-{os.getpid()}-{time.monotonic_ns()}"
-    loaded = tmux.tmux("load-buffer", "-b", buffer, "-", given=text)
+    loaded = tmux.tmux("load-buffer", "-b", buffer, "-", given=typeable(text))
     pasted = loaded and loaded.returncode == 0 and tmux.tmux("paste-buffer", "-d", "-p", "-b", buffer, "-t", address)
     if not pasted or pasted.returncode != 0:
         tmux.tmux("delete-buffer", "-b", buffer)

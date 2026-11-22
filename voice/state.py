@@ -8,11 +8,13 @@ running on the system Python, reads these names too.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -244,7 +246,7 @@ def read_json(path: Path) -> dict:
         return {}
 
 
-def write_json(path: Path, data: dict, private: bool = False) -> None:
+def write_json(path: Path, data: dict | list, private: bool = False) -> None:
     """Write whole or not at all: readers never see half a file. `private`: readable by this user only."""
     path.parent.mkdir(parents=True, exist_ok=True)
     # Its own name: the call server and hands-free both write some files, and must not share one temp file
@@ -255,6 +257,20 @@ def write_json(path: Path, data: dict, private: bool = False) -> None:
         tmp.replace(path)
     finally:
         tmp.unlink(missing_ok=True)  # only left when the write or the replace failed
+
+
+@contextmanager
+def file_lock(path: Path, mode: str = "a"):
+    """An exclusive flock on `path` for the block: one read-change-write at a time across processes, and across
+    threads too (each opens the file anew). Mode "a" makes the lock file when missing; "r+" locks a file that holds
+    its own data, read and written through the handle this yields (it must exist)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, mode) as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield handle
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def log(path: Path, line: str, echo: bool = False) -> None:

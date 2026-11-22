@@ -49,8 +49,7 @@ class PhonePlay(unittest.TestCase):
     def setUp(self):
         phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         patches = [mock.patch.object(worker, "in_call", return_value=True),
-                   mock.patch.object(worker, "mic_busy", return_value=False),
-                   mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]
+                   mock.patch.object(worker, "mic_busy", return_value=False)]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -74,7 +73,7 @@ class PhonePlay(unittest.TestCase):
         worker.phone_play(FakeVoice(), clip, path, "")
         thread.join(2)
         self.assertEqual(" ".join(seen[0]["pieces"]), "Done. The tests pass now.")
-        self.assertEqual(seen[0]["sid"], 3)
+        self.assertEqual(seen[0]["sid"], phonevoice.SPEAKER)
         self.assertEqual(len(seen[0]["ph"]), len(seen[0]["pieces"]))  # each piece's phonemes, said in its place
         self.assertTrue(all(seen[0]["ph"]))
         self.assertFalse(path.exists())  # spoken: nothing kept
@@ -170,8 +169,7 @@ class Timeout(unittest.TestCase):
         phonevoice.offer({"tts": {"engine": phonevoice.ENGINE, "model": phonevoice.VERSION}})
         for p in [mock.patch.object(worker, "in_call", return_value=True),
                   mock.patch.object(worker, "mic_busy", return_value=False),
-                  mock.patch.object(worker, "PHONE_TIMEOUT", 0.3),
-                  mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]:
+                  mock.patch.object(worker, "PHONE_TIMEOUT", 0.3)]:
             p.start()
             self.addCleanup(p.stop)
 
@@ -212,8 +210,7 @@ class DroppedLine(unittest.TestCase):
         for p in [mock.patch.object(worker, "in_call", side_effect=lambda: self.calling.is_set()),
                   mock.patch.object(worker, "line_dropped",
                                     side_effect=lambda: {"until": time.time() + 30} if self.dropped.is_set() else None),
-                  mock.patch.object(worker, "mic_busy", return_value=False),
-                  mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]:
+                  mock.patch.object(worker, "mic_busy", return_value=False)]:
             p.start()
             self.addCleanup(p.stop)
 
@@ -264,8 +261,7 @@ class Cap(unittest.TestCase):
         for p in [mock.patch.object(worker, "in_call", return_value=True),
                   mock.patch.object(worker, "mic_busy", return_value=False),
                   mock.patch.object(worker, "PHONE_SLACK", 0.2),
-                  mock.patch.object(worker, "speech", return_value=0.05),
-                  mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]:
+                  mock.patch.object(worker, "speech", return_value=0.05)]:
             p.start()
             self.addCleanup(p.stop)
 
@@ -292,8 +288,7 @@ class DropWindowText(unittest.TestCase):
         for p in [mock.patch.object(worker, "in_call", side_effect=lambda: self.calling.is_set()),
                   mock.patch.object(worker, "line_dropped",
                                     side_effect=lambda: {"until": time.time() + 30} if self.dropped.is_set() else None),
-                  mock.patch.object(worker, "mic_busy", return_value=False),
-                  mock.patch.object(worker.phonevoice, "voice_id", return_value=3)]:
+                  mock.patch.object(worker, "mic_busy", return_value=False)]:
             p.start()
             self.addCleanup(p.stop)
 

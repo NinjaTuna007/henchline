@@ -1,6 +1,8 @@
 """voice/reminders.py: when a reminder is due, and keeping them."""
 
+import time
 import unittest
+from unittest import mock
 from datetime import datetime
 
 from tests import sandbox  # noqa: F401  (first: a throwaway HOME)
@@ -41,13 +43,53 @@ class Keeping(unittest.TestCase):
     def test_due_settle_cancel(self):
         early = reminders.add(100.0, "claude-a", "wake up", keep_awake=True)
         later = reminders.add(10 ** 10, "claude-a", "later")
-        self.assertEqual([r["id"] for r in reminders.due(200.0)], [early["id"]])
+        self.assertEqual([r.id for r in reminders.due(200.0)], [early["id"]])
         self.assertEqual(reminders.keep_awake_until(), 400.0)
-        reminders.settle(early["id"], "delivered")
+        self.assertFalse(reminders.settle(early["id"], reminders.ReminderState.DELIVERED))  # not claimed: left
+        self.assertEqual(reminders.claim(early["id"]).words, "wake up")
+        self.assertEqual(reminders.keep_awake_until(), 400.0)  # on its way: still keeps the laptop awake
+        self.assertTrue(reminders.settle(early["id"], reminders.ReminderState.DELIVERED))
         self.assertEqual(reminders.due(200.0), [])
         self.assertTrue(reminders.cancel(later["id"]))
         self.assertFalse(reminders.cancel(later["id"]))  # only a pending one
         self.assertEqual(reminders.keep_awake_until(), 0.0)
+
+    def test_a_reminder_cancelled_before_its_claim_is_never_typed(self):
+        item = reminders.add(time.time() - 10, "claude-a", "wake up")
+        self.assertEqual(len(reminders.due()), 1)  # due, and then the user cancels it
+        self.assertTrue(reminders.cancel(item["id"]))
+        self.assertIsNone(reminders.claim(item["id"]))
+        self.assertFalse(reminders.settle(item["id"], reminders.ReminderState.DELIVERED))
+        self.assertEqual(reminders.listed()[0]["state"], "cancelled")
+
+    def test_a_claimed_reminder_cannot_be_cancelled_and_a_failed_try_is_pending_again(self):
+        item = reminders.add(time.time() - 10, "claude-a", "wake up")
+        self.assertIsNotNone(reminders.claim(item["id"]))
+        self.assertIsNone(reminders.claim(item["id"]))  # never typed twice
+        self.assertFalse(reminders.cancel(item["id"]))
+        self.assertTrue(reminders.later(item["id"]))
+        self.assertEqual(reminders.listed()[0]["state"], "pending")
+        self.assertEqual(reminders.due(), [])  # backing off
+        self.assertFalse(reminders.later(item["id"]))  # only a claim is put back
+
+    def test_a_claim_left_by_a_dead_server_is_due_again(self):
+        item = reminders.add(time.time() - 10, "claude-a", "wake up")
+        reminders.claim(item["id"])
+        self.assertEqual(reminders.due(time.time()), [])
+        self.assertEqual([r.id for r in reminders.due(time.time() + reminders.SEND_FOR + 1)], [item["id"]])
+
+    def test_the_server_delivers_only_a_reminder_still_pending(self):
+        from call import server
+        item = reminders.add(time.time() - 10, "claude-a", "wake up")
+        reminders.cancel(item["id"])
+        with mock.patch.object(server, "to_agent", return_value=("Claude", "")) as typed:
+            server.deliver_reminder(item["id"])
+        typed.assert_not_called()
+        other = reminders.add(time.time() - 10, "claude-a", "stand up")
+        with mock.patch.object(server, "to_agent", return_value=("Claude", "")) as typed:
+            server.deliver_reminder(other["id"])
+        typed.assert_called_once()
+        self.assertEqual(next(r for r in reminders.listed() if r["id"] == other["id"])["state"], "delivered")
 
 
 if __name__ == "__main__":
