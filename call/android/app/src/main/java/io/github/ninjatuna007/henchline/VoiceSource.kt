@@ -11,11 +11,13 @@ object VoiceSource {
     const val NEXT_CALL = " From the next call."
     const val PREPARING_LINE = "Getting Jenny ready…"
     const val FELL_BEHIND_LINE = "Laptop for now: the phone fell behind. Tap Phone to try again."
-    const val OTHER_HOST_LINE = "Phone voice works on your laptop's calls."
+    const val OTHER_HOST_LINE = "Calls with another computer always use the phone's voice."
+    const val OTHER_HOST_BEHIND_LINE = "The phone fell behind: the replies show as text until it catches up."
 
     /** What the switch shows: where the thumb sits, whether Phone can be tapped, the line under it, and whether that
      *  line is in the waiting colour (the phone fell behind). */
-    data class State(val phone: Boolean, val phoneUsable: Boolean, val line: String, val waiting: Boolean = false)
+    data class State(val phone: Boolean, val phoneUsable: Boolean, val line: String, val waiting: Boolean = false,
+                     val fixed: Boolean = false)  // fixed: this call can't change it (another computer's: always the phone)
 
     /**
      * enabled: the user's choice (PhoneVoice.enabled); ready: the model is downloaded; onCall: a call is up;
@@ -24,7 +26,8 @@ object VoiceSource {
      */
     fun state(enabled: Boolean, ready: Boolean, onCall: Boolean, otherHost: Boolean, fellBehind: Boolean,
               preparing: Boolean): State {
-        if (onCall && otherHost) return State(phone = false, phoneUsable = false, line = OTHER_HOST_LINE)
+        if (onCall && otherHost) return if (fellBehind) State(phone = true, phoneUsable = true, line = OTHER_HOST_BEHIND_LINE,
+            waiting = true, fixed = true) else State(phone = true, phoneUsable = true, line = OTHER_HOST_LINE, fixed = true)
         val phone = enabled && ready
         val later = if (onCall) "" else NEXT_CALL
         return when {

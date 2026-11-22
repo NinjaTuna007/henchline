@@ -382,10 +382,13 @@ object PhoneVoice {
 
     /** What the phone tells the laptop on connecting: it can speak talkback (only when switched on and here).
      *  `chosen`: the user switched to the phone mid-call (the laptop then says so in this voice). */
-    fun offer(context: Context, chosen: Boolean = false): JSONObject? =
-        if (enabled(context) && ready(context)) JSONObject().put("tts", JSONObject().put("engine", ENGINE).put("model", MODEL)
-            .apply { if (rtf > 0f) put("rtf", rtf.toDouble()) })
-            .apply { if (chosen) put("chosen", true) }
+    /** required: a call with another computer, which always speaks through the phone (it makes no speech of its
+     *  own, 2026-11-22): offered whatever the laptop-call setting, marked so the computer never answers with audio. */
+    fun offer(context: Context, chosen: Boolean = false, required: Boolean = false): JSONObject? =
+        if ((required || enabled(context)) && ready(context)) JSONObject().put("tts", JSONObject().put("engine", ENGINE).put("model", MODEL)
+            .apply { if (rtf > 0f) put("rtf", rtf.toDouble()) }
+            .apply { if (required) put("required", true) })
+            .apply { if (chosen || required) put("chosen", true) }
         else null
 
     // The Voices sheet's preview: its phonemes made once on the laptop (python -m voice.phonevoice phonemes …), as

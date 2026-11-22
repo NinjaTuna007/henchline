@@ -180,7 +180,7 @@ class PhoneVoiceSheet(activity: Activity, private val changed: () -> Unit = {}) 
                 setTextColor(colour(if (ready) R.color.text else R.color.muted))
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(Switch(activity).apply {
-                isChecked = ready && PhoneVoice.enabled(activity); isEnabled = ready
+                isChecked = ready && PhoneVoice.enabled(activity); isEnabled = ready && service?.otherHost != true
                 setOnCheckedChangeListener { _, on ->
                     if (service != null && !service.otherHost) service.useVoice(on) else PhoneVoice.setEnabled(activity, on)
                     changed()
@@ -188,7 +188,7 @@ class PhoneVoiceSheet(activity: Activity, private val changed: () -> Unit = {}) 
             })
         }, wide(8))
         if (!ready) content.addView(downloadCard(thenUse = false), wide(10))
-        else content.addView(quiet("Delete it from this phone") {
+        else if (service?.otherHost != true) content.addView(quiet("Delete it from this phone") {  // not while she speaks a call
             if (service != null && !service.otherHost && PhoneVoice.enabled(activity)) service.useVoice(false)
             PhoneVoice.setEnabled(activity, false)
             Thread { PhoneVoice.delete(activity); activity.runOnUiThread { draw() } }.start()

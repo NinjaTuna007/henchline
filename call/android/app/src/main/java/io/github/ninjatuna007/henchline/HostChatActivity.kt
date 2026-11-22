@@ -425,6 +425,11 @@ class HostChatActivity : Activity() {
                 activity.requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), MIC); return
             }
             pendingAnswer = null; pendingAnswered = false
+            // A computer makes no speech of its own: the phone speaks every reply with Jenny, so she must be here
+            if (!PhoneVoice.ready(activity)) {
+                if (answered) Ringing.end(activity)
+                show(CallService.NEEDS_JENNY); return
+            }
             if (answered) Ringing.end(activity)  // answered: the ring stops everywhere
             val prefs = activity.getSharedPreferences("call", Context.MODE_PRIVATE)
             callLines.removeAllViews(); shownSeq = -1

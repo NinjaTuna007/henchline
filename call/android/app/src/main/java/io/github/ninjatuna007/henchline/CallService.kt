@@ -269,6 +269,15 @@ class CallService : Service() {
         Bus.host = hostId
         hostId?.let { Bus.hostLines.start(it, hostSession) }
         if (hostId != null) goForeground()  // its notification opens that computer's chat
+        // HostChatActivity starts no such call without Jenny downloaded; one started anyway (a ring's Answer) ends here,
+        // before anything is taken or said to be answered
+        if (hostId != null && !PhoneVoice.ready(this)) {
+            android.util.Log.w("Henchline", "call: another computer's call without the phone voice: not started")
+            tell(org.json.JSONObject().put("closed", NEEDS_JENNY).toString())
+            ended = true  // onDestroy mustn't follow it with its own "Call ended"
+            stopSelf()
+            return START_NOT_STICKY
+        }
         clear = intent.getBooleanExtra(CLEAR, true)
         speaker = intent.getBooleanExtra(SPEAKER, true)
         if (!speaker) clear = false  // the earpiece is only on the phone-call path
@@ -285,8 +294,8 @@ class CallService : Service() {
                 .createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "henchline:call")
                 .apply { setReferenceCounted(false); acquire() }
         } catch (e: Exception) { null }
-        // The phone's own voice is the laptop's (its voices and manifest come from there): not on another computer's call
-        if (hostId == null && PhoneVoice.enabled(this) && PhoneVoice.ready(this)) {
+        // The phone's own voice: on the laptop's calls when chosen; on another computer's always (it makes no speech)
+        if (PhoneVoice.ready(this) && (hostId != null || PhoneVoice.enabled(this))) {
             phoneVoice = newSpeaker()
             Thread { PhoneVoice.load(this) }.start()  // about 2.4 s: ready before the first reply
         }
@@ -890,7 +899,7 @@ class CallService : Service() {
      *  in clear sound, or without a canceller, our voice can reach this mic and talking over is judged with care. */
     private fun offerPhoneVoice(webSocket: WebSocket) {
         val voice = phoneVoice ?: return
-        PhoneVoice.offer(this)?.let { webSocket.send(it.toString()) }
+        PhoneVoice.offer(this, required = hostId != null)?.let { webSocket.send(it.toString()) }
         voice.report().forEach { webSocket.send(it) }  // after a drop: how far each clip got while the line was down
     }
 
@@ -1071,6 +1080,8 @@ class CallService : Service() {
     companion object {
         const val SERVER = "server"
         const val CLEAR = "clear"
+        /** Why a call with another computer can't start: it speaks only through the phone's own voice. */
+        const val NEEDS_JENNY = "Calls with another computer use the phone's own voice: download it in Settings › Voices."
         const val HOST_ID = "host_id"        // multi-host: a call with that paired computer instead of the laptop
         const val HOST_SESSION = "host_session"  // and with that agent there
         const val CALL_HOST = "call_host"        // on each message to the screens: whose call it is

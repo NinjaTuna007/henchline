@@ -1611,7 +1611,8 @@ class VoicesSheet(
                     background = rounded(colour(R.color.surface_high), 17f)
                     typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
                 }
-                if (phone && !state.phoneUsable) { isEnabled = false; contentDescription = "Phone (not on this call)" }
+                if (state.fixed) isEnabled = false  // another computer's call: the phone's voice, not to be changed now
+                else if (phone && !state.phoneUsable) { isEnabled = false; contentDescription = "Phone (not on this call)" }
                 else setOnClickListener { pick(body, phone, state, ready, this) }
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
         }

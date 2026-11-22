@@ -26,12 +26,18 @@ class VoiceSourceTest {
         assertTrue(state(enabled = true, ready = false).phoneUsable)  // a tap offers the download
     }
 
-    @Test fun anotherComputersCallLeavesPhoneInert() {
-        val s = state(enabled = true, onCall = true, otherHost = true)
-        assertFalse(s.phone)
-        assertFalse(s.phoneUsable)
-        assertEquals(VoiceSource.OTHER_HOST_LINE, s.line)
+    @Test fun anotherComputersCallIsAlwaysThePhonesVoiceAndFixed() {
+        for (enabled in listOf(true, false)) {  // whatever the laptop-call choice is
+            val s = state(enabled = enabled, onCall = true, otherHost = true)
+            assertTrue(s.phone)
+            assertTrue(s.fixed)
+            assertEquals(VoiceSource.OTHER_HOST_LINE, s.line)
+        }
+        val behind = state(enabled = false, onCall = true, otherHost = true, fellBehind = true)
+        assertEquals(VoiceSource.OTHER_HOST_BEHIND_LINE, behind.line)
+        assertTrue(behind.waiting && behind.fixed)
         assertEquals(VoiceSource.PHONE_LINE + VoiceSource.NEXT_CALL, state(enabled = true, otherHost = true).line)  // no call
+        assertFalse(state(enabled = true, onCall = true).fixed)  // the laptop's calls: switchable as before
     }
 
     @Test fun fallingBehindKeepsTheThumbOnPhoneInTheWaitingColour() {
