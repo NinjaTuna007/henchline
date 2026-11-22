@@ -352,8 +352,10 @@ async def chat_events(request: web.Request, api: Api, signed_request: SignedRequ
     limit = limit_of(request, rid)
     rows = await asyncio.get_running_loop().run_in_executor(
         None, api.store.events, session_id, limit, cursor_after(request.query.get("cursor", ""), rid))
+    # Each event's own cursor: a phone polling for what's new resumes after the last one it has (next_cursor is
+    # only there when the page was full), a little earlier for a text that is filed late in its place
     events = [{"host_id": api.config.host_id, "session_id": session_id, "event_id": row["event_id"],
-               "kind": row["kind"], **json.loads(row["body"])} for row in rows]
+               "kind": row["kind"], **json.loads(row["body"]), "cursor": cursor_of(row)} for row in rows]
     return ok(signed_request, {"host_id": api.config.host_id, "session_id": session_id, "events": events,
                                "next_cursor": cursor_of(rows[-1]) if len(rows) == limit else None})
 
@@ -393,15 +395,18 @@ def utc(at: float) -> str:
 
 # ---- the reply ledger: agents' texts kept as chat events -----------------------------------------------------
 
-def ingest(api: Api) -> int:
+def ingest(api: Api, now: float | None = None) -> int:
     """Each agent text this host keeps, added once to its chat's events (kind agent_text). Safe to run again and
-    again, and after a restart: the text's id is the event's source, kept unique. How many were new."""
+    again, and after a restart: the text's id is the event's source, kept unique. Texts older than ledger_days are
+    left out, so pruning and ingesting never take turns over the same old text. How many were new."""
     added = 0
+    cutoff = (time.time() if now is None else now) - api.config.ledger_days * 86400
     for record in api.host.texts():
         tid, words, session = str(record.get("id", "")), record.get("words"), str(record.get("session", ""))
         at = record.get("at")
         if (not TEXT_ID.fullmatch(tid) or not isinstance(words, str) or not words.strip()
-                or not SESSION_ID.fullmatch(session) or not isinstance(at, (int, float)) or isinstance(at, bool)):
+                or not SESSION_ID.fullmatch(session) or not isinstance(at, (int, float)) or isinstance(at, bool)
+                or at < cutoff):
             continue
         body = {"agent": str(record.get("agent", "")), "text": words, "text_id": tid, "created_at": utc(at)}
         if api.store.append_event(session, "agent_text", json.dumps(body).encode(), now=float(at),

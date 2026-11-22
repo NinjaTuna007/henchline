@@ -11,3 +11,18 @@
 `--host tailscale` keeps the self-signed way even when `tailscale serve` would work.
 
 The Android app, Henchline: [android/README.md](android/README.md).
+
+## The signed host API (preview)
+
+`voice-call --api-v1` also serves a versioned API for phones paired with this computer (more than one computer
+per phone). It is off unless asked for, and it needs `~/.config/henchline/host.json`.
+
+- `voice-call pair` shows the address, the key's fingerprint and a five-minute one-time code;
+  `voice-call devices list` / `voice-call devices revoke ID` manage paired phones.
+- `voice-call backup --output FILE` copies the host database (paired phones, the request ledger, chat history).
+  The database's format is upgraded automatically and one way (version 2 adds where each chat event came from):
+  to go back to an older build, restore the backup taken before the upgrade.
+- Agents' texts to the phone are kept as chat history in `~/.local/share/henchline/host.sqlite3` for
+  `ledger_days` (in host.json, default 30), so paired phones can read them; older ones are pruned and not
+  taken in again.
+

@@ -85,6 +85,21 @@ class HostChat(private val client: HostClient, private val hostId: String) {
         }
     }
 
+    /** The agents' texts among eventIds, seen on this phone: moved forward on the host (a read text stops an
+     *  until-read ring there). Returns the events the host marked; harmless to send again (forward only).
+     *  At most RECEIPT_IDS at once (the host's limit): the caller sends chunks and records each one sent. */
+    fun receipt(sessionId: String, eventIds: List<String>, state: String = "read"): List<String> {
+        if (eventIds.isEmpty()) return emptyList()
+        require(eventIds.size <= RECEIPT_IDS) { "at most $RECEIPT_IDS events per receipt" }
+        client.require("chat")
+        val body = JSONObject().put("host_id", hostId).put("session_id", sessionId).put("state", state)
+            .put("event_ids", org.json.JSONArray(eventIds)).toString().toByteArray()
+        val answer = client.call("POST", listOf("api", "v1", "chats", sessionId, "receipts"), body = body)
+        if (answer.code != 200) throw java.io.IOException("receipts: ${answer.code} ${answer.errorCode}")
+        val marked = answer.json().optJSONArray("marked") ?: return emptyList()
+        return (0 until marked.length()).map { marked.getString(it) }
+    }
+
     /** The phone has kept the answer: the host may compact it (it still never runs twice). */
     fun ack(requestId: String): Boolean = try {
         client.call("POST", listOf("api", "v1", "requests", requestId, "ack")).code == 200
@@ -93,6 +108,8 @@ class HostChat(private val client: HostClient, private val hostId: String) {
     }
 
     companion object {
+        const val RECEIPT_IDS = 200
+
         /** The message as it will be sent, every time. */
         fun body(hostId: String, sessionId: String, clientMessageId: String, text: String): String =
             JSONObject().put("host_id", hostId).put("session_id", sessionId).put("client_message_id", clientMessageId)
@@ -102,10 +119,10 @@ class HostChat(private val client: HostClient, private val hostId: String) {
     }
 }
 
-/** Where the queues live (Store on the phone; a list in tests). */
 /** A message as the chat screen shows it: its words, and what became of it. */
 data class QueuedRow(val requestId: String, val clientMessageId: String, val text: String, val state: String, val note: String)
 
+/** Where the queues live (Store on the phone; a list in tests). */
 interface OutboxStore {
     fun enqueue(hostId: String, requestId: String, clientMessageId: String, sessionId: String, body: String): Queued
     fun waiting(hostId: String): List<Queued>
@@ -179,5 +196,59 @@ object HostOutbox {
             }
         }
         return Result(sent, 0, null)
+    }
+}
+
+/**
+ * One chat's events as this phone holds them, in the host's order (created_at, then event id), each once. The chat
+ * screen asks the host only for what follows where it got to, and draws only what is new where it belongs.
+ * A text the host files late (it reads agents' texts every couple of seconds, or after a restart) can sort before
+ * events already held: polling resumes from OVERLAP_S before the newest event held, and repeats are dropped.
+ */
+class ChatTimeline {
+    private data class Held(val at: Long, val eventId: String, val cursor: String)
+    private val held = ArrayList<Held>()  // in order
+    private val ids = HashSet<String>()
+
+    private var more: String? = null  // a full page's next cursor: the history goes on past what is held
+
+    val size get() = held.size
+
+    /** Still reading a long history up to its end (a page came back full). */
+    val catchingUp get() = more != null
+
+    /** The new events among a page, each with the position it takes among those held (apply in the order given). */
+    fun add(page: List<JSONObject>): List<Pair<Int, JSONObject>> {
+        val placed = ArrayList<Pair<Int, JSONObject>>()
+        for (e in page) {
+            val id = e.optString("event_id")
+            if (id.isEmpty() || !ids.add(id)) continue
+            val h = Held(millis(e.optString("created_at")), id, e.optString("cursor"))
+            var at = held.size
+            while (at > 0 && order(held[at - 1], h) > 0) at--
+            held.add(at, h)
+            placed += at to e
+        }
+        return placed
+    }
+
+    /** A page has been added: next is the host's next_cursor for it (null: that was the end). */
+    fun pageEnded(next: String?) { more = next }
+
+    /** Where the next look starts: while catching up, straight after the last full page (never back over it, so
+     *  a long history always moves on); null (from the start) until something is held; else the cursor of the last
+     *  event older than the newest by OVERLAP_S (none: from the start, which is then short anyway). */
+    fun resumeFrom(): String? {
+        more?.let { return it }
+        val newest = held.lastOrNull() ?: return null
+        return held.lastOrNull { it.at <= newest.at - OVERLAP_S * 1000 && it.cursor.isNotEmpty() }?.cursor
+    }
+
+    private fun order(a: Held, b: Held) = compareValuesBy(a, b, { it.at }, { it.eventId })
+
+    companion object {
+        const val OVERLAP_S = 120L
+
+        fun millis(utc: String): Long = try { java.time.Instant.parse(utc).toEpochMilli() } catch (e: Exception) { 0L }
     }
 }

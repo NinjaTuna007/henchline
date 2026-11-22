@@ -205,6 +205,31 @@ class HostOutboxTest {
         assertEquals("maybe", store.state(item.requestId))
     }
 
+    @Test fun readReceiptsNameTheChatAndItsEvents() {
+        var sent: Pair<HttpUrl, JSONObject>? = null
+        val chat = HostChat(HostClient(host(a), key, { _, url, body, _ ->
+            sent = url to JSONObject(String(body!!))
+            HttpAnswer(200, """{"host_id":"$a","marked":["e1"],"unknown":["m1"]}""") }), a)
+        assertEquals(listOf("e1"), chat.receipt("a/b", listOf("e1", "m1")))
+        val (url, body) = sent!!
+        assertEquals("/api/v1/chats/a%2Fb/receipts", url.encodedPath)
+        assertEquals(listOf(a, "a/b", "read"), listOf(body.getString("host_id"), body.getString("session_id"), body.getString("state")))
+        assertEquals(2, body.getJSONArray("event_ids").length())
+        assertEquals(emptyList<String>(), chat.receipt("a/b", emptyList()))  // nothing to say: nothing sent
+        // More than the host takes at once is refused, not cut short: the caller sends chunks and records each
+        val many = (0..HostChat.RECEIPT_IDS).map { "e$it" }
+        assertTrue(runCatching { chat.receipt("a/b", many) }.exceptionOrNull() is IllegalArgumentException)
+        chat.receipt("a/b", many.take(HostChat.RECEIPT_IDS))
+        assertEquals(HostChat.RECEIPT_IDS, sent!!.second.getJSONArray("event_ids").length())
+    }
+
+    @Test fun agentTextsComeWithTheChatsEvents() {
+        val chat = HostChat(HostClient(host(a), key, { _, _, _, _ -> HttpAnswer(200, """{"host_id":"$a","events":[
+            {"host_id":"$a","session_id":"c1","event_id":"t1","kind":"agent_text","agent":"claude","text":"Done."},
+            {"host_id":"$a","session_id":"c1","event_id":"m1","kind":"message","state":"delivered"}],"next_cursor":null}""") }), a)
+        assertEquals(listOf("agent_text", "message"), chat.events("c1").first.map { it.getString("kind") })
+    }
+
     @Test fun chatsAndEventsAreThisHostsOnly() {
         val pages = ArrayDeque(listOf(
             """{"host_id":"$a","chats":[{"host_id":"$a","session_id":"c1","name":"One"}],"next_cursor":"1"}""",

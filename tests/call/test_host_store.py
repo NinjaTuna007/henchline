@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests import sandbox  # noqa: F401  (first: a throwaway HOME)
 
@@ -181,6 +182,42 @@ class SchemaTwo(Base):
         self.assertIsNotNone(self.store.append_event("c", "message", b"{}", now=T0))
         self.assertEqual(len(self.store.events("c")), 3)
         self.assertEqual(self.store.event(first)["source"], "text:1")
+
+    def test_two_openers_upgrading_at_once_are_fine(self):
+        # A store from before schema 2, then "another process" adds the column between this one's look and its ALTER
+        self.store.close()
+        db = sqlite3.connect(self.path)
+        db.executescript("DROP INDEX host_events_source; UPDATE schema_meta SET version=1;")
+        db.execute("CREATE TABLE e2 AS SELECT event_id, session_id, kind, body, created_at FROM host_events")
+        db.executescript("DROP TABLE host_events; ALTER TABLE e2 RENAME TO host_events;")
+        db.commit(); db.close()
+        real = HostStore._migrate
+
+        def racing(store):
+            other = sqlite3.connect(self.path)
+            other.execute("ALTER TABLE host_events ADD COLUMN source TEXT")
+            other.commit(); other.close()
+            # this opener's own look (before the other's ALTER) said "missing": make it look so again
+            original = store._db
+            class Stale:
+                def __init__(self, db): self.db = db
+                def execute(self, sql, *a):
+                    if sql.startswith("PRAGMA table_info(host_events)"):
+                        return iter([(0, "event_id")])
+                    return self.db.execute(sql, *a)
+                def __getattr__(self, name): return getattr(self.db, name)
+                def __enter__(self): return self.db.__enter__()
+                def __exit__(self, *e): return self.db.__exit__(*e)
+            store._db = Stale(original)
+            try:
+                real(store)
+            finally:
+                store._db = original
+        with mock.patch.object(HostStore, "_migrate", racing):
+            self.store = HostStore(self.path)
+        self.assertEqual(self.store._db.execute("SELECT version FROM schema_meta").fetchone()[0], 2)
+        self.assertIsNotNone(self.store.append_event("c", "agent_text", b"{}", source="text:1"))  # the unique index
+        self.assertIsNone(self.store.append_event("c", "agent_text", b"{}", source="text:1"))     # is there
 
     def test_pruning(self):
         self.store.append_event("c", "agent_text", b"{}", now=T0 - 100, source="text:old")

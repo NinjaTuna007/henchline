@@ -364,6 +364,15 @@ class Messages(Base):
                                   f"/api/v1/chats/claude-1/events?limit=2&cursor={page['next_cursor']}")
         self.assertEqual([e["content"]["text"] for e in rest["events"]], ["m2"])
         self.assertIsNone(rest["next_cursor"])
+        # A part page still says where each event is: polling resumes after the last one held, sees only what's new
+        _, none_new = await self.call(key, device, "GET",
+                                      f"/api/v1/chats/claude-1/events?cursor={rest['events'][-1]['cursor']}")
+        self.assertEqual(none_new["events"], [])
+        await self.call(key, device, "POST", "/api/v1/chats/claude-1/messages", self.message(text="m3"))
+        _, new = await self.call(key, device, "GET",
+                                 f"/api/v1/chats/claude-1/events?cursor={rest['events'][-1]['cursor']}")
+        self.assertEqual([e["content"]["text"] for e in new["events"]], ["m3"])
+        self.assertEqual(page["events"][-1]["cursor"], page["next_cursor"])
         status, _ = await self.call(key, device, "GET", "/api/v1/chats/claude-1/events?cursor=bogus")
         self.assertEqual(status, 400)
 
@@ -474,12 +483,13 @@ class Ledger(Base):
             self.assertEqual((status, answer["error"]["code"]), (422, "validation_failed"))
         self.assertEqual(self.host.marked, [])
 
-    async def test_old_events_are_pruned(self):
-        self.host.texts_kept = [text("a" * 16, at=time.time() - 40 * 86400), text("b" * 16, at=time.time())]
-        api_v1.ingest(self.api)
-        self.assertEqual(self.store.prune_events(time.time() - self.config.ledger_days * 86400), 1)
-        self.assertEqual([json.loads(r["body"])["text_id"] for r in self.store.events("claude-1")], ["b" * 16])
-        self.assertEqual(api_v1.ingest(self.api), 1)  # still kept by the host: back in, until it ages out there too
+    async def test_old_texts_are_neither_ingested_nor_kept(self):
+        now = time.time()
+        self.host.texts_kept = [text("a" * 16, at=now - 40 * 86400), text("b" * 16, at=now - 29 * 86400)]
+        self.assertEqual(api_v1.ingest(self.api, now=now), 1)  # older than ledger_days (30): left out
+        self.assertEqual(self.store.prune_events(now + 2 * 86400 - self.config.ledger_days * 86400), 1)  # two days on
+        self.assertEqual(self.store.events("claude-1"), [])
+        self.assertEqual(api_v1.ingest(self.api, now=now + 2 * 86400), 0)  # no churn: pruned stays out
 
 
 class NoChat(Base):

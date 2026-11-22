@@ -16,7 +16,10 @@ from call.canonical import b64url, crockford
 from call.sqlite_backup import backup  # noqa: F401  (voice-call backup)
 
 
-SCHEMA_VERSION = 2  # 2: host_events.source, so an ingested record is kept once
+# 2: host_events.source, so an ingested record is kept once. Upgrading is automatic and one-way: an older build
+# refuses a version-2 store, so rolling back means restoring the backup taken before the upgrade
+# (`voice-call backup --output FILE`, which the deployment preflight takes).
+SCHEMA_VERSION = 2
 PAIRING_LIFETIME = 5 * 60
 NONCE_LIFETIME = 10 * 60
 PAIRING_ATTEMPTS = 5
@@ -124,7 +127,11 @@ class HostStore:
             # 1 -> 2: where an event came from ("text:<id>"), unique, so ingesting again never duplicates it
             columns = {r[1] for r in self._db.execute("PRAGMA table_info(host_events)")}
             if "source" not in columns:
-                self._db.execute("ALTER TABLE host_events ADD COLUMN source TEXT")
+                try:
+                    self._db.execute("ALTER TABLE host_events ADD COLUMN source TEXT")
+                except sqlite3.OperationalError as exc:  # another process opening the store added it first
+                    if "duplicate column" not in str(exc):
+                        raise
             self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS host_events_source ON host_events(source) "
                              "WHERE source IS NOT NULL")
             if row is None:
