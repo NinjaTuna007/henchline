@@ -117,7 +117,7 @@ class MainActivity : Activity() {
             setProgressBackgroundColorSchemeColor(getColor(R.color.surface))
             setOnRefreshListener { refreshPlan() }
         }
-        refresh.setOnRefreshListener { if (tab == "usage") showUsage(fresh = true) else findCrew() }
+        refresh.setOnRefreshListener { if (tab == "usage") showUsage(fresh = true) else { findCrew(); refreshComputers() } }
         quoteBar.setOnClickListener { setQuote("") }  // tap it to stop replying
         findViewById<View>(R.id.settingsButton).visibility = View.GONE  // the header keeps only the title and you
         findViewById<View>(R.id.profile).setOnClickListener { toggleAway() }
@@ -496,6 +496,8 @@ class MainActivity : Activity() {
         CallService.Bus.listener = { message -> main.post { fromServer(message) } }
         RingService.share(this)  // where texts reach this app: the laptop kept an old address after a reinstall
         HostRefresh.soon(this)  // multi-host: paired computers' descriptions, when due
+        HostLists.changed = { if (listScreen.visibility == View.VISIBLE && tab == "chats") showCrew() }
+        main.removeCallbacks(computersPoll); main.post(computersPoll)  // the other computers' chats, while on screen
         main.removeCallbacks(textsPoll); main.post(textsPoll)
         refreshAway()  // the laptop may have changed Away while the app was in the background
         if (Outbox.all(this).isNotEmpty()) {  // messages that waited: now, maybe, and on any change of network
@@ -551,6 +553,8 @@ class MainActivity : Activity() {
     }
 
     override fun onPause() {
+        main.removeCallbacks(computersPoll)
+        HostLists.changed = null
         Messages.viewing = ""  // not on screen: texts get their banner again
         lifecycleSeen = false
         pulseLive(false)  // no beat for nobody
@@ -778,7 +782,11 @@ class MainActivity : Activity() {
         if (tab == "calls") return showCalls()
         if (tab == "usage") return showUsage()
         val query = if (::search.isInitialized) search.text.toString().trim() else ""
-        if (names.isEmpty()) {
+        // Multi-host: the other paired computers' chats, grouped by computer (none: the list is exactly as before)
+        val computers = otherComputers()
+        val looks = if (computers.isEmpty()) emptyMap() else HostLists.cached(this)
+        val seenThere = if (computers.isEmpty()) emptyMap() else HostLists.seen(this)
+        if (names.isEmpty() && computers.none { looks[it.hostId]?.chats?.isNotEmpty() == true }) {
             crew.addView(TextView(this).apply {
                 text = "No crew yet. Pull down to look for agents running on your computer, or call once."
                 setTextColor(getColor(R.color.muted))
@@ -830,7 +838,8 @@ class MainActivity : Activity() {
                 }
                 chats = chats.mapNotNull { c -> done[c.session]?.let { Chat(c.session, c.agent, c.project, c.last, it, c.state) } }
             } else chats = byName
-            if (chats.isEmpty()) crew.addView(TextView(this).apply {
+            if (chats.isEmpty() && computers.none { h -> HostLists.groups(looks[h.hostId]?.summaries ?: emptyList(), "recent",
+                    emptySet(), query).isNotEmpty() }) crew.addView(TextView(this).apply {
                 text = "Nothing matches \"$query\"."; setTextColor(getColor(R.color.muted)); setPadding(dp(20), dp(24), dp(20), dp(24))
             })
         }
@@ -848,19 +857,75 @@ class MainActivity : Activity() {
         }
         // A crew chat goes under its manager's row when that row is in the list; otherwise it keeps its own place
         val shown = if (query.isEmpty()) groups.flatMap { g -> g.second.map { it.session } }.toSet() else emptySet()
-        for ((heading, members) in groups) {
-            if (heading.isNotEmpty() && members.any { nestedUnder(it.session, shown) == null }) crew.addView(TextView(this).apply {
-                text = heading.replace("_", " ").uppercase()
-                setTextColor(getColor(R.color.muted)); textSize = 12f; typeface = android.graphics.Typeface.DEFAULT_BOLD
-                setPadding(dp(20), dp(16), dp(20), dp(4))
-            })
-            for (chat in members) {
-                if (nestedUnder(chat.session, shown) != null) continue  // drawn under its manager, wherever that is
-                crew.addView(chatRow(chat.session, chat.agent, chat.project, chat.last, chat.found, state = chat.state))
-                // Its crew right under it, indented (the user's pick, 2026-11-21: the hard-hat mock-up's nested list),
-                // even a helper working in another project. Not in a search: results stay flat.
-                if (query.isEmpty()) for (helper in byRecent.filter { bosses[it.session] == chat.session && it.session !in pins })
-                    crew.addView(chatRow(helper.session, helper.agent, helper.project, helper.last, helper.found, nested = true, state = helper.state))
+        fun drawGroups(list: List<Pair<String, List<Chat>>>, inComputer: Boolean) {
+            for ((heading, members) in list) {
+                if (heading.isNotEmpty() && members.any { nestedUnder(it.session, shown) == null }) crew.addView(sortHeading(heading, inComputer))
+                for (chat in members) {
+                    if (nestedUnder(chat.session, shown) != null) continue  // drawn under its manager, wherever that is
+                    crew.addView(chatRow(chat.session, chat.agent, chat.project, chat.last, chat.found, state = chat.state))
+                    // Its crew right under it, indented (the user's pick, 2026-11-21: the hard-hat mock-up's nested list),
+                    // even a helper working in another project. Not in a search: results stay flat.
+                    if (query.isEmpty()) for (helper in byRecent.filter { bosses[it.session] == chat.session && it.session !in pins })
+                        crew.addView(chatRow(helper.session, helper.agent, helper.project, helper.last, helper.found, nested = true, state = helper.state))
+                }
+            }
+        }
+        if (computers.isEmpty()) drawGroups(groups, inComputer = false)
+        else {
+            // Grouped by computer (the user's pick, 2026-11-22): one Pinned for all of them first, then the laptop,
+            // then the others in pairing order, each with the sort inside it. A search shows each one's hits flat.
+            val now = System.currentTimeMillis()
+            val folded = HostLists.collapsed(this)
+            // A pinned row, the laptop's or another computer's, and its helpers (HostLists.pinnedRows nests them)
+            class Pin(val at: Long, val helpers: List<Pin>, val draw: (nested: Boolean) -> Unit)
+            fun laptopPin(c: Chat, nested: Boolean = false): Pin = Pin(c.last?.optLong("at") ?: 0L,
+                if (nested) emptyList()  // one level, as the old Pinned group: no loop even if two name each other
+                else byRecent.filter { bosses[it.session] == c.session && it.session != c.session && it.session !in pins }
+                    .map { laptopPin(it, nested = true) }) { nested ->
+                crew.addView(chatRow(c.session, c.agent, c.project, c.last, c.found, nested = nested, state = c.state))
+            }
+            fun hostPin(h: Host, all: List<ChatSummary>, c: ChatSummary, nested: Boolean = false): Pin = Pin(c.lastAt,
+                if (nested) emptyList() else all.filter { it.boss == c.sessionId && it.sessionId != c.sessionId &&
+                    HostLists.pinKey(h.hostId, it.sessionId) !in pins && Strays.listed(it.state, false, false) }
+                    .sortedByDescending { it.lastAt }.map { hostPin(h, all, it, nested = true) }) { inside ->
+                crew.addView(hostRow(h, c, seenThere, inside, where = h.label, dim = false,
+                    bossName = if (inside) all.firstOrNull { it.sessionId == c.boss }?.let { HostLists.named(it).first } else null))
+            }
+            val pinRows = if (query.isNotEmpty()) emptyList() else pinned.map { laptopPin(it) } + computers.flatMap { h ->
+                val all = looks[h.hostId]?.summaries ?: emptyList()
+                all.filter { HostLists.pinKey(h.hostId, it.sessionId) in pins }.map { hostPin(h, all, it) }
+            }
+            if (pinRows.isNotEmpty()) {
+                crew.addView(sortHeading("Pinned", inComputer = false))
+                HostLists.pinnedRows(pinRows, { it.at }, { it.helpers }).forEach { (pin, nested) -> pin.draw(nested) }
+            }
+            val laptopChats = if (query.isEmpty()) groups.filter { it.first != "Pinned" } else listOf("" to byRecent)
+            if (query.isEmpty() || byRecent.isNotEmpty()) {
+                val open = query.isNotEmpty() || "laptop" !in folded
+                crew.addView(computerHeading("laptop", HostPush.laptopLabel(this) ?: "This laptop",
+                    if (names.isNotEmpty()) HostLists.Dot.LIVE else HostLists.Dot.UNKNOWN, "",
+                    rest.sumOf { unread(it.session, it.last) }, open, null))
+                if (open) drawGroups(laptopChats.filter { it.second.isNotEmpty() }, inComputer = true)
+            }
+            for (h in computers) {
+                val look = looks[h.hostId]
+                val summaries = look?.summaries ?: emptyList()
+                val hostPins = pins.filter { it.startsWith("${h.hostId}|") }.map { it.substringAfter("|") }.toSet()
+                val drawn = HostLists.groups(summaries, sortMode(), hostPins, query)
+                if (query.isNotEmpty() && drawn.isEmpty()) continue
+                val (dot, words) = HostLists.status(look, now)
+                val open = query.isNotEmpty() || h.hostId !in folded
+                crew.addView(computerHeading(h.hostId, h.label, dot, words,
+                    summaries.count { it.sessionId !in hostPins && HostLists.unread(it, seenThere[HostLists.pinKey(h.hostId, it.sessionId)] ?: 0L) },
+                    open, h))
+                if (!open) continue
+                if (summaries.isEmpty() && dot == HostLists.Dot.OFFLINE) crew.addView(quietLine("Can't reach ${h.label} right now."))
+                val dim = dot == HostLists.Dot.OFFLINE
+                for ((heading, members) in drawn) {
+                    if (heading.isNotEmpty()) crew.addView(sortHeading(heading, inComputer = true))
+                    for ((c, nested) in members) crew.addView(hostRow(h, c, seenThere, nested, where = "", dim = dim,
+                        bossName = summaries.firstOrNull { it.sessionId == c.boss }?.let { HostLists.named(it).first }))
+                }
             }
         }
         crew.addView(TextView(this).apply {
@@ -2432,19 +2497,23 @@ class MainActivity : Activity() {
     /** A chat in the list: henchman, project, the agent's name and the last line (or the line a search found). A crew
      *  chat under its manager is indented, and says whose crew it is. */
     private fun chatRow(session: String, agent: String, project: String, last: JSONObject?, found: String, nested: Boolean = false,
-                        state: String = ""): View {
-        val unread = unread(session, last)
+                        state: String = "", remote: Remote? = null): View {
+        val unread = remote?.unread ?: unread(session, last)
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(if (nested) 44 else 20), dp(12), dp(20), dp(12))
-            background = getDrawable(if (session == current) R.drawable.row_current else android.R.color.transparent)
-            setOnClickListener { open(session) }
-            setOnLongClickListener { chatMenu(session, project, agent); true }
+            background = getDrawable(if (remote == null && session == current) R.drawable.row_current else android.R.color.transparent)
+            setOnClickListener {
+                if (remote == null) open(session)
+                else startActivity(HostChatActivity.open(this@MainActivity, ChatKey(remote.host.hostId, session)))
+            }
+            setOnLongClickListener { if (remote == null) chatMenu(session, project, agent) else hostChatMenu(remote.host, session, project); true }
         }
         row.addView(ImageView(this).apply {
-            setImageResource(avatarOf(session, teams[session] ?: ""))
-            if (state.isNotEmpty()) alpha = 0.45f  // its agent isn't running: greyed, as an ended helper
+            setImageResource(avatarOf(session, remote?.team ?: teams[session] ?: ""))
+            // its agent isn't running (greyed, as an ended helper), or its computer can't be reached now
+            if (state.isNotEmpty() || remote?.dim == true) alpha = 0.45f
         }, LinearLayout.LayoutParams(dp(52), dp(52)))
         val words = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14), 0, 0, 0) }
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -2461,14 +2530,15 @@ class MainActivity : Activity() {
         val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         TextView(this).apply {
             // A workflow running in it says so instead of the last line (the design review, 2026-11-17)
-            val flow = flows[session]?.takeIf { found.isEmpty() }
+            val flow = flows[session]?.takeIf { found.isEmpty() && remote == null }
             val line = found.ifEmpty {
                 flow?.let { f -> "⚙ ${f.optString("name")} · " + (if (f.optInt("phases") > 0) "${f.optInt("at").coerceAtLeast(1)}/${f.optInt("phases")} · " else "") +
                     "${f.optInt("done")}/${f.optInt("total")} done" }
                     ?: last?.let { (if (it.optBoolean("mine")) "You: " else "") + it.optString("text").ifEmpty { "📎 file" } } ?: ""
             }
-            val crewOf = if (nested) bosses[session]?.let { b -> "Crew of " + (names[b]?.substringBefore(",") ?: b.substringBefore("-").replaceFirstChar { it.uppercase() }) } else null
-            text = listOf(crewOf ?: Strays.label(agent, state), line.replace("\n", " ")).filter { !it.isNullOrEmpty() }.joinToString(" · ")
+            val crewOf = if (!nested) null else if (remote != null) remote.bossName?.let { "Crew of $it" }
+                else bosses[session]?.let { b -> "Crew of " + (names[b]?.substringBefore(",") ?: b.substringBefore("-").replaceFirstChar { it.uppercase() }) }
+            text = listOf(remote?.where, crewOf ?: Strays.label(agent, state), line.replace("\n", " ")).filter { !it.isNullOrEmpty() }.joinToString(" · ")
             setTextColor(getColor(when { found.isNotEmpty() || flow != null -> R.color.cyan; unread > 0 -> R.color.text; else -> R.color.muted }))
             textSize = 14f; maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -2483,6 +2553,111 @@ class MainActivity : Activity() {
         words.addView(bottom)
         row.addView(words, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         return row
+    }
+
+    /** A chat on another paired computer, as its row is drawn (chatRow): which computer, its hard hat, its boss's
+     *  name for "Crew of", whether it's unread, the computer's name when it is drawn outside its group (Pinned),
+     *  and greyed while that computer can't be reached. */
+    private class Remote(val host: Host, val team: String, val bossName: String?, val unread: Int, val where: String, val dim: Boolean)
+
+    private fun hostRow(host: Host, c: ChatSummary, seen: Map<String, Long>, nested: Boolean, where: String, dim: Boolean,
+                        bossName: String? = null): View {
+        val (agent, project) = HostLists.named(c)
+        val last = if (c.lastAt > 0 || c.lastText.isNotEmpty()) JSONObject().put("at", c.lastAt).put("text", c.lastText).put("mine", c.lastMine) else null
+        val unread = if (HostLists.unread(c, seen[HostLists.pinKey(host.hostId, c.sessionId)] ?: 0L)) 1 else 0
+        val state = if (c.running) "" else c.state.ifEmpty { if (HostChatRules.isReminders(c.sessionId)) "" else "gone" }
+        return chatRow(c.sessionId, agent, project, last, "", nested, state, Remote(host, c.team, bossName, unread, where, dim))
+    }
+
+    /** The small uppercase heading of a sort group (By project, By agent) or of Pinned; inside a computer, a little
+     *  closer to the rows, so the computer's own heading reads as the bigger one. */
+    private fun sortHeading(heading: String, inComputer: Boolean) = TextView(this).apply {
+        text = heading.replace("_", " ").uppercase()
+        setTextColor(getColor(R.color.muted)); textSize = 12f; typeface = android.graphics.Typeface.DEFAULT_BOLD
+        setPadding(dp(20), dp(if (inComputer) 12 else 16), dp(20), dp(4))
+    }
+
+    private fun quietLine(words: String) = TextView(this).apply {
+        text = words; setTextColor(getColor(R.color.muted)); textSize = 14f; setPadding(dp(20), dp(8), dp(20), dp(8))
+    }
+
+    /** A computer's heading in the list (multi-host): a dot (reachable, offline, messages waiting), its name, a few
+     *  words of state, the unread count when folded, and a chevron. A tap folds it; a long press offers Refresh and
+     *  the computer's settings. */
+    private fun computerHeading(key: String, label: String, dot: HostLists.Dot, words: String, unread: Int, open: Boolean, host: Host?): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; minimumHeight = dp(48)
+            setPadding(dp(20), 0, dp(8), 0)
+            setOnClickListener { HostLists.setCollapsed(this@MainActivity, key, open); showCrew() }
+            setOnLongClickListener {
+                performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                computerMenu(label, host); true
+            }
+        }
+        row.addView(View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(getColor(when (dot) {
+                    HostLists.Dot.LIVE -> R.color.call_live
+                    HostLists.Dot.WAITING -> R.color.wait
+                    else -> R.color.muted
+                }))
+            }
+        }, LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginEnd = dp(10) })
+        row.addView(TextView(this).apply {
+            text = label; setTextColor(getColor(R.color.text)); textSize = 15f; typeface = android.graphics.Typeface.DEFAULT_BOLD
+            maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        row.addView(TextView(this).apply {
+            text = if (words.isEmpty()) "" else "  $words"; setTextColor(getColor(R.color.muted)); textSize = 12f; maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (!open && unread > 0) row.addView(TextView(this).apply {
+            text = if (unread > 99) "99+" else unread.toString()
+            setTextColor(getColor(R.color.navy)); textSize = 12f; typeface = android.graphics.Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER; minWidth = dp(22); setPadding(dp(6), dp(1), dp(6), dp(1))
+            background = GradientDrawable().apply { setColor(getColor(R.color.cyan)); cornerRadius = dp(11).toFloat() }
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(8) })
+        row.addView(TextView(this).apply {
+            text = if (open) "⌄" else "›"; setTextColor(getColor(R.color.muted)); textSize = 20f; gravity = Gravity.CENTER
+        }, LinearLayout.LayoutParams(dp(32), LinearLayout.LayoutParams.WRAP_CONTENT))
+        return row.also { it.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) } }
+    }
+
+    /** The other paired computers whose chats the list shows (multi-host on): none means the list is as before. */
+    private fun otherComputers(): List<Host> {
+        if (Build.VERSION.SDK_INT < MultiHost.MIN_SDK || !MultiHost.enabled(this)) return emptyList()
+        val hosts = HostPush.hostsOrNull(HostRegistry.of(this)) ?: return emptyList()
+        if (hosts.isEmpty()) return emptyList()
+        return HostLists.others(hosts, Files.origin(this), HostPush.laptopIdOrLearn(this))
+    }
+
+    /** Every other computer's chats asked for again (each one at a time, off the main thread). */
+    private fun refreshComputers() = otherComputers().forEach { HostLists.refresh(this, it) }
+
+    /** While the list is on screen: the other computers asked every 15 s (and at once on a push: HostLists). */
+    private val computersPoll = object : Runnable {
+        override fun run() {
+            if (lifecycleSeen && listScreen.visibility == View.VISIBLE && tab == "chats") refreshComputers()
+            main.postDelayed(this, 15_000L)
+        }
+    }
+
+    private fun computerMenu(label: String, host: Host?) {
+        panel = ActionsSheet(this, label, if (host == null) "This phone's laptop" else host.baseUrl, buildList {
+            add(Triple("↻", "Refresh") { if (host == null) findCrew() else HostLists.refresh(this@MainActivity, host) })
+            if (host != null && Build.VERSION.SDK_INT >= MultiHost.MIN_SDK) add(Triple("⚙", "Computer settings") { HostsSheet(this@MainActivity).show() })
+        }).also { it.show() }
+    }
+
+    private fun hostChatMenu(host: Host, session: String, project: String) {
+        val key = HostLists.pinKey(host.hostId, session)
+        val pinned = key in pins()
+        panel = ActionsSheet(this, project.replace("_", " "), "On ${host.label}", listOf(
+            Triple("📌", if (pinned) "Unpin" else "Pin") { setPinned(key, !pinned); showCrew() },
+            Triple("💬", "Open") { startActivity(HostChatActivity.open(this@MainActivity, ChatKey(host.hostId, session))) }
+        )).also { it.show() }
     }
 
     /** One screen at a time: the chat list, a chat, or settings. */

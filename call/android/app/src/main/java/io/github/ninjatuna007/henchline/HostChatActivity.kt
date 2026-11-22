@@ -62,6 +62,7 @@ class HostChatActivity : Activity() {
     private val tick = object : Runnable {
         override fun run() {  // while on screen: the agents' new texts show within a few seconds
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) screen?.refresh()
+            seen()
             ticker.postDelayed(this, POLL_MS)
         }
     }
@@ -82,7 +83,14 @@ class HostChatActivity : Activity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) screen?.showCall()
     }
 
+    /** This chat is open on screen: what it holds is read, for the home list's unread (HostLists). */
+    private fun seen() {
+        val shown = screen ?: return
+        if (resumed && shown.sessionId != null) HostLists.markSeen(this, shown.hostId, shown.sessionId)
+    }
+
     override fun onPause() {
+        seen()  // the last look before leaving counts too
         resumed = false
         ticker.removeCallbacks(tick)
         if (CallService.Bus.hostListener === callWatcher) CallService.Bus.hostListener = null  // the call goes on
@@ -248,7 +256,7 @@ class HostChatActivity : Activity() {
             }
         }
 
-        private fun showChats(chats: List<HostChat.Summary>) {
+        private fun showChats(chats: List<ChatSummary>) {
             list.removeAllViews()
             if (chats.isEmpty()) list.addView(note("No agents are running on ${host.label} right now."))
             chats.forEach { c ->

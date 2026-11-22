@@ -96,7 +96,24 @@ object HostPush {
     }
 
     private const val LAPTOP_ID = "laptop_host_id"
+    private const val LAPTOP_LABEL = "laptop_host_label"
     private const val LAPTOP_FOR = "laptop_host_for"  // the laptop address it was learned at: another one forgets it
+
+    /** The laptop's own label (its signed descriptor's), learned with its id; null until then. */
+    fun laptopLabel(context: Context): String? {
+        val prefs = context.getSharedPreferences("call", Context.MODE_PRIVATE)
+        val at = origin(laptop(context)) ?: return null
+        return prefs.getString(LAPTOP_LABEL, null)?.takeIf { it.isNotBlank() && prefs.getString(LAPTOP_FOR, null) == at }
+    }
+
+    /** The laptop's id as learned, asked for again (off the main thread) when not known yet. */
+    fun laptopIdOrLearn(context: Context): String? = knownLaptopId(context) ?: run {
+        val now = System.currentTimeMillis()
+        if (now - lastAsked > 60_000L) { lastAsked = now; relearn(context) }  // the list redraws often: once a minute
+        null
+    }
+
+    @Volatile private var lastAsked = 0L
 
     private fun knownLaptopId(context: Context): String? {
         val prefs = context.getSharedPreferences("call", Context.MODE_PRIVATE)
@@ -112,7 +129,8 @@ object HostPush {
         if (answer.code != 200) return
         val descriptor = answer.json().optJSONObject("descriptor") ?: return
         val id = laptopIdFrom(descriptor, HostRegistry.of(context).all()) ?: return
-        context.getSharedPreferences("call", Context.MODE_PRIVATE).edit().putString(LAPTOP_ID, id).putString(LAPTOP_FOR, at).apply()
+        context.getSharedPreferences("call", Context.MODE_PRIVATE).edit().putString(LAPTOP_ID, id).putString(LAPTOP_FOR, at)
+            .putString(LAPTOP_LABEL, descriptor.optString("label").take(64)).apply()  // signed with the id: its own name
     }
 
     private fun offersLegacyRoutes(host: Host): Boolean = try {
@@ -136,6 +154,7 @@ object HostPush {
         val laptopId = knownLaptopId(context)
         if (shouldRelearn(push, hosts, laptop(context), laptopId)) relearn(context)  // for the next push
         val host = sender(push, hosts, laptop(context), laptopId) ?: return false
+        HostLists.pushed(context, host)  // the home list shows its new last line soon
         val agent = IncomingActivity.nameOf(push.optString("agent", "handsfree"))
         val session = push.optString("session")
         when {

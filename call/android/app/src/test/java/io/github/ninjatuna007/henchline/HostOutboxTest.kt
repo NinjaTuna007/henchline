@@ -239,7 +239,7 @@ class HostOutboxTest {
                 {"host_id":"$a","session_id":"c1","event_id":"e1"},{"host_id":"$b","session_id":"c1","event_id":"x"},
                 {"host_id":"$a","session_id":"c2","event_id":"y"}],"next_cursor":null}""")
             else HttpAnswer(200, pages.removeFirst()) }), a)
-        assertEquals(listOf(HostChat.Summary("c1", "One", false), HostChat.Summary("c2", "Two", true)), chat.chats())
+        assertEquals(listOf(ChatSummary("c1", "One", false), ChatSummary("c2", "Two", true)), chat.chats())
         val (events, next) = chat.events("c1")
         assertEquals(listOf("e1"), events.map { it.getString("event_id") })
         assertNull(next)

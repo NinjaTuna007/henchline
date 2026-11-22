@@ -19,15 +19,33 @@ sealed class Sent {
     data class Later(val why: String) : Sent()          // offline, busy, rate limited: try again, same request id
 }
 
+/** A chat as a paired computer lists it (any API level: the home list reads it from what is kept): running or known only from its events lately (a timer's texts, an agent no
+ *  longer running: state gone or ended), with its agent, boss (a helper's), team, and last line. */
+data class ChatSummary(val sessionId: String, val name: String, val current: Boolean, val running: Boolean = true,
+                   val state: String = "", val agent: String = "", val boss: String = "", val team: String = "",
+                   val lastAt: Long = 0L, val lastText: String = "", val lastMine: Boolean = false) {
+    companion object {
+        /** From the computer's answer (older ones send only session_id, name and current). */
+        fun of(it: org.json.JSONObject): ChatSummary {
+            val last = it.optJSONObject("last")
+            val at = try { java.time.Instant.parse(it.optString("last_at")).toEpochMilli() } catch (e: Exception) { 0L }
+            return ChatSummary(it.getString("session_id"), it.optString("name"), it.optBoolean("current"),
+                it.optBoolean("running", true), it.optString("state"), it.optString("agent"), it.optString("boss"),
+                it.optString("team"), at, last?.optString("text") ?: "", last?.optBoolean("mine") ?: false)
+        }
+    }
+}
+
 /** One computer's chats over the signed v1 API. */
 @RequiresApi(MultiHost.MIN_SDK)
 class HostChat(private val client: HostClient, private val hostId: String) {
-    data class Summary(val sessionId: String, val name: String, val current: Boolean)
-
     /** The chats there now, every page (bounded). */
-    fun chats(): List<Summary> {
+    fun chats(): List<ChatSummary> = listed().map { ChatSummary.of(it) }
+
+    /** The same, as the computer sent each one (kept as is by HostLists, read again with ChatSummary.of). */
+    fun listed(): List<org.json.JSONObject> {
         client.require("chat")
-        val out = ArrayList<Summary>()
+        val out = ArrayList<org.json.JSONObject>()
         var cursor: String? = null
         repeat(20) {
             val answer = client.call("GET", listOf("api", "v1", "chats"),
@@ -36,7 +54,7 @@ class HostChat(private val client: HostClient, private val hostId: String) {
             val page = answer.json()
             val list = page.optJSONArray("chats") ?: return out
             for (i in 0 until list.length()) list.getJSONObject(i).let {
-                if (it.optString("host_id") == hostId) out += Summary(it.getString("session_id"), it.optString("name"), it.optBoolean("current"))
+                if (it.optString("host_id") == hostId && it.optString("session_id").isNotEmpty()) out += it
             }
             cursor = page.optString("next_cursor").takeIf { c -> !page.isNull("next_cursor") && c.isNotEmpty() } ?: return out
         }
