@@ -36,6 +36,7 @@ class RingService : PushService() {
         } catch (_: Exception) {
             JSONObject()
         }
+        if (HostPush.handle(this, ring)) return  // from another paired computer (multi-host): shown as its own
         if (ring.has("text")) {  // `handsfree text`: a message, not a call
             Messages.show(this, ring.optString("agent", "handsfree"), ring.optString("session"), ring.optString("text"),
                 ring.optString("id"))
@@ -78,6 +79,7 @@ class RingService : PushService() {
         /** The push address to the laptop over plain HTTP (off the main thread), so texts and rings find the app
          *  after a reinstall without waiting for a call (they went nowhere for a night, 2026-11-18). */
         fun share(context: Context) {
+            HostPush.share(context)  // multi-host: the other paired computers that take it get it too
             val endpoint = context.getSharedPreferences("call", MODE_PRIVATE).getString(ENDPOINT, null) ?: return
             val origin = Files.origin(context) ?: return
             Thread {

@@ -406,8 +406,25 @@ def _backup_text(tid: str) -> None:
         log(HANDSFREE_LOG, f"{agent} text not confirmed by the phone: sent the backup notification")
 
 
+HOST_CONFIG = Path.home() / ".config/henchline/host.json"  # this computer's identity for paired phones, if set up
+
+
+def with_host(body: bytes) -> bytes:
+    """A push names the computer it comes from (host.json's host_id), when it has one: a phone paired with more
+    than one computer then knows whose agent it is. Unchanged without host.json, or if it can't be read."""
+    try:
+        host_id = json.loads(HOST_CONFIG.read_text()).get("host_id")
+        message = json.loads(body)
+    except (OSError, ValueError, AttributeError):
+        return body
+    if not isinstance(host_id, str) or not host_id or not isinstance(message, dict):
+        return body
+    return json.dumps({**message, "host_id": host_id}).encode()
+
+
 def push(body: bytes, headers: dict | None = None) -> bool:
     """Henchline's own push address (the ntfy app wakes it): never printed."""
+    body = with_host(body)
     try:
         urllib.request.urlopen(urllib.request.Request(CALL_RING.read_text().strip(), data=body,
                                                       headers={"Content-Type": "application/json", **(headers or {})}),

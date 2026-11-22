@@ -100,6 +100,7 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
                         return@background
                     }
                     registry.put(host)
+                    HostPush.share(activity)  // its agents' texts and rings can reach this phone
                     activity.runOnUiThread {
                         onChanged()
                         tell("Paired", "${host.label} is paired. Its chats come in a later update of this preview.") {
@@ -179,6 +180,7 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
         val words = try {
             val fresh = HostClient(host, HostKeys.forAuthority("host", host.hostId)).refresh()
             registry.put(fresh)
+            HostPush.share(activity)  // it may take signed requests now
             "Reachable, and this phone is still paired.\n\n" + offers(fresh)
         } catch (e: ClockSkew) {
             e.message ?: ""
