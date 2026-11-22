@@ -1,0 +1,316 @@
+package io.github.ninjatuna007.henchline
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.os.BatteryManager
+import android.os.PowerManager
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.security.MessageDigest
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Talkback spoken by the phone itself (the laptop's side: voice/phonevoice.py). Over a call the laptop sends a
+ * clip's words, already cut into pieces the way its own talkback cuts them (punctuation only), and the phone renders
+ * them with the same Kokoro voices: sherpa-onnx's Kokoro v1.0 export carries the laptop's very voices file, a voice's
+ * id is its place in the sorted names. Only words cross the network, so a dropped line in a lift loses nothing that
+ * was already here, and a lost clip is simply sent again.
+ *
+ * Off unless the user turns "Speak on the phone" on and the model is here (about 360 MB, fetched from the laptop,
+ * every file checked against the laptop's SHA-256). When the phone can't keep up (a piece late by more than a
+ * second while the speaker ran dry), the battery is low or the phone is hot, it says so ({"tts": "fallback"}) and
+ * the laptop streams its own audio for the rest of the call, as before.
+ */
+object PhoneVoice {
+    const val MODEL = "kokoro-multi-lang-v1_0"
+    const val ENGINE = "sherpa-kokoro"
+    private const val PREF = "phone_voice"  // the user's switch: speak on the phone
+    private const val PREF_MOBILE = "phone_voice_mobile"  // download over mobile data too
+    private const val THREADS = 4  // measured best on this phone (RTF 0.68; 2 threads 0.92, 6 no better)
+    const val RATE = 24000
+    private const val PAUSE = 0.25f  // as the laptop's talkback (talkback/scripts/worker.py): between sentences
+    private const val JOIN = 0.05f  // between pieces of one sentence
+    private const val EDGE = 0.035f  // kept beyond the first and last sound where pieces of one sentence join
+    private const val QUIET = 0.005f  // below this share of the piece's peak counts as quiet
+    private const val CHUNK = RATE / 50  // 20 ms, as the laptop streams
+    private const val AHEAD_CHUNKS = 25  // at most half a second queued at the speaker: a cut stops it soon
+    private const val STARVED_MS = 1000L  // the speaker ran dry this long waiting for a piece: the phone falls back
+    private const val LOW_BATTERY = 15
+
+    fun enabled(context: Context) = prefs(context).getBoolean(PREF, false)
+    fun setEnabled(context: Context, on: Boolean) = prefs(context).edit().putBoolean(PREF, on).apply()
+    fun mobileData(context: Context) = prefs(context).getBoolean(PREF_MOBILE, false)
+    fun setMobileData(context: Context, on: Boolean) = prefs(context).edit().putBoolean(PREF_MOBILE, on).apply()
+    private fun prefs(context: Context) = context.getSharedPreferences("call", Context.MODE_PRIVATE)
+
+    // --- the model files --------------------------------------------------------------------------------------
+
+    fun dir(context: Context) = File(context.filesDir, "phone-voice/$MODEL")
+    private fun marker(context: Context) = File(dir(context), ".verified")
+
+    /** Downloaded and every file checked: the manifest it was checked against is kept as the marker. */
+    fun ready(context: Context): Boolean {
+        val kept = try { JSONObject(marker(context).readText()) } catch (_: Exception) { return false }
+        val files = kept.optJSONArray("files") ?: return false
+        return (0 until files.length()).all { i ->
+            val f = files.getJSONObject(i)
+            File(dir(context), f.getString("name")).length() == f.getLong("size")
+        }
+    }
+
+    fun sizeOnPhone(context: Context): Long = dir(context).walkTopDown().filter { it.isFile }.sumOf { it.length() }
+
+    fun delete(context: Context) {
+        release()
+        dir(context).deleteRecursively()
+    }
+
+    /** May the download start on this network: Wi-Fi (unmetered) unless the user allowed mobile data. */
+    fun networkAllows(context: Context): Boolean {
+        if (mobileData(context)) return true
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return false
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+    }
+
+    class Download(private val context: Context, private val progress: (done: Long, total: Long, name: String) -> Unit) {
+        private val cancelled = AtomicBoolean(false)
+        fun cancel() = cancelled.set(true)
+
+        /** null when done; otherwise why not. Files already here and whole are kept (a cut download carries on). */
+        fun run(): String? {
+            val origin = Files.origin(context) ?: return "Set the laptop's address in Settings first."
+            val manifest = try {
+                Files.client.newCall(okhttp3.Request.Builder().url("$origin/phone-voice/manifest")
+                    .header("Origin", origin).build()).execute().use {
+                    if (!it.isSuccessful) return "The laptop hasn't prepared the voice yet (python -m voice.phonevoice prepare)."
+                    JSONObject(it.body!!.string())
+                }
+            } catch (e: Exception) { return "Couldn't reach the laptop (is Tailscale on?)" }
+            if (manifest.optString("version") != MODEL) return "The laptop offers another voice model: update the app."
+            val files = manifest.getJSONArray("files")
+            val total = (0 until files.length()).sumOf { files.getJSONObject(it).getLong("size") }
+            val folder = dir(context).apply { mkdirs() }
+            marker(context).delete()
+            var done = 0L
+            for (i in 0 until files.length()) {
+                val f = files.getJSONObject(i)
+                val name = f.getString("name")
+                if (name.contains('/') || name.startsWith(".")) return "The laptop named an odd file: stopped."
+                val target = File(folder, name)
+                val size = f.getLong("size")
+                if (target.length() == size && sha256(target) == f.getString("sha256")) { done += size; continue }
+                val part = File(folder, "$name.part")
+                val have = part.length().coerceAtMost(size)
+                try {
+                    val request = okhttp3.Request.Builder().url("$origin/phone-voice/file/$name").header("Origin", origin)
+                    if (have > 0) request.header("Range", "bytes=$have-")
+                    Files.client.newCall(request.build()).execute().use { answer ->
+                        if (!answer.isSuccessful) return "The laptop couldn't send $name."
+                        val append = have > 0 && answer.code == 206
+                        java.io.FileOutputStream(part, append).use { out ->
+                            var got = if (append) have else 0L
+                            val input = answer.body!!.byteStream()
+                            val buffer = ByteArray(1 shl 16)
+                            while (true) {
+                                if (cancelled.get()) return "Cancelled."
+                                val n = input.read(buffer)
+                                if (n < 0) break
+                                out.write(buffer, 0, n)
+                                got += n
+                                progress(done + got, total, name)
+                            }
+                        }
+                    }
+                } catch (e: Exception) { return "The download broke off: try again to carry on." }
+                if (sha256(part) != f.getString("sha256")) { part.delete(); return "$name didn't match the laptop's copy: try again." }
+                part.renameTo(target)
+                done += size
+            }
+            marker(context).writeText(manifest.toString())
+            return null
+        }
+    }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(1 shl 16)
+            while (true) { val n = input.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    // --- the engine -----------------------------------------------------------------------------------------
+
+    @Volatile private var tts: com.k2fsa.sherpa.onnx.OfflineTts? = null
+    private val loadLock = Any()
+
+    /** The model in memory (about 2.4 s the first time); held for the call. */
+    fun load(context: Context): Boolean = synchronized(loadLock) {
+        if (tts != null) return true
+        if (!ready(context)) return false
+        val folder = dir(context).absolutePath
+        return try {
+            val kokoro = com.k2fsa.sherpa.onnx.OfflineTtsKokoroModelConfig(
+                model = "$folder/model.onnx", voices = "$folder/voices.bin", tokens = "$folder/tokens.txt",
+                lexicon = "$folder/lexicon-us-en.txt", lang = "en-us")
+            val config = com.k2fsa.sherpa.onnx.OfflineTtsConfig(
+                model = com.k2fsa.sherpa.onnx.OfflineTtsModelConfig(kokoro = kokoro, numThreads = THREADS, provider = "cpu"))
+            tts = com.k2fsa.sherpa.onnx.OfflineTts(null, config)
+            true
+        } catch (e: Throwable) {
+            android.util.Log.w("Henchline", "phone voice: couldn't load the model: $e")
+            false
+        }
+    }
+
+    fun release() = synchronized(loadLock) { tts?.release(); tts = null }
+
+    /** What the phone tells the laptop on connecting: it can speak talkback (only when switched on and here). */
+    fun offer(context: Context): JSONObject? =
+        if (enabled(context) && ready(context)) JSONObject().put("tts", JSONObject().put("engine", ENGINE).put("model", MODEL))
+        else null
+
+    /** Why the phone shouldn't take a clip now, or null. */
+    private fun unfit(context: Context): String? {
+        val battery = context.getSystemService(BatteryManager::class.java)
+            ?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 100
+        val charging = context.getSystemService(BatteryManager::class.java)?.isCharging ?: false
+        if (battery in 1 until LOW_BATTERY && !charging) return "battery $battery%"
+        val power = context.getSystemService(PowerManager::class.java)
+        if (power != null && power.currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE) return "the phone is hot"
+        return null
+    }
+
+    // --- speaking clips ---------------------------------------------------------------------------------------
+
+    /** One call's speaker: clips come from the laptop, audio goes to the call's own playback queue. */
+    class Speaker(
+        private val context: Context,
+        private val enqueue: (ByteArray) -> Unit,  // 20 ms of 16-bit mono at 24 kHz into the call's speaker
+        private val queued: () -> Int,  // chunks still waiting at the speaker
+        private val send: (String) -> Unit,  // a message to the laptop
+    ) {
+        private val clips = LinkedBlockingQueue<JSONObject>()
+        @Volatile private var current = ""
+        private val stopped = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+        @Volatile private var running = true
+        @Volatile private var fellBack = false
+        private val thread = Thread({ loop() }, "henchline-phone-voice").apply { isDaemon = true; start() }
+
+        fun say(clip: JSONObject) { if (!fellBack) clips.offer(clip) else fallback(clip.optString("id"), "fell back earlier") }
+        fun stop(id: String) { stopped.add(id) }
+        fun stopAll() { clips.clear(); if (current.isNotEmpty()) stopped.add(current) }
+        fun close() { running = false; stopAll(); thread.interrupt() }
+
+        private fun fallback(id: String, reason: String) {
+            fellBack = true
+            clips.clear()
+            send(JSONObject().put("tts", "fallback").put("reason", reason).put("id", id).toString())
+            android.util.Log.i("Henchline", "phone voice: falling back to the laptop's audio ($reason)")
+        }
+
+        private fun loop() {
+            while (running) {
+                val clip = try { clips.poll(500, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { null } ?: continue
+                val id = clip.optString("id")
+                if (id.isEmpty() || stopped.remove(id)) continue
+                val why = unfit(context)
+                if (why != null) { fallback(id, why); continue }
+                if (!load(context)) { fallback(id, "the voice model isn't loaded"); continue }
+                current = id
+                try { speak(clip, id) } catch (e: Throwable) { fallback(id, "rendering failed: ${e.javaClass.simpleName}") }
+                current = ""
+            }
+        }
+
+        private fun speak(clip: JSONObject, id: String) {
+            val engine = tts ?: return fallback(id, "the voice model isn't loaded")
+            val pieces = clip.optJSONArray("pieces") ?: JSONArray()
+            val joined = clip.optJSONArray("joined").toIntSet()
+            val sid = clip.optInt("sid", 3)
+            // Rendered one piece ahead of the one playing, on its own thread at normal priority
+            val ready = LinkedBlockingQueue<Pair<Int, FloatArray>>(2)
+            val over = AtomicBoolean(false)  // this clip is finished, cut or fallen back: the renderer stops
+            val renderer = Thread({
+                try { for (n in 0 until pieces.length()) {
+                    if (over.get() || stopped.contains(id) || !running) break
+                    val samples = engine.generate(pieces.getString(n), sid, 1.0f).samples
+                    val trimmed = trim(samples, lead = n in joined, tail = (n + 1) in joined)
+                    while (!over.get() && running && !ready.offer(n to trimmed, 100, TimeUnit.MILLISECONDS)) Unit
+                } } catch (_: InterruptedException) {
+                } catch (e: Throwable) {  // a thread's uncaught error would end the whole app, the call with it
+                    android.util.Log.w("Henchline", "phone voice: rendering failed: $e")
+                }
+            }, "henchline-phone-voice-render").apply { isDaemon = true; start() }
+            try {
+                for (n in 0 until pieces.length()) {
+                    var waited = 0L
+                    var next: Pair<Int, FloatArray>? = null
+                    while (next == null) {
+                        if (stopped.remove(id)) return
+                        next = ready.poll(50, TimeUnit.MILLISECONDS)
+                        if (next == null && !renderer.isAlive && ready.isEmpty()) return fallback(id, "rendering stopped")
+                        if (next == null && n > 0 && queued() == 0) {  // the speaker ran dry waiting for this piece
+                            waited += 50
+                            if (waited >= STARVED_MS) return fallback(id, "fell behind by over a second")
+                        }
+                    }
+                    val gap = if (n == 0) 0f else if (n in joined) JOIN else PAUSE
+                    val audio = pcm(next.second, gap)
+                    send(JSONObject().put("said", JSONObject().put("id", id).put("piece", n)).toString())
+                    var at = 0
+                    while (at < audio.size) {
+                        if (stopped.remove(id)) return
+                        while (queued() > AHEAD_CHUNKS) { if (stopped.remove(id)) return; Thread.sleep(10) }
+                        val end = minOf(audio.size, at + CHUNK * 2)
+                        enqueue(audio.copyOfRange(at, end))
+                        at = end
+                    }
+                }
+                while (queued() > 0 && !stopped.contains(id)) Thread.sleep(20)  // done when it has been heard
+                send(JSONObject().put("said", JSONObject().put("id", id).put("done", true)).toString())
+            } finally {
+                over.set(true)
+                renderer.interrupt()
+            }
+        }
+    }
+
+    // --- shared with the laptop's rules (tests/fixtures/phone-voice-trim.json) ---------------------------------
+
+    /** Kokoro's quiet lead-in and tail cut (to EDGE) where pieces of one sentence join, as the laptop's trim(). */
+    fun trim(samples: FloatArray, lead: Boolean, tail: Boolean): FloatArray {
+        if (samples.isEmpty() || !(lead || tail)) return samples
+        var peak = 0f
+        for (s in samples) peak = maxOf(peak, kotlin.math.abs(s))
+        val level = maxOf(peak * QUIET, 1e-5f)
+        var first = -1
+        var last = -1
+        for (i in samples.indices) if (kotlin.math.abs(samples[i]) > level) { if (first < 0) first = i; last = i }
+        if (first < 0) return samples
+        val keep = (RATE * EDGE).toInt()
+        val start = if (lead) maxOf(0, first - keep) else 0
+        val end = if (tail) minOf(samples.size, last + 1 + keep) else samples.size
+        return samples.copyOfRange(start, end)
+    }
+
+    /** 16-bit little-endian PCM, with `gap` seconds of silence in front. */
+    fun pcm(samples: FloatArray, gap: Float): ByteArray {
+        val silence = (RATE * gap).toInt()
+        val out = ByteArray((silence + samples.size) * 2)
+        for (i in samples.indices) {
+            val v = (samples[i].coerceIn(-1f, 1f) * 32767f).toInt()
+            out[(silence + i) * 2] = (v and 0xff).toByte()
+            out[(silence + i) * 2 + 1] = ((v shr 8) and 0xff).toByte()
+        }
+        return out
+    }
+
+    private fun JSONArray?.toIntSet(): Set<Int> = if (this == null) emptySet() else (0 until length()).map { getInt(it) }.toSet()
+}

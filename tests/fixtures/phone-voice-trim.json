@@ -1,0 +1,58 @@
+{
+ "about": "talkback/scripts/worker.py trim() on a synthetic piece; the phone's PhoneVoice.trim must keep the same span",
+ "rate": 24000,
+ "parts": [
+  {
+   "silence": 0.08
+  },
+  {
+   "tone": "0.003*sin(2*pi*3000*t)",
+   "seconds": 0.03
+  },
+  {
+   "tone": "0.5*sin(2*pi*220*t)",
+   "seconds": 0.4
+  },
+  {
+   "tone": "0.003*sin(2*pi*3000*t)",
+   "seconds": 0.03
+  },
+  {
+   "silence": 0.2
+  }
+ ],
+ "length": 17760,
+ "cases": [
+  {
+   "lead": false,
+   "tail": false,
+   "start": 0,
+   "length": 17760
+  },
+  {
+   "lead": true,
+   "tail": false,
+   "start": 1082,
+   "length": 16678
+  },
+  {
+   "lead": false,
+   "tail": true,
+   "start": 0,
+   "length": 13799
+  },
+  {
+   "lead": true,
+   "tail": true,
+   "start": 1082,
+   "length": 12717
+  }
+ ],
+ "silent": [
+  {
+   "lead": true,
+   "tail": true,
+   "length": 100
+  }
+ ]
+}

@@ -20,11 +20,12 @@ import threading
 import time
 from pathlib import Path
 
-from voice import spool
+from voice import phonevoice, spool
 from voice.agents import AGENT_VOICES, DEFAULT_VOICE
 from voice.voices import for_agent as chosen_voice
-from voice.state import (AWAY, BY_HANDSFREE, CALL_SILENT, KOKORO_MODELS, LOCK, PLAYING, TALKBACK_LOG, WORKER_PID, Playing,
-                         Speaker, in_call, last_speaker, log, mic_busy, read_json, speaker_sink, target_session_since,
+from voice.state import (AWAY, BY_HANDSFREE, CALL_DROPPED, CALL_SILENT, KOKORO_MODELS, LOCK, PLAYING, TALKBACK_LOG, WORKER_PID, Playing,
+                         Speaker, in_call, last_speaker, line_dropped, log, mic_busy, read_json, silent_since,
+                         speaker_sink, target_session_since,
                          target_since)
 
 THREADS = int(os.environ.get("TALKBACK_THREADS", "4"))  # CPU threads: 4 measured best (latency vs load)
@@ -45,6 +46,7 @@ RENDER_RTF = 0.6  # render seconds per audio second the plan assumes (0.3 idle, 
 RENDER_RTF_BUSY = 0.9  # ... when the laptop is busy: the same limit hands-free's load guard uses (0.55 x cores)
 BUSY_PER_CORE = 0.55
 LOOKAHEAD = 4  # pieces made ahead of the one playing
+PHONE_TIMEOUT = 8.0  # a clip the phone hasn't started by then (model loading takes ~2.4 s) is said by the laptop
 HOLD = 1.0  # at most this long, the first piece waits for a late second one: a pause before speaking, not in it
 EDGE = 0.035  # seconds kept beyond the first and last sound where pieces of one sentence join
 QUIET = 0.005  # below this share of the piece's peak (-46 dB) counts as quiet: soft s, f, th and breath stay
@@ -116,6 +118,34 @@ class Plan:
     def ready_in_time(self, text: str, joined: bool) -> bool:
         gap = JOIN if joined else PAUSE
         return not self.pieces or self.made + self.rtf * speech(text) <= self.ends + gap
+
+
+LINE_LAG = 0.5  # seconds between writing audio and the phone hearing it (player, sink, socket): rewound past
+
+
+def heard_up_to(started: list[float], spoken: int, since: float | None) -> int:
+    """After a dropped line, the piece to say again from: the one playing when the line went quiet (`since`), not the
+    one the worker reached by the time it noticed (a drop is noticed seconds late, and what played meanwhile went
+    nowhere). `started` holds when each piece began; without a time, the piece it was cut in."""
+    if since is None:
+        return spoken
+    playing = [n for n, at in enumerate(started) if at <= since - LINE_LAG]
+    return min(spoken, playing[-1] if playing else 0)
+
+
+def held_by_drop(queued: float, since: float | None) -> bool:
+    """A clip queued after the dropped call's line went quiet: meant for the call, so texted if it never came back."""
+    return since is not None and queued >= since
+
+
+def on_dropped_line(calling: bool, dropped: dict | None, for_call: bool) -> str:
+    """What a waiting clip does around a dropped call: "wait" while the phone may come back, "text" once the call is
+    over for a clip meant for it (said nowhere aloud), else "play"."""
+    if not calling and dropped is not None:
+        return "wait"
+    if not calling and for_call:
+        return "text"
+    return "play"
 
 
 def render_rtf() -> float:
@@ -245,6 +275,9 @@ class Voice:
                 self.intros[(plain, voice)] = samples
         return samples
 
+    def play_on_phone(self, clip, path: Path, intro: str) -> None:
+        phone_play(self, clip, path, intro)
+
     def play(self, path: Path) -> None:
         """Speak one clip; put back what is left if the user cuts in."""
         import numpy as np
@@ -257,6 +290,25 @@ class Voice:
         if calling and CALL_SILENT.exists():  # the line dropped: kept until the phone is back, or the call ends
             time.sleep(0.5)
             return
+        if on_dropped_line(calling, line_dropped(), clip.for_call) == "wait":
+            # The connection broke (a lift): neither said at the laptop nor texted while the phone may come back
+            time.sleep(0.5)
+            return
+        if not calling and CALL_DROPPED.exists():
+            # Its window passed without the phone: every clip that waited through the call or the window is texted
+            # below, once, rather than said aloud at the laptop while the user is still in the lift
+            since = silent_since()
+            for waiting in spool.queued():
+                held = spool.Clip.load(waiting)
+                if held is not None and not held.for_call and held_by_drop(held.queued, since):
+                    held.for_call = True
+                    held.save(waiting)
+            if held_by_drop(clip.queued, since):
+                clip.for_call = True
+            CALL_DROPPED.unlink(missing_ok=True)
+        if calling and clip.replay:
+            log(TALKBACK_LOG, f"{clip.agent} replaying {len(clip.sentences)} sentences after the line came back")
+            clip.replay = False
         if AWAY.exists() and not calling:  # queued before Away began: not said into an empty room
             path.unlink(missing_ok=True)
             log(TALKBACK_LOG, f"{clip.agent} clip dropped: the user is away (agents are told to text)")
@@ -284,6 +336,9 @@ class Voice:
             if not last or last.session != clip.session:
                 intro = f"{clip.agent.capitalize()} here, from {clip.where}."
             Speaker(clip.session, clip.agent, clip.where, clip.tab).remember()
+        if calling and phonevoice.phone_renders():  # the phone speaks it itself: only the words cross the network
+            self.play_on_phone(clip, path, intro)
+            return
         plan = pieces(list(clip.sentences), intro)
         sentences, joined = plan.pieces, plan.joined  # joined: said straight after the piece before, one sentence
         # Once, with the words, before the clip file goes: no moment when neither says a clip is under way.
@@ -314,6 +369,7 @@ class Voice:
         player = subprocess.Popen([*PLAYER, f"--device={speaker_sink()}"], stdin=subprocess.PIPE)
         piece = int(RATE * PIECE)
         spoken, cut, self.skip = 0, False, False
+        started: list[float] = []  # when each piece began, to say again what a dropped line swallowed
         try:
             while (samples := ready.get()) is not None:
                 if spoken == 0 and 1 in plan.late:
@@ -336,6 +392,7 @@ class Voice:
                     gap = JOIN if spoken in joined else PAUSE
                     samples = np.concatenate([np.zeros(int(RATE * gap), "<f4"), samples])
                 data = samples.astype("<f4")
+                started.append(time.time())
                 for n, start in enumerate(range(0, len(data), piece)):
                     # The call started or ended mid-clip: the rest is said where the user is now (or texted), not
                     # carried on at the laptop after a hang-up (the user's catch, 2026-11-17)
@@ -351,6 +408,9 @@ class Voice:
                         if moved:
                             clip.for_call = True  # resumed on the phone if a call began; texted if it ended
                             log(TALKBACK_LOG, f"{clip.agent} cut: the call {'began' if not calling else 'ended or dropped'}")
+                            if calling:  # the line went: from what was playing when it went quiet, said again
+                                clip.replay = True
+                                spoken = heard_up_to(started, spoken, silent_since())
                         break
                     player.stdin.write(data[start:start + piece].tobytes())
                     player.stdin.flush()
@@ -372,7 +432,62 @@ class Voice:
             # (pieces saved as sentences would be said with full pauses between them)
             clip.sentences = plan.left(spoken, list(clip.sentences))
             clip.save(path)
-            log(TALKBACK_LOG, f"{clip.agent} cut by the mic, {len(clip.sentences)} sentences kept")
+            why = "a dropped line" if clip.replay else "the mic"
+            log(TALKBACK_LOG, f"{clip.agent} cut by {why}, {len(clip.sentences)} sentences kept")
+
+
+def phone_play(voice: Voice, clip, path: Path, intro: str) -> None:
+    """A clip spoken by the phone (voice/phonevoice.py): the laptop cuts it into pieces as it would for itself, at the
+    phone's own render speed, sends the words, and follows the phone's acks for the echo check and for a cut. If the
+    phone falls back (behind, hot, low battery), what's left goes back to the spool and the laptop says it."""
+    plan = pieces(list(clip.sentences), intro, rtf=phonevoice.PHONE_RTF)
+    name = clip.voice or (VOICES[clip.agent] if clip.agent in SYSTEM else chosen_voice(clip.agent))
+    sid = phonevoice.voice_id(name)
+    if sid is None:  # a voice the shared file lacks: said by the laptop
+        phonevoice.offer({"tts": "fallback", "reason": f"no voice {name} on the phone"})
+        return
+    marker = Playing(path.name, clip.session, clip.agent, " ".join(plan.pieces))
+    marker.save()
+    path.unlink(missing_ok=True)
+    phonevoice.send(path.name, clip.agent, name, sid, plan.pieces, plan.joined, plan.sentence)
+    began, cut, fell_back, spoken = time.time(), False, "", 0
+    try:
+        while True:
+            state = phonevoice.progress(path.name)
+            if state["spoken"] and not marker.sounding:
+                marker.sounding = time.time()
+                marker.save()
+                log(TALKBACK_LOG, f"{clip.agent} first_audio={marker.sounding - began:.2f}s on the phone")
+            spoken = state["spoken"]
+            if state["fallback"]:
+                fell_back = state["fallback"]
+                break
+            if state["done"]:
+                break
+            if mic_busy() or voice.skip or not in_call() or CALL_SILENT.exists():
+                cut = True
+                if CALL_SILENT.exists():
+                    clip.replay = True  # the line dropped: said again from this sentence when the phone is back
+                elif not in_call():
+                    clip.for_call = True  # the call ended: texted, as for a clip the laptop was saying
+                phonevoice.stop(path.name)
+                break
+            if time.time() - began > PHONE_TIMEOUT and not spoken:  # never started: the phone is gone or stuck
+                fell_back = "the phone didn't start it"
+                phonevoice.offer({"tts": "fallback", "reason": fell_back})
+                break
+            time.sleep(0.05)
+    finally:
+        PLAYING.unlink(missing_ok=True)
+        if not cut:
+            phonevoice.finished(path.name)
+    if fell_back or (cut and not voice.skip and clip.agent not in SYSTEM):
+        # Said again from the start of the sentence it reached, by whoever speaks next (the laptop, after a fallback)
+        clip.sentences = plan.left(max(spoken - 1, 0), list(clip.sentences))
+        if clip.sentences:
+            clip.save(path)
+        log(TALKBACK_LOG, f"{clip.agent} on the phone: {'fell back (' + fell_back + ')' if fell_back else 'cut'}, "
+                          f"{len(clip.sentences)} sentences kept")
 
 
 def after_input(since: float) -> None:

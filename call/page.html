@@ -207,7 +207,7 @@ async function start() {
 }
 
 function stop() {
-  if (ws && ws.readyState <= 1) ws.close();
+  if (ws && ws.readyState <= 1) ws.close(1000, 'hung up');  // 1000: the laptop knows it's a hang-up, not a dropped line
   if (stream) stream.getTracks().forEach((t) => t.stop());
   if (ctx) ctx.close();
   if (wakeLock) wakeLock.release();

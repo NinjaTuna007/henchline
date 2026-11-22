@@ -32,6 +32,8 @@ class Clip:
     # Said to the phone: queued while a call was up. Once the call is over it isn't said aloud at the laptop (maybe
     # in an office, the user's worry, 2026-11-17): it goes to the phone as a text instead
     for_call: bool = False
+    # Cut by a dropped call line: said again from the interrupted sentence when the phone is back (logged then)
+    replay: bool = False
 
     @classmethod
     def of_text(cls, text: str, **fields) -> Clip:

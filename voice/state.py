@@ -65,6 +65,39 @@ VOICE_CHOICE = STATE / "voices.json"  # how the agents sound: each its own, one 
 CLAUDE_MODE = STATE / "claude-mode"  # a plan-chip press, until Claude's own log catches up
 CALL_SOUND = STATE / "call.sound"  # the phone's sound on a call: {"sound": clear/call, "out": speaker/..., "aec": bool}
 CALL_SILENT = STATE / "call.no-audio"  # the phone's mic stopped arriving mid-call (a dropped line): talkback waits
+# The phone's connection broke mid-call (not a hang-up): {"since": when its mic last arrived, "until": the end of the
+# phone's reconnect window}. Talkback keeps what the drop cut and says it again when the line is back, or texts it
+# once the window passes (the user's catch in a lift, 2026-11-22)
+CALL_DROPPED = STATE / "call.dropped"
+REJOIN = 35.0  # seconds a dropped call may come back: the phone retries for 30 s
+
+
+def line_dropped(now: float | None = None) -> dict | None:
+    """The dropped call's marker while its reconnect window is open, else None."""
+    found = read_json(CALL_DROPPED)
+    try:
+        return found if float(found["until"]) > (time.time() if now is None else now) else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def silent_since() -> float | None:
+    """When the call's line went quiet (the phone's mic last arrived), for a drop or a silence; None if unknown."""
+    dropped = read_json(CALL_DROPPED)
+    for value in (dropped.get("since"), _read_float(CALL_SILENT)):
+        try:
+            if value is not None:
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _read_float(path: Path) -> float | None:
+    try:
+        return float(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
 CALL_RING = STATE / "call.ring-endpoint"  # where Henchline can be rung (its UnifiedPush address): private, never logged
 CALL_RINGER = STATE / "call.ringer"  # who rang the user last (session, when): the call server routes the answer there
 CALL_RANG_BACK = STATE / "call.rang_back"  # a quiet call last rung back then: one per chain

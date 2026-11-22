@@ -4,3 +4,7 @@ build/
 local.properties
 # Henchman phrases made from someone's own voice (henchify_takes.py): their phone only
 app/src/debug/
+# sherpa-onnx's release AAR: fetched and checked by the build (fetchSherpa), not kept in git
+app/libs/*.aar
+app/libs/*.part
+.kotlin/

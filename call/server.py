@@ -51,10 +51,12 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent), str(HERE.parent / "handsfree/core")]  # voice/, and hands-free's routing
 import routing  # noqa: E402
 from routing import Heard  # noqa: E402
+from voice import phonevoice
 from voice import chains, commands, cursor_cli, files, minions, pickup, plans, reminders, snaps, spool, screenshot, subagents, usage, voices, workflows  # noqa: E402
 from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
 from voice.desktop import current as desktop, cursor_bridge, tmux  # noqa: E402
 from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CALL_SILENT, CALL_STAY_ON, CALL_HANGUP, CALL_MIRROR, CALL_ORIGIN,  # noqa: E402
+                         CALL_DROPPED, REJOIN,
                          CALL_PINNED, CALL_RANG_BACK, CALL_SOUND, CALL_TOLD, PHASE,
                          SPAWNED, TEXTS, VOICE_NOTE_STALE, VOICE_NOTES,
                          CALL_PORT, CALL_PUSH, CALL_INTERRUPT, CALL_CUT_IN, CALL_CHECK, CLAUDE_MODE,
@@ -372,6 +374,14 @@ async def ring_endpoint(request: web.Request) -> web.Response:
 
 async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None) -> str:
     """The talk button held or let go, a switch, or a typed chat message; a note for the page, if any."""
+    if "tts" in message:  # the phone can speak talkback itself, or can't keep up any more (voice/phonevoice.py)
+        await asyncio.get_running_loop().run_in_executor(None, phonevoice.offer, message)
+        log(HANDSFREE_LOG, f"call: the phone {'renders talkback' if phonevoice.phone_renders() else 'leaves talkback to the laptop'}"
+                           f"{' (' + str(message.get('reason'))[:120] + ')' if message.get('reason') else ''}")
+        return ""
+    if "said" in message:  # the phone started a piece of a clip it speaks
+        await asyncio.get_running_loop().run_in_executor(None, phonevoice.said, message)
+        return ""
     if str(message.get("note") or "").startswith("dropped:"):  # why the phone's line last dropped (CallService)
         note = " ".join(str(message["note"]).split())[:200]  # one line per event, whatever the exception said
         log(HANDSFREE_LOG, f"call: the phone says its line {note}")
@@ -1045,6 +1055,24 @@ async def chat_workflows(request: web.Request) -> web.Response:
     session = request.query.get("session", "")
     found = await asyncio.get_running_loop().run_in_executor(None, workflows.runs, session)
     return web.json_response({"runs": found})
+
+
+async def phone_voice_manifest(request: web.Request) -> web.Response:
+    """The Kokoro files the phone downloads to speak talkback itself (voice/phonevoice.py): names, sizes, SHA-256."""
+    trusted(request)
+    found = await asyncio.get_running_loop().run_in_executor(None, phonevoice.manifest)
+    if found is None:
+        return web.json_response({"error": "not prepared: python -m voice.phonevoice prepare"}, status=404)
+    return web.json_response(found)
+
+
+async def phone_voice_file(request: web.Request) -> web.StreamResponse:
+    """One of those files, by name only; ranges let a broken download carry on."""
+    trusted(request)
+    path = phonevoice.model_file(request.match_info["name"])
+    if path is None:
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Cache-Control": "no-store"})
 
 
 async def chat_minions(request: web.Request) -> web.Response:
@@ -2411,6 +2439,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
         blank_words()  # words a killed server never blanked
         for stale in CALL_MIRROR.glob("*.json"):  # terminal lines from before this call
             stale.unlink(missing_ok=True)
+        CALL_DROPPED.unlink(missing_ok=True)  # the line is back (or a new call): talkback says what the drop cut
         write_json(CALL, {"from": request.remote or "", "pid": os.getpid(),
                           "cmdline": Path("/proc/self/cmdline").read_text()})
         await asyncio.get_running_loop().run_in_executor(None, turn_on_handsfree, False)  # with talkback
@@ -2556,7 +2585,8 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             while not ws.closed:
                 await asyncio.sleep(0.5)
                 if time.monotonic() - last_audio[0] > 3:  # an earbud switch can pause it 1-3 s
-                    CALL_SILENT.touch()
+                    if not CALL_SILENT.exists():  # when it went quiet: talkback says again what played since
+                        CALL_SILENT.write_text(f"{time.time() - (time.monotonic() - last_audio[0]):.3f}")
                 else:
                     CALL_SILENT.unlink(missing_ok=True)
 
@@ -2567,6 +2597,16 @@ async def call(request: web.Request) -> web.WebSocketResponse:
         shower = asyncio.create_task(show_status())
         unmuter = asyncio.create_task(keep_unmuted())
         nudger = asyncio.create_task(nudge())
+
+        async def phone_voice() -> None:
+            """Clips the phone speaks itself, and cuts, sent as they come (voice/phonevoice.py)."""
+            loop = asyncio.get_running_loop()
+            while True:
+                for message in await loop.run_in_executor(None, phonevoice.outgoing):
+                    await ws.send_str(json.dumps(message))
+                await asyncio.sleep(0.05)
+
+        speaker_text = asyncio.create_task(phone_voice())
         heard = 0  # bytes of the phone's mic, for the log
         silent = SilentMic()
         try:
@@ -2590,6 +2630,8 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             CALL_STAY_ON.unlink(missing_ok=True)  # and is asked after when it goes quiet
             CALL_SILENT.unlink(missing_ok=True)
             CALL_SOUND.unlink(missing_ok=True)
+            speaker_text.cancel()
+            phonevoice.call_over()  # the next call offers again, or streams
             liner.cancel()
             CALL_HANGUP.unlink(missing_ok=True)  # the phone went first: the hang-up is moot
             sender.cancel()
@@ -2598,6 +2640,9 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             nudger.cancel()
             for watcher in watchers:
                 watcher.cancel()
+            if dropped_line(ws.close_code, bool(hung_up_here)):  # not a hang-up: the phone may come back
+                write_json(CALL_DROPPED, {"since": round(time.time() - (time.monotonic() - last_audio[0]), 3),
+                                          "until": round(time.time() + REJOIN, 3)})
             CALL.unlink(missing_ok=True)  # hands-free and talkback go back to the laptop first
             for target in call_back if hung_up_here else []:  # hung up for quiet (by us, not them): once
                 CALL_RANG_BACK.touch()
@@ -2616,6 +2661,12 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             log(HANDSFREE_LOG, f"phone call ended ({heard / 2 / MIC_RATE:.0f} s of the phone's mic arrived; "
                                f"{ear.summary()}; {closed_how(ws, bool(hung_up_here))})")
     return ws
+
+
+def dropped_line(close_code: int | None, here: bool) -> bool:
+    """A call connection that broke rather than ended: neither side hung up (the phone hangs up with 1000, the laptop
+    closes it itself), so the phone is likely to come back within its reconnect window."""
+    return not here and close_code not in (1000, 1001)
 
 
 def closed_how(ws, here: bool) -> str:
@@ -2938,6 +2989,8 @@ def main() -> int:
     app.router.add_get("/usage", usage_overview)
     app.router.add_get("/chat/workflows", chat_workflows)
     app.router.add_get("/chat/minions", chat_minions)
+    app.router.add_get("/phone-voice/manifest", phone_voice_manifest)
+    app.router.add_get("/phone-voice/file/{name}", phone_voice_file)
     app.router.add_post("/chat/minions/view", chat_minion_view)
     app.router.add_post("/chat/minions/decide", chat_minion_decide)
     app.router.add_post("/away", away)

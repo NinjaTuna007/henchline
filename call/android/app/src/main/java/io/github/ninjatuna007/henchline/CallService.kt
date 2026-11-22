@@ -127,6 +127,8 @@ class CallService : Service() {
     private val attributes get() = if (clear) MEDIA else VOICE
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null  // Wi-Fi kept out of power save for the call
+    // Talkback the phone speaks itself (PhoneVoice): only when "Speak on the phone" is on and the model is here
+    private var phoneVoice: PhoneVoice.Speaker? = null
     @Volatile private var lastDrop = ""  // why the line last dropped: told to the laptop once it's back
     @Volatile private var running = false
     @Volatile private var link = 0  // which connection is the call's now: a dropped one's late words are ignored
@@ -180,6 +182,11 @@ class CallService : Service() {
                 .createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "henchline:call")
                 .apply { setReferenceCounted(false); acquire() }
         } catch (e: Exception) { null }
+        if (PhoneVoice.enabled(this) && PhoneVoice.ready(this)) {
+            phoneVoice = PhoneVoice.Speaker(this, enqueue = { heard.offer(it) }, queued = { heard.size },
+                send = { socket?.send(it) })
+            Thread { PhoneVoice.load(this) }.start()  // about 2.4 s: ready before the first reply
+        }
         applySound()
         connect(server)
         if (Build.VERSION.SDK_INT >= 31) {
@@ -284,6 +291,9 @@ class CallService : Service() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wifiLock?.let { try { if (it.isHeld) it.release() } catch (e: Exception) {} }
         wifiLock = null
+        phoneVoice?.close()
+        phoneVoice = null
+        PhoneVoice.release()  // the model's few hundred MB go with the call
         nearEar(false)
         Bus.connected = false
         if (startedAt > 0) logCall()
@@ -480,6 +490,7 @@ class CallService : Service() {
                     lostAt = 0
                     android.util.Log.i("Henchline", "call: reconnected")
                     webSocket.send(soundNote())
+                    offerPhoneVoice(webSocket)  // the laptop forgets the offer when the line drops
                     if (lastDrop.isNotEmpty()) {  // the laptop's log then says why the line went, not only that it did
                         webSocket.send(org.json.JSONObject().put("note", "dropped: $lastDrop").toString())
                         lastDrop = ""
@@ -498,6 +509,7 @@ class CallService : Service() {
                 getSharedPreferences("call", MODE_PRIVATE).getString(RingService.ENDPOINT, null)?.let {
                     webSocket.send(org.json.JSONObject().put("ring_endpoint", it).toString())
                 }
+                offerPhoneVoice(webSocket)
                 startAudio()
                 Bus.listener?.invoke("""{"opened": true}""")
             }
@@ -505,6 +517,12 @@ class CallService : Service() {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (me != link) return
                 val message = try { org.json.JSONObject(text) } catch (_: Exception) { null }
+                message?.optJSONObject("say")?.let { clip ->  // talkback the phone speaks itself (PhoneVoice)
+                    phoneVoice?.say(clip) ?: webSocket.send(org.json.JSONObject().put("tts", "fallback")
+                        .put("reason", "not speaking on the phone").put("id", clip.optString("id")).toString())
+                    return
+                }
+                message?.optString("stop")?.takeIf { it.isNotEmpty() }?.let { phoneVoice?.stop(it); return }
                 if (message?.optBoolean("flush") == true) {  // the user started talking: drop the talkback still queued
                     flushSpeaker()
                     return
@@ -673,12 +691,17 @@ class CallService : Service() {
 
     /** The sound mode, where it plays, and whether the phone's echo canceller is on, for the laptop: on the loudspeaker
      *  in clear sound, or without a canceller, our voice can reach this mic and talking over is judged with care. */
+    private fun offerPhoneVoice(webSocket: WebSocket) {
+        if (phoneVoice != null) PhoneVoice.offer(this)?.let { webSocket.send(it.toString()) }
+    }
+
     private fun soundNote(): String = org.json.JSONObject().put("sound", if (clear) "clear" else "call").put("out", where)
         .apply { echoCanceller?.let { put("aec", it) } }.toString()
 
     /** The laptop heard the user start talking: what is still queued to play (up to a second, plus the speaker's
      *  own fifth of a second) is dropped, so a clip they cut stops at once here too (2026-11-21). */
     private fun flushSpeaker() {
+        phoneVoice?.stopAll()  // the user is talking: a clip the phone speaks stops as the laptop's would
         val dropped = heard.size
         heard.clear()
         playing?.let { track ->
