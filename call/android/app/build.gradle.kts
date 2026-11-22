@@ -81,6 +81,7 @@ dependencies {
     implementation(files(sherpaAar))
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0")  // pull down the chat list to find every agent
     implementation("org.unifiedpush.android:connector:3.0.10")  // rung awake through the ntfy app, no Google
+    implementation("androidx.dynamicanimation:dynamicanimation:1.1.0")  // springs that carry a gesture's velocity (Motion)
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")  // the real org.json on the JVM (Android's is a stub in unit tests)
     androidTestImplementation("androidx.test.ext:junit:1.2.1")  // connectedDebugAndroidTest: the vectors on a phone

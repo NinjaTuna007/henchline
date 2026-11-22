@@ -4422,10 +4422,7 @@ class MainActivity : Activity() {
             save.visibility = if (pic.url != null) View.VISIBLE else View.GONE  // yours is on your phone already
             save.setOnClickListener { pic.url?.let { u -> Files.open(this@MainActivity, u, pic.name, pic.type, session = current) { say("", it, note = true) } } }
         }
-        pager.onTap = {  // hidden, it takes no taps either (Back and Save were reachable unseen)
-            if (bar.alpha > 0.5f) bar.animate().alpha(0f).setDuration(150).withEndAction { bar.visibility = View.INVISIBLE }.start()
-            else { bar.visibility = View.VISIBLE; bar.animate().alpha(1f).setDuration(150).start() }
-        }
+        pager.onTap = { PictureMotion.bar(bar, show = bar.alpha <= 0.5f) }  // hidden, it takes no taps either
         pager.onDown = { part -> dark.alpha = 1f - part * 0.7f; bar.alpha = minOf(bar.alpha, 1f - part) }
 
         // Where the tapped picture is on the screen: the viewer grows out of it and shrinks back into it
@@ -4435,32 +4432,18 @@ class MainActivity : Activity() {
             val at = IntArray(2); view.getLocationOnScreen(at)
             return android.graphics.RectF(at[0].toFloat(), at[1].toFloat(), (at[0] + view.width).toFloat(), (at[1] + view.height).toFloat())
         }
-        fun toward(target: View, box: android.graphics.RectF?) {  // as if it sat where box is (else a little smaller)
-            val w = resources.displayMetrics.widthPixels.toFloat()
-            val h = resources.displayMetrics.heightPixels.toFloat()
-            if (box == null) { target.scaleX = 0.9f; target.scaleY = 0.9f; target.translationX = 0f; target.translationY = 0f; return }
-            val scale = maxOf(box.width() / w, box.height() / h).coerceIn(0.1f, 1f)
-            target.scaleX = scale; target.scaleY = scale
-            target.translationX = box.centerX() - w / 2; target.translationY = box.centerY() - h / 2
-        }
         var shut = false
+        var opening: android.animation.Animator? = null
+        var leaving: android.animation.Animator? = null
         val close = {
             if (!shut) {
                 shut = true
-                val current = pager.current()
-                val box = if (pager.index == start) origin() else null
-                val w = resources.displayMetrics.widthPixels.toFloat()
-                val h = resources.displayMetrics.heightPixels.toFloat()
-                val scale = if (box == null) 0.9f else maxOf(box.width() / w, box.height() / h).coerceIn(0.1f, 1f)
-                current.animate().scaleX(scale).scaleY(scale)
-                    .translationX(if (box == null) current.translationX else box.centerX() - w / 2)
-                    .translationY(if (box == null) current.translationY + dp(40) else box.centerY() - h / 2)
-                    .alpha(if (box == null) 0f else 1f)
-                    .setDuration(220).setInterpolator(android.view.animation.AccelerateInterpolator()).start()
-                dark.animate().alpha(0f).setDuration(220).withEndAction { dialog.dismiss() }.start()
-                bar.animate().alpha(0f).setDuration(120).start()
+                val box = if (pager.index == start) origin() else null  // swiped to another: it shrinks and fades
+                opening?.cancel()  // closed on the way in: the close takes over from where the open got to
+                leaving = PictureMotion.close(pager.current(), dark, bar, box, pager) { dialog.dismiss() }
             }
         }
+        dialog.setOnDismissListener { opening?.cancel(); leaving?.cancel() }  // nothing runs on after it
         dialog.closing = close
         back.setOnClickListener { close() }
         pager.onClose = close
@@ -4468,13 +4451,8 @@ class MainActivity : Activity() {
         dialog.show()
         pager.show(start)
         // In: from the tapped picture to the whole screen, the dark coming up behind it
-        pager.post {
-            toward(pager, origin())
-            pager.animate().scaleX(1f).scaleY(1f).translationX(0f).translationY(0f)
-                .setDuration(260).setInterpolator(android.view.animation.DecelerateInterpolator(1.5f)).start()
-            dark.animate().alpha(1f).setDuration(260).start()
-            bar.animate().alpha(1f).setStartDelay(120).setDuration(180).start()
-        }
+        val corner = (from?.background as? GradientDrawable)?.cornerRadius ?: 0f  // the thumbnail's rounded corners
+        pager.post { opening = PictureMotion.open(pager, dark, bar, origin(), corner) }
     }
 
     /** A picture file on the phone, decoded no wider than it needs to be (and never huge). */
