@@ -53,6 +53,15 @@ object ChatEvents {
         else -> EventLook.NONE
     }
 
+    /** Said on the latest call with that chat (it began at startedAt, this phone's clock; null: no call this
+     *  run): kept lines from before it are an older call's. Two minutes' grace for the computers' clocks. */
+    fun ofCall(e: JSONObject, startedAt: Long?): Boolean {
+        val at = try { java.time.Instant.parse(e.optString("created_at")).toEpochMilli() } catch (ex: Exception) { return false }
+        return startedAt != null && at >= startedAt - CLOCK_GRACE
+    }
+
+    const val CLOCK_GRACE = 120_000L
+
     /** A call line's identity among the ones told live (CallService.HostLines): the same words from the same speaker,
      *  so the kept copy replaces the live one rather than showing twice. */
     fun callKey(from: String, text: String) = from.lowercase() + "\u0000" + text

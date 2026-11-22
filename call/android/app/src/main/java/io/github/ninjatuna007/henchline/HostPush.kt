@@ -222,8 +222,10 @@ object HostPush {
         if (wait) send() else Thread { send() }.start()
     }
 
-    private fun chat(context: Context, host: Host, session: String): Intent =
-        (if (session.isEmpty()) HostChatActivity.openHost(context, host.hostId) else HostChatActivity.open(context, ChatKey(host.hostId, session)))
+    private fun chat(context: Context, host: Host, session: String): Intent = chat(context, host.hostId, session)
+
+    private fun chat(context: Context, hostId: String, session: String): Intent =
+        (if (session.isEmpty()) HostChatActivity.openHost(context, hostId) else HostChatActivity.open(context, ChatKey(hostId, session)))
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
     /** A text or a file from another computer, as its agent's message there: shown as the laptop's texts are
@@ -243,6 +245,7 @@ object HostPush {
     }
 
     const val REPLY_KEY = "host_reply"
+    const val MAX_MINE = 20
     const val REPLY = "io.github.ninjatuna007.henchline.HOST_REPLY"
 
     /** Whether a text from that chat gets a Reply box: an agent's chat, not a timer's or a script's (Reminders). */
@@ -251,16 +254,22 @@ object HostPush {
     /** Another computer's text, as its notification (one per chat: a newer text replaces the last), with a Reply box
      *  that goes through that computer's own queue (HostReplyReceiver); mine: the replies typed in it so far, each a
      *  line under theirs, shown without a new buzz (the Reply box carries them, so the next adds a line). */
-    fun postText(context: Context, host: Host, agent: String, session: String, text: String, mine: List<String> = emptyList()) {
+    fun postText(context: Context, host: Host, agent: String, session: String, text: String, mine: List<String> = emptyList()) =
+        postText(context, host.hostId, host.label, agent, session, text, mine)
+
+    /** The same, by the computer's id and name (a reply whose computer can't be read now still says so). */
+    fun postText(context: Context, hostId: String, label: String, agent: String, session: String, text: String,
+                 all: List<String> = emptyList()) {
+        val mine = all.takeLast(MAX_MINE)  // the latest replies typed in it: the notification stays short
         val name = IncomingActivity.nameOf(agent)
-        val id = "${host.hostId} $session".hashCode()
+        val id = "$hostId $session".hashCode()
         val reply = if (!takesReply(session)) null else PendingIntent.getBroadcast(context, id,
-            Intent(context, HostReplyReceiver::class.java).setAction(REPLY).putExtra("host_id", host.hostId)
+            Intent(context, HostReplyReceiver::class.java).setAction(REPLY).putExtra("host_id", hostId).putExtra("label", label)
                 .putExtra("session", session).putExtra("agent", agent).putExtra("text", text)
                 .putStringArrayListExtra("mine", ArrayList(mine)),
             PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)  // mutable: the reply text is added to it
-        notify(context, "$name on ${host.label}", mine.lastOrNull() ?: text, chat(context, host, session), Messages.CHANNEL, id = id,
-            message = Message("$name on ${host.label}", text), agent = agent, mine = mine,
+        notify(context, "$name on $label", mine.lastOrNull() ?: text, chat(context, hostId, session), Messages.CHANNEL, id = id,
+            message = Message("$name on $label", text), agent = agent, mine = mine,
             reply = reply?.let { name to it })
     }
 
@@ -310,8 +319,13 @@ class HostReplyReceiver : android.content.BroadcastReceiver() {
         val pending = goAsync()
         Thread {
             var host: Host? = null
-            val paired = try { HostRegistry.of(app).get(hostId) } catch (e: Exception) { null }
+            val label = intent.getStringExtra("label") ?: "that computer"
             try {
+                val paired = try { HostRegistry.of(app).get(hostId) } catch (e: Exception) {
+                    android.util.Log.w("Henchline", "reply to ${hostId.take(8)}: computers unreadable: ${e.javaClass.simpleName}")
+                    HostPush.postText(app, hostId, label, agent, session, text, before + "$words  (not sent: couldn't read the paired computers)")
+                    return@Thread
+                }
                 val target = paired?.takeIf { !it.revocationPending }
                 if (target == null) {  // never a spinner left turning: said in the notification, or it goes
                     if (paired != null) HostPush.postText(app, paired, agent, session, text,

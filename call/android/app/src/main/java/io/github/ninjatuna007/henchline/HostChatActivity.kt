@@ -300,7 +300,7 @@ class HostChatActivity : Activity() {
                         val from = e.optString("from"); val text = e.optString("text")
                         events.addView(if (ChatEvents.lookOf(e) == EventLook.CALL_YOU) bubble(text, "said on the call")
                             else theirs(from.ifEmpty { "Agent" }, text), at)
-                        dropLive(ChatEvents.callKey(from, text))
+                        dropLive(ChatEvents.callKey(from, text), ChatEvents.ofCall(e, CallService.Bus.hostLines.startedFor(hostId, sessionId ?: "")))
                     }
                     EventLook.NONE -> events.addView(View(activity).apply { visibility = View.GONE }, at)
                 }
@@ -376,10 +376,11 @@ class HostChatActivity : Activity() {
         private val keptAhead = HashMap<String, Int>()
 
         /** A call line the computer kept is drawn: its live copy goes (the first one this screen shows), or, not shown
-         *  yet, the next one that comes is skipped. A line said twice is two lines either way. */
-        private fun dropLive(key: String) {
+         *  yet and said on the latest call (ofLatest), the next one that comes is skipped. A line said twice is two
+         *  lines either way; an older call's kept lines never hide a later call's ("yes", "okay"). */
+        private fun dropLive(key: String, ofLatest: Boolean) {
             for (i in 0 until callLines.childCount) if (callLines.getChildAt(i).tag == key) { callLines.removeViewAt(i); return }
-            keptAhead[key] = (keptAhead[key] ?: 0) + 1
+            if (ofLatest) keptAhead[key] = (keptAhead[key] ?: 0) + 1
         }
 
         fun say(words: String) = show(words)
@@ -448,7 +449,7 @@ class HostChatActivity : Activity() {
             }
             if (m.has("closed")) CallService.Bus.hostLines.takeClosed(hostId, sessionId ?: "")  // seen here: not again
             when {
-                m.has("opened") -> { callBar.visibility = View.VISIBLE; callState.text = "On a call" }
+                m.has("opened") -> { callBar.visibility = View.VISIBLE; callState.text = "On a call"; keptAhead.clear() }
                 m.has("reconnecting") -> callState.text = if (m.optBoolean("reconnecting")) "Reconnecting…" else "On a call"
                 m.has("closed") -> { callBar.visibility = View.GONE; show(m.optString("closed")) }
                 m.has("talking") -> talk.text = if (m.optBoolean("talking")) "Send" else "Talk"
@@ -462,7 +463,7 @@ class HostChatActivity : Activity() {
                 val key = ChatEvents.callKey(line.optString("from"), line.optString("text"))
                 val ahead = keptAhead[key] ?: 0
                 if (ahead > 0) { keptAhead[key] = ahead - 1; return }  // the computer's kept copy is drawn already
-                callLines.addView((if (line.optString("from") == "you") bubble(line.optString("text"), "said on the call")
+                callLines.addView((if (line.optString("from").equals("you", ignoreCase = true)) bubble(line.optString("text"), "said on the call")
                     else theirs(line.optString("from").ifEmpty { "Agent" }, line.optString("text"))).apply { tag = key })
                 if (callLines.childCount > CallService.HostLines.MAX) callLines.removeViewAt(0)  // as many as are kept
                 empty.visibility = View.GONE

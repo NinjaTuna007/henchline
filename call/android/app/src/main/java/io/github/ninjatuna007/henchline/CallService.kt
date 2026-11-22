@@ -74,9 +74,16 @@ class CallService : Service() {
 
         private var closedWhy: String? = null
 
+        private var startedAt = 0L
+
         @Synchronized fun start(hostId: String, session: String) {
             lines.clear(); closedWhy = null; this.hostId = hostId; this.session = session
+            startedAt = System.currentTimeMillis()
         }
+
+        /** When the call with that chat (the latest one) began, by this phone's clock; null for another chat or none. */
+        @Synchronized fun startedFor(hostId: String, session: String?): Long? =
+            startedAt.takeIf { it > 0 && hostId == this.hostId && session == this.session }
 
         /** How the call ended, for its chat screen if it wasn't showing then. */
         @Synchronized fun closed(why: String) { closedWhy = why }
