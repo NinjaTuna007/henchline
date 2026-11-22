@@ -3270,8 +3270,20 @@ class MainActivity : Activity() {
             val answer = try {
                 val request = okhttp3.Request.Builder().url("$origin$path").header("Origin", origin)
                 if (body != null) request.post(body.toString().toRequestBody("application/json".toMediaType()))
-                Files.client.newCall(request.build()).execute().use { JSONObject(it.body?.string()?.ifEmpty { "{}" } ?: "{}") }
-            } catch (_: Exception) { JSONObject().put("note", "Couldn't reach $who (is Tailscale on?)") }
+                Files.client.newCall(request.build()).execute().use { response ->
+                    val json = try { JSONObject(response.body?.string()?.ifEmpty { "{}" } ?: "{}") } catch (e: org.json.JSONException) { JSONObject() }
+                    // Refused (an unsigned request where only signed ones are taken, a route it hasn't got): said so
+                    if (!response.isSuccessful && !json.has("note")) {
+                        val code = json.optJSONObject("error")?.optString("code").orEmpty()
+                        android.util.Log.w("Henchline", "$path on $who: HTTP ${response.code} $code")
+                        json.put("note", "$who refused it (${response.code}${if (code.isEmpty()) "" else " $code"}).")
+                    }
+                    json
+                }
+            } catch (e: Exception) {
+                android.util.Log.w("Henchline", "$path on $who: ${e.javaClass.simpleName}: ${e.message}")
+                JSONObject().put("note", "Couldn't reach $who (is Tailscale on?)")
+            }
             main.post { then(answer) }
         }.start()
     }
@@ -3342,7 +3354,13 @@ class MainActivity : Activity() {
 
     /** New chat (the user's wish, 2026-11-16): the laptop's folders (those its Claude trusts, newest first, or a
      *  typed path) and agents, in a bottom sheet; the agent starts in its own tmux window there and its chat opens. */
-    private fun newChat(on: String? = null) {
+    /** reply: from another computer's sheet (its COMPUTER row): null once this computer's sheet is up, else why
+     *  not, shown in that sheet (a toast after it closed went unseen, 2026-11-22); without it, a toast. */
+    private fun newChat(on: String? = null, reply: ((String?) -> Unit)? = null) {
+        fun failed(why: String) {
+            android.util.Log.w("Henchline", "new chat on ${on ?: "the last computer"}: $why")
+            if (reply != null) reply(why) else android.widget.Toast.makeText(this, why, android.widget.Toast.LENGTH_LONG).show()
+        }
         // Multi-host: on the computer asked for (a heading's New chat, the sheet's computer row), else the one whose
         // chat was opened last; that computer's own folders and agents, its new chat opened there
         val computers = otherComputers()
@@ -3353,11 +3371,10 @@ class MainActivity : Activity() {
         val host = computers.firstOrNull { it.hostId == key }
         val who = host?.label ?: "the laptop"
         // Another computer's requests go to its own address only, never the laptop's in its place
-        val origin = if (host != null) HostPush.origin(host.baseUrl)?.trimEnd('/') ?: run {
-            android.widget.Toast.makeText(this, "${host.label}'s address can't be used: pair it again in Settings › Computers.",
-                android.widget.Toast.LENGTH_LONG).show()
-            return
-        } else Files.origin(this) ?: return say("", "Set the laptop's address in Settings first.", note = true).let {}
+        val origin = if (host != null) HostPush.origin(host.baseUrl)?.trimEnd('/')
+            ?: return failed("${host.label}'s address can't be used: pair it again in Settings › Computers.")
+        else Files.origin(this) ?: return if (reply != null) failed("Set the laptop's address in Settings first.")
+            else say("", "Set the laptop's address in Settings first.", note = true).let {}
         askAt(origin, who, "/crew/folders", null) { answer ->
             val folders = answer.optJSONArray("folders")
             val agents = answer.optJSONArray("agents")
@@ -3365,10 +3382,9 @@ class MainActivity : Activity() {
                 return@askAt newChat(LAPTOP)  // the remembered computer didn't answer: the laptop, whose sheet can switch
             }
             if (folders == null || agents == null || agents.length() == 0) {
-                android.widget.Toast.makeText(this, answer.optString("note").ifEmpty { "No agent to start on $who (it needs tmux)." },
-                    android.widget.Toast.LENGTH_LONG).show()
-                return@askAt
+                return@askAt failed(answer.optString("note").ifEmpty { "No agent to start on $who (it needs tmux)." })
             }
+            reply?.invoke(null)  // the sheet it was picked from goes; this computer's comes up
             panel = NewChatSheet(this, (0 until folders.length()).map { folders.getJSONObject(it) },
                 (0 until agents.length()).map { agents.getString(it) },
                 loadModels = { agent, then -> askAt(origin, who, "/crew/models?agent=$agent", null) { answer -> then(answer) } },
@@ -3393,7 +3409,7 @@ class MainActivity : Activity() {
                     else listOf(LAPTOP to (HostPush.laptopLabel(this) ?: "This laptop")) + computers.map { it.hostId to it.label },
                 computer = key,
                 offline = offline,
-                pickComputer = { picked -> newChat(picked) }
+                pickComputer = { picked, answer -> newChat(picked, answer) }
             ).also { it.show() }
         }
     }

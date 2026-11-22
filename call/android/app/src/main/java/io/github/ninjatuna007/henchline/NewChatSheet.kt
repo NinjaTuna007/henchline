@@ -290,7 +290,7 @@ class NewChatSheet(
     private val computers: List<Pair<String, String>> = emptyList(),
     private val computer: String = "",
     private val offline: Set<String> = emptySet(),
-    private val pickComputer: ((String) -> Unit)? = null,
+    private val pickComputer: ((key: String, reply: (String?) -> Unit) -> Unit)? = null,
 ) : BottomPanel(activity) {
     private var model = ""  // "" the agent's own default
     private var modelName = "Default"
@@ -300,6 +300,7 @@ class NewChatSheet(
     private var typed = ""  // a path in the box, when it is one
     private var failure = ""  // why the last start didn't happen, shown until something else is picked
     private var modelRefresh: () -> Unit = {}
+    private var refreshNow: () -> Unit = {}  // the sheet's own refresh, once it is built
 
     /** A listed folder the picked agent doesn't trust yet (the computer says so: trusted {agent: false}; an older one
      *  says nothing): starting there gets the same confirm as a typed path, and the computer then answers the agent's
@@ -322,7 +323,14 @@ class NewChatSheet(
                     if (key == computer) 2 else 1, if (key == computer) colour(R.color.cyan) else colour(R.color.surface_high))
                 val reachable = key !in offline
                 alpha = if (reachable) 1f else 0.45f
-                if (reachable && key != computer) setOnClickListener { pop(this); close(); pickComputer.invoke(key) }
+                // This sheet stays until that computer's own sheet is ready; if it can't be, it says why here
+                if (reachable && key != computer) setOnClickListener {
+                    pop(this)
+                    failure = "Asking $name…"; refreshNow()
+                    pickComputer.invoke(key) { why ->
+                        if (why == null) close() else { failure = why; refreshNow() }
+                    }
+                }
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginEnd = px(8) })
             sheet.addView(HorizontalScrollView(activity).apply { isHorizontalScrollBarEnabled = false; addView(row) }, wide(10))
         }
@@ -368,6 +376,7 @@ class NewChatSheet(
                 else -> warning.visibility = View.GONE
             }
         }
+        refreshNow = { refresh() }
         fun listFolders(query: String) {
             cards.removeAllViews()
             failure = ""
