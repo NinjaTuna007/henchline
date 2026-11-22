@@ -381,8 +381,14 @@ async def chat_events(request: web.Request, api: Api, signed_request: SignedRequ
     rid = signed_request.request_id
     session_id = session_of(request, rid)
     limit = limit_of(request, rid)
+    # Call lines only for a phone that asks for them (with=call_lines): an older one would draw an unknown kind as
+    # a message of its own
+    wanted = set(filter(None, request.query.get("with", "").split(",")))
+    if wanted - {"call_lines"}:
+        raise ApiError(400, "invalid_request", "with: call_lines is the only option", request_id=rid)
+    without = () if "call_lines" in wanted else ("call_line",)
     rows = await asyncio.get_running_loop().run_in_executor(
-        None, api.store.events, session_id, limit, cursor_after(request.query.get("cursor", ""), rid))
+        None, api.store.events, session_id, limit, cursor_after(request.query.get("cursor", ""), rid), without)
     # Each event's own cursor: a phone polling for what's new resumes after the last one it has (next_cursor is
     # only there when the page was full), a little earlier for a text that is filed late in its place
     events = [{"host_id": api.config.host_id, "session_id": session_id, "event_id": row["event_id"],
@@ -425,6 +431,23 @@ def utc(at: float) -> str:
 
 
 # ---- the reply ledger: agents' texts kept as chat events -----------------------------------------------------
+
+MAX_FROM = 64  # characters of a call line's speaker
+
+
+def record_call_line(api: Api, chat: dict[str, Any], now: float | None = None) -> str | None:
+    """A line said on a call (your words as heard, an agent's talkback, a line typed in its terminal), kept in its
+    chat's events as kind call_line ({from, text, created_at}), so a paired phone can read the call afterwards.
+    Not an agent's text (tid: ingested from texts/ already) or a file (its link is a secret). The new event's id,
+    or None when the line isn't kept. Pruned with the rest after ledger_days."""
+    session, text = str(chat.get("session", "")), chat.get("text")
+    if (chat.get("tid") or chat.get("file") or not SESSION_ID.fullmatch(session)
+            or not isinstance(text, str) or not text.strip()):
+        return None
+    at = time.time() if now is None else now
+    body = {"from": str(chat.get("from", ""))[:MAX_FROM], "text": text[:MAX_TEXT], "created_at": utc(at)}
+    return api.store.append_event(session, "call_line", json.dumps(body).encode(), now=at)
+
 
 def ingest(api: Api, now: float | None = None) -> int:
     """Each agent text this host keeps, added once to its chat's events (kind agent_text). Safe to run again and

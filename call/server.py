@@ -587,6 +587,7 @@ def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent
 
 SIGNED_ORIGIN = ""   # with --api-v1: this host's own address (host.json), for requests a paired phone signed
 SIGNED_ONLY = False  # --signed-only: these routes take only signed requests (no Origin-only access)
+CALL_LEDGER = None   # with --api-v1 and chat: keeps each line said on a call in host.sqlite3 (api_v1.record_call_line)
 
 
 def trusted(request: web.Request) -> None:
@@ -2575,6 +2576,11 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                         shown_agents = now_agents
                 for event in status.events():
                     await ws.send_json(event)
+                    if CALL_LEDGER is not None and isinstance(event.get("chat"), dict):
+                        try:  # in the executor (SQLite may wait on its lock); never a reason for the call to stop
+                            await asyncio.get_running_loop().run_in_executor(None, CALL_LEDGER, event["chat"])
+                        except Exception as exc:
+                            log(HANDSFREE_LOG, f"call: a call line wasn't kept ({exc.__class__.__name__})")
                 now = status.now()
                 if now != shown:
                     await ws.send_json(now)
@@ -2966,7 +2972,7 @@ def mount_api_v1(app: web.Application, heartbeats: bool = False, signed_only: bo
     """--api-v1: the signed host API beside the legacy routes, from ~/.config/henchline/host.json. "" or why not.
     heartbeats (--directory-heartbeat): also keep this host listed in the directory it was enrolled with.
     signed_only (--signed-only): the legacy routes' Origin check lets in only requests a paired phone signed."""
-    global SIGNED_ORIGIN, SIGNED_ONLY
+    global SIGNED_ORIGIN, SIGNED_ONLY, CALL_LEDGER
     from call import api_v1
     from call.host_config import HostConfig
     from call.host_store import HostStore
@@ -2984,6 +2990,8 @@ def mount_api_v1(app: web.Application, heartbeats: bool = False, signed_only: bo
     api_v1.guard_legacy(app, STREAMED)
     SIGNED_ORIGIN = config.base_url.rstrip("/")
     SIGNED_ONLY = signed_only
+    if api.capabilities.get("chat"):
+        CALL_LEDGER = lambda chat: api_v1.record_call_line(api, chat)  # noqa: E731
     if heartbeats:
         from call import directory_client
 

@@ -278,6 +278,26 @@ class NotOffered(Base):
 
 
 class Mounting(unittest.TestCase):
+    def test_a_host_with_chat_keeps_call_lines(self):
+        folder = Path(tempfile.mkdtemp(dir=sandbox.HOME))
+        config = hostkit.config(folder, capabilities={"chat": True})
+        with mock.patch("call.host_config.HostConfig.load", return_value=config), \
+                mock.patch.object(server, "CALL_LEDGER", None):
+            self.assertEqual(server.mount_api_v1(web.Application()), "")
+            self.assertIsNotNone(server.CALL_LEDGER(
+                {"from": "Claude", "text": "on the call", "session": "claude-1"}))
+        store = HostStore(config.database)
+        self.addCleanup(store.close)
+        self.assertEqual([r["kind"] for r in store.events("claude-1", 50)], ["call_line"])
+
+    def test_without_chat_no_call_lines_are_kept(self):
+        folder = Path(tempfile.mkdtemp(dir=sandbox.HOME))
+        config = hostkit.config(folder, capabilities={"chat": False})
+        with mock.patch("call.host_config.HostConfig.load", return_value=config), \
+                mock.patch.object(server, "CALL_LEDGER", None):
+            self.assertEqual(server.mount_api_v1(web.Application()), "")
+            self.assertIsNone(server.CALL_LEDGER)
+
     def test_signed_only_needs_the_capability(self):
         folder = Path(tempfile.mkdtemp(dir=sandbox.HOME))
         config = hostkit.config(folder, capabilities={"chat": True})

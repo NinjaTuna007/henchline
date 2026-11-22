@@ -503,3 +503,48 @@ class NoChat(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CallLines(Base):
+    """What is said on a call, kept as its chat's call_line events and served only to a phone that asks."""
+
+    def line(self, text="hello", session="claude-1", **extra):
+        return {"from": "Claude", "text": text, "session": session, **extra}
+
+    async def test_lines_are_kept_but_never_texts_files_or_bad_ones(self):
+        # Recent times: the app's own ledger loop prunes anything older than ledger_days meanwhile
+        at = float(int(time.time()))
+        self.assertIsNotNone(api_v1.record_call_line(self.api, self.line("one"), now=at))
+        for skipped in (self.line(tid="0123456789abcdef"), self.line(file={"url": "/files/s/x"}), self.line(session=""),
+                        self.line(session="a\nb"), self.line(text="  "), self.line(text=None)):
+            with self.subTest(line=skipped):
+                self.assertIsNone(api_v1.record_call_line(self.api, skipped, now=at + 1))
+        rows = self.store.events("claude-1", 50)
+        self.assertEqual([(r["kind"], json.loads(r["body"])["text"]) for r in rows], [("call_line", "one")])
+        self.assertEqual(json.loads(rows[0]["body"]),
+                         {"from": "Claude", "text": "one", "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))})
+
+    async def test_served_only_when_asked_for_in_order_and_paged(self):
+        key, device = await self.enrolled()
+        now = time.time()
+        for i in range(3):
+            api_v1.record_call_line(self.api, self.line(f"said {i}"), now=now - 10 + i)  # before the messages
+        for i in range(2):
+            await self.call(key, device, "POST", "/api/v1/chats/claude-1/messages", self.message(text=f"m{i}"))
+        _, plain = await self.call(key, device, "GET", "/api/v1/chats/claude-1/events?limit=2")
+        # An older phone: as before, and a full page of what it knows (left out in the query, not after it)
+        self.assertEqual([e["kind"] for e in plain["events"]], ["message", "message"])
+        _, asked = await self.call(key, device, "GET", "/api/v1/chats/claude-1/events?with=call_lines")
+        self.assertEqual([e.get("text") or e["content"]["text"] for e in asked["events"]],
+                         ["said 0", "said 1", "said 2", "m0", "m1"])
+        self.assertEqual(asked["events"][0]["from"], "Claude")
+        status, body = await self.call(key, device, "GET", "/api/v1/chats/claude-1/events?with=everything")
+        self.assertEqual((status, body["error"]["code"]), (400, "invalid_request"))
+
+    async def test_only_a_paired_phone_reads_them_and_they_are_pruned(self):
+        at = time.time() - 3600
+        api_v1.record_call_line(self.api, self.line("an hour ago"), now=at)
+        answer = await self.client.get("/api/v1/chats/claude-1/events?with=call_lines")
+        self.assertEqual(answer.status, 401)
+        self.assertEqual(self.store.prune_events(at + 1), 1)  # with the rest of the ledger
+        self.assertEqual(self.store.events("claude-1", 50), [])

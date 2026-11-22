@@ -331,14 +331,16 @@ class HostStore:
             return self._db.execute("DELETE FROM host_events WHERE created_at < ?", (before,)).rowcount
 
     def events(self, session_id: str, limit: int = 50,
-               after: tuple[float, str] | None = None) -> list[sqlite3.Row]:
-        """A chat's events, oldest first; after=(created_at, event_id) of the last one already seen."""
+               after: tuple[float, str] | None = None, without: tuple[str, ...] = ()) -> list[sqlite3.Row]:
+        """A chat's events, oldest first; after=(created_at, event_id) of the last one already seen; without: kinds
+        left out (in the query, so a page is still `limit` long)."""
         limit = max(1, min(200, int(limit)))
         since, last = after if after is not None else (-1.0, "")
+        skip = " AND kind NOT IN (%s)" % ",".join("?" * len(without)) if without else ""
         with self._lock:
             return list(self._db.execute(
-                "SELECT * FROM host_events WHERE session_id=? AND (created_at>? OR (created_at=? AND event_id>?)) "
-                "ORDER BY created_at,event_id LIMIT ?",
-                (session_id, since, since, last, limit),
+                "SELECT * FROM host_events WHERE session_id=? AND (created_at>? OR (created_at=? AND event_id>?))"
+                + skip + " ORDER BY created_at,event_id LIMIT ?",
+                (session_id, since, since, last, *without, limit),
             ))
 
