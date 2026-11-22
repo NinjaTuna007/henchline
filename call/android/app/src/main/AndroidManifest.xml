@@ -143,5 +143,12 @@
             android:enabled="${phoneVoiceBench}"
             android:exported="true"
             android:permission="android.permission.DUMP" />
+
+        <!-- Debug builds only: speech-to-text candidates on the user's recordings (PhoneSpeechBench); disabled in a release -->
+        <receiver
+            android:name=".PhoneSpeechBench"
+            android:enabled="${phoneVoiceBench}"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
     </application>
 </manifest>

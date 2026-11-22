@@ -287,14 +287,14 @@ object PhoneVoice {
     /** ONNX's own worker threads, made inside the engine when it loads: they do most of a render's work. */
     @Volatile private var engineThreads = IntArray(0)
 
-    private fun tasks(): Set<Int> =
+    internal fun tasks(): Set<Int> =
         try { File("/proc/self/task").list()?.mapNotNull { it.toIntOrNull() }?.toSet() ?: emptySet() } catch (_: Exception) { emptySet() }
 
     private fun comm(tid: Int): String? = try { File("/proc/self/task/$tid/comm").readText().trim() } catch (_: Exception) { null }
 
     /** Threads made since `before` by this thread: a native thread starts with its maker's name, so other threads the
      *  app made meanwhile are left out. */
-    private fun spawned(before: Set<Int>): IntArray {
+    internal fun spawned(before: Set<Int>): IntArray {
         val mine = comm(android.os.Process.myTid()) ?: return IntArray(0)
         return (tasks() - before).filter { comm(it) == mine }.sorted().toIntArray()
     }
