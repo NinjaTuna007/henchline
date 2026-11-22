@@ -1,6 +1,8 @@
 """handsfree/core/routing.py: what a transcribed turn asks for, before any agent sees it."""
 
+import os
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -80,6 +82,9 @@ class Placing(unittest.TestCase):
         for path in routing._RESUMING.glob("*"):
             path.unlink()
         self.speaker = routing.Speaker("claude-" + self.CHAT, "claude", "henchline")
+        server = mock.patch("voice.desktop.tmux.server_started", return_value=0.0)  # never the real tmux
+        server.start()
+        self.addCleanup(server.stop)
 
     def tearDown(self):
         for path in routing._RESUMING.glob("*"):
@@ -260,6 +265,68 @@ class Placing(unittest.TestCase):
                 mock.patch("voice.desktop.tmux.pane_there", return_value=None), \
                 mock.patch.object(routing, "say"):
             note = routing.place(self.speaker)
+        self.assertEqual(note, "That chat is still starting.")
+        resume.assert_not_called()
+
+    def _old_reservation(self, data: str, age: float) -> float:
+        routing._RESUMING.mkdir(parents=True, exist_ok=True)
+        path = routing._RESUMING / self.CHAT
+        path.write_text(data)
+        written = time.time() - age
+        os.utime(path, (written, written))
+        return written
+
+    def _resumed_with(self, *patches) -> tuple[str, mock.Mock]:
+        with mock.patch("voice.resume.find_running", return_value=[]), \
+                mock.patch("voice.resume.folder_of", return_value=Path("/tmp/henchline-place")), \
+                mock.patch("voice.desktop.tmux.resume", return_value=Tab("tmux", "%9")) as resume, \
+                mock.patch.object(routing, "say"), \
+                mock.patch.object(routing.time, "sleep"), \
+                mock.patch.object(routing.Speaker, "pin", return_value=True), \
+                mock.patch.object(routing.Speaker, "save"):
+            for patch in patches:
+                patch.start()
+            try:
+                note = routing.place(self.speaker)
+            finally:
+                for patch in patches:
+                    patch.stop()
+        return note, resume
+
+    def test_a_pane_recorded_under_an_earlier_tmux_server_is_not_this_chat(self):
+        # After a reboot the new server counts pane ids from %0 again: %15 may now be another chat
+        written = self._old_reservation(
+            '{"pid": 1, "token": "old", "phase": "up", "owner": "tmux", "address": "%15"}', 60)
+        note, resume = self._resumed_with(
+            mock.patch("voice.desktop.tmux.server_started", return_value=written + 30),
+            mock.patch("voice.desktop.tmux.pane_there", return_value=True))
+        self.assertEqual(note, "")
+        self.assertEqual(resume.call_count, 1)
+        self.assertEqual(self.speaker.tab, Tab("tmux", "%9"))
+
+    def test_a_pane_recorded_under_this_server_still_blocks(self):
+        written = self._old_reservation(
+            '{"pid": 1, "token": "old", "phase": "up", "owner": "tmux", "address": "%15"}', 60)
+        note, resume = self._resumed_with(
+            mock.patch("voice.desktop.tmux.server_started", return_value=written - 30),
+            mock.patch("voice.desktop.tmux.pane_there", return_value=True),
+            mock.patch.object(routing.Speaker, "pin", return_value=False))
+        self.assertEqual(note, "")
+        resume.assert_not_called()
+        self.assertEqual(self.speaker.tab, Tab("tmux", "%15"))  # typed into the pane already reserved
+
+    def test_a_holder_from_before_the_boot_does_not_block(self):
+        # Its pid may now be any process: pid 1 always exists
+        written = self._old_reservation(
+            '{"pid": 1, "token": "old", "phase": "wait", "owner": "", "address": ""}', 60)
+        note, resume = self._resumed_with(mock.patch.object(routing, "_booted", return_value=written + 30))
+        self.assertEqual(note, "")
+        self.assertEqual(resume.call_count, 1)
+
+    def test_a_live_holder_from_this_boot_still_blocks(self):
+        written = self._old_reservation(
+            '{"pid": 1, "token": "old", "phase": "wait", "owner": "", "address": ""}', 60)
+        note, resume = self._resumed_with(mock.patch.object(routing, "_booted", return_value=written - 30))
         self.assertEqual(note, "That chat is still starting.")
         resume.assert_not_called()
 

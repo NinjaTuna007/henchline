@@ -290,27 +290,27 @@ def pane_pid(tab: Tab) -> int:
     """The pane's first process: with the pane id, says it is still the same pane (tmux reuses ids after a
     restart). 0 when it is gone, or when tmux could not be asked: callers that must not treat those the same
     use pane_there."""
-    there = pane_there(tab)
-    if there is not True:
-        return 0
-    pid = out("display-message", "-p", "-t", tab.address, "#{pane_pid}")
-    return int(pid) if pid.isdigit() else 0
+    panes = pane_pids() if tab and tab.owner == OWNER else None
+    return (panes or {}).get(tab.address if tab else "", 0)
 
 
 def pane_there(tab: Tab) -> bool | None:
     """True when that tmux pane exists, False when tmux says it does not, None when tmux could not be asked.
-    None is not a dead pane: a failed query must not start a second resume."""
+    None is not a dead pane: a failed query must not start a second resume. Read from the list of panes: asked
+    about one pane that isn't there, `display-message -t` answers nothing and still succeeds (tmux 3.4)."""
     if not tab or tab.owner != OWNER:
         return False
-    done = tmux("display-message", "-p", "-t", tab.address, "#{pane_id}")
-    if done is None:
-        return None
-    if done.returncode == 0 and done.stdout.strip() == tab.address:
-        return True
-    err = f"{done.stderr}\n{done.stdout}".lower()
-    if "can't find pane" in err or "no server running" in err or "error connecting" in err:
-        return False
-    return None
+    panes = pane_pids()
+    return None if panes is None else tab.address in panes
+
+
+def server_started() -> float | None:
+    """When the running tmux server started: pane ids count from %0 again on a new one. 0 when none runs, None
+    when tmux couldn't be asked."""
+    when = out("display-message", "-p", "#{start_time}")
+    if when.isdigit():
+        return float(when)
+    return 0.0 if pane_pids() == {} else None
 
 
 def pane_pids() -> dict[str, int] | None:

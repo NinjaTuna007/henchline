@@ -321,6 +321,36 @@ def _load(handle) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _booted() -> float:
+    """When this machine last started, from the kernel; 0 when that can't be read."""
+    try:
+        line = next(l for l in Path("/proc/stat").read_text().splitlines() if l.startswith("btime "))
+        return float(line.split()[1])
+    except (OSError, StopIteration, ValueError, IndexError):
+        return 0.0
+
+
+def _written(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _from_this_boot(path: Path) -> bool:
+    """A reservation from before the last boot: its pid may now be some other process."""
+    return _written(path) >= _booted()
+
+
+def _pane_of_this_server(path: Path) -> bool:
+    """A pane recorded before the running tmux server started names a pane of an earlier server, and that id may
+    now be another chat's pane. A pane is recorded only once its server runs, so a current one is never older.
+    No server, or tmux not answering: the pane check itself says gone or unknown."""
+    from voice.desktop import tmux
+    started = tmux.server_started()
+    return not started or _written(path) >= started
+
+
 def _pane_open(tab: Tab) -> bool | None:
     """True when the pane exists, False when it is gone, None when tmux could not be asked. None stays blocked."""
     from voice.desktop import tmux
@@ -336,7 +366,7 @@ def _reserved_tab(chat: str) -> Tab | None:
         data = json.loads(path.read_text() or "{}")
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or not _pane_of_this_server(path):
         return None
     owner, address = str(data.get("owner") or ""), str(data.get("address") or "")
     return Tab(owner, address) if owner and address else None
@@ -348,7 +378,8 @@ def _claim(chat: str) -> tuple[str, str]:
     too, even while the agent is not yet the foreground."""
     path = _RESUMING / chat
     _RESUMING.mkdir(parents=True, exist_ok=True)
-    path.touch()
+    if not path.exists():  # create only: touching an old reservation would make it look new, and its age matters
+        path.touch()
     with path.open("r+") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         data = _load(handle)
@@ -358,9 +389,9 @@ def _claim(chat: str) -> tuple[str, str]:
             holder = int(data.get("pid") or 0)
         except (TypeError, ValueError):
             holder = 0
-        holder_alive = bool(holder) and Path(f"/proc/{holder}").exists()
+        holder_alive = bool(holder) and _from_this_boot(path) and Path(f"/proc/{holder}").exists()
         waiting = data.get("phase") != "up"
-        pane = _pane_open(tab) if tab else False
+        pane = _pane_open(tab) if tab and _pane_of_this_server(path) else False
         if pane is not False or (waiting and holder_alive):
             return "That chat is still starting.", ""
         token = f"{os.getpid()}-{time.time_ns()}"
