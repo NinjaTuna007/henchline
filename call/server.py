@@ -983,6 +983,61 @@ def trusted_folders(limit: int | None = 30) -> list[Path]:
     return sorted(shown, key=used, reverse=True)[:limit]
 
 
+def cursor_trusted() -> list[tuple[float, Path]]:
+    """Folders the Cursor CLI trusts: each has ~/.cursor/projects/<key>/.workspace-trusted naming it
+    (workspacePath), with when that project folder last changed (its transcripts: when it was last used)."""
+    found = []
+    for marker in (Path.home() / ".cursor/projects").glob("*/.workspace-trusted"):
+        try:
+            path = json.loads(marker.read_text()).get("workspacePath")
+            used = marker.parent.stat().st_mtime
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(path, str) and path:
+            found.append((used, Path(path)))
+    return found
+
+
+def tmux_folders() -> list[tuple[float, Path]]:
+    """The folders the phone's chats run in now (panes of tmux session henchline), with each window's last
+    activity: where the user is working."""
+    found = []
+    for line in tmux.out("list-panes", "-s", "-t", tmux.SESSION, "-F", "#{window_activity} #{pane_current_path}").splitlines():
+        at, _, path = line.partition(" ")
+        if at.isdigit() and path:
+            found.append((float(at), Path(path)))
+    return found
+
+
+def start_folders(limit: int = 30) -> list[Path]:
+    """Where a new chat can start: the folders the user works in now (tmux session henchline), those Claude Code
+    trusts (as trusted_folders), then those the Cursor CLI trusts, most recent first in each, once each. Those
+    not from Claude's list pass typed_folder's rules (an existing folder of the user's, never home itself or its
+    credential folders) and are never inside a hidden folder: a machine without Claude still has folders to offer."""
+    out: list[Path] = []
+    seen: set[Path] = set()
+
+    def take(folder: Path, checked: bool) -> None:
+        try:
+            key = folder.resolve()
+        except (OSError, RuntimeError):
+            return
+        if key in seen:
+            return
+        if checked and (typed_folder(str(folder)) is None or any(part.startswith(".") for part in key.parts)):
+            return
+        seen.add(key)
+        out.append(folder if not checked else key)
+
+    for _, folder in sorted(tmux_folders(), key=lambda f: f[0], reverse=True):
+        take(folder, True)
+    for folder in trusted_folders(None):
+        take(folder, False)
+    for _, folder in sorted(cursor_trusted(), key=lambda f: f[0], reverse=True):
+        take(folder, True)
+    return out[:limit]
+
+
 def notice(title: str, words: str) -> None:
     """A notification on the user's phone through their own ntfy topic (handsfree's; never printed or logged)."""
     topic_file = Path.home() / ".config/ptt/ntfy-topic"
@@ -1011,12 +1066,51 @@ def typed_folder(given: str) -> Path | None:
     return path
 
 
+ASKS_TRUST = ("claude", "codex")  # the agents whose trust question a new chat may answer (tmux.accept_trust)
+
+
+def trusted_by(agent: str) -> set[Path]:
+    """The folders that agent itself trusts: Claude's list (trusted_folders), Codex's own (its config), the Cursor
+    CLI's markers. Anything running here can add to the last two, so they only ever say what the agent will do on
+    its own: a trust question is answered for the user only after their own confirm (crew_new)."""
+    if agent == "claude":
+        found = trusted_folders(None)
+    elif agent == "codex":
+        found = minions._codex_trusted()
+    elif agent == "cursor":
+        found = [folder for _, folder in cursor_trusted()]
+    else:
+        found = []
+    out = set()
+    for folder in found:
+        with contextlib.suppress(OSError, RuntimeError):
+            out.add(folder.resolve())
+    return out
+
+
+def trust_answer(agent: str, folder: Path, said_yes: bool) -> bool | None:
+    """Whether a new chat answers the agent's trust question for that folder: None when it won't ask (not one
+    that asks, or the folder already trusted by that agent), True only when the user said yes on the phone (a
+    typed folder, or trust: true after the same confirm), else False: the question waits in tmux. A listed
+    folder can come from anything running here (a tmux pane's folder, a Cursor marker): answering for it unseen
+    would let that folder's own settings run."""
+    if agent not in ASKS_TRUST or folder.resolve() in trusted_by(agent):
+        return None
+    return said_yes
+
+
 async def crew_folders(request: web.Request) -> web.Response:
-    """A new chat's choices: the folders it can start in and the agents installed."""
+    """A new chat's choices: the folders it can start in (start_folders), each with which installed agents
+    already trust it (trusted: {agent: bool}; an untrusted one gets the same confirm as a typed folder on the
+    phone), and the agents installed."""
     trusted(request)
-    folders = await asyncio.get_running_loop().run_in_executor(None, trusted_folders)
-    listed = [{"path": str(f), "name": "home" if f == Path.home() else f.name} for f in folders]
-    return web.json_response({"folders": listed, "agents": tmux.available()})
+    loop = asyncio.get_running_loop()
+    folders = await loop.run_in_executor(None, start_folders)
+    agents_here = tmux.available()
+    trusts = {agent: await loop.run_in_executor(None, trusted_by, agent) for agent in agents_here}
+    listed = [{"path": str(f), "name": "home" if f == Path.home() else f.name,
+               "trusted": {agent: f.resolve() in trusts[agent] for agent in agents_here}} for f in folders]
+    return web.json_response({"folders": listed, "agents": agents_here})
 
 
 def usage_of(target: Speaker) -> dict:
@@ -1379,12 +1473,13 @@ async def crew_new(request: web.Request) -> web.Response:
     try:
         body = await request.json()
         folder, agent, typed = str(body.get("folder", "")), str(body.get("agent", "claude")), bool(body.get("typed"))
+        confirmed = body.get("trust") is True  # the user said yes on the phone's confirm, as for a typed folder
         model = str(body.get("model", ""))
         settings = body.get("params") if isinstance(body.get("params"), dict) else {}
     except (ValueError, AttributeError):
         raise web.HTTPBadRequest(text="expected JSON")
     loop = asyncio.get_running_loop()
-    match = next((f for f in await loop.run_in_executor(None, trusted_folders) if str(f) == folder), None)
+    match = next((f for f in await loop.run_in_executor(None, start_folders) if str(f) == folder), None)
     if match is None and typed:  # a path the user typed (and confirmed trusting): any folder of theirs that exists
         match = typed_folder(folder)
         if match is None:
@@ -1401,16 +1496,14 @@ async def crew_new(request: web.Request) -> web.Response:
                                      {str(k): str(v) for k, v in settings.items()})
     if not tab:
         return web.json_response({"note": f"{agent} didn't start."}, status=500)
-    # Claude's question only comes for a typed folder (the listed ones are those it trusts); Codex keeps its own
-    # list, so it may ask about any folder: answered once that exact question is on screen (it may not come at all)
-    asks = agent == "codex" or (typed and agent == "claude"
-                                and match not in await loop.run_in_executor(None, trusted_folders))
-    if asks:
+    # A folder the agent doesn't trust yet makes it ask first: answered (once that exact question is on screen)
+    # only when the user said yes on the phone (trust_answer), else it waits in tmux
+    answer = await loop.run_in_executor(None, trust_answer, agent, match, typed or confirmed)
+    if answer is not None:
         name = agent.capitalize()
         wait = 8.0 if agent == "codex" else 12.0
-        accepted = await loop.run_in_executor(None, tmux.accept_trust, tab, match, agent, wait)
-        if accepted or typed:
-            log(HANDSFREE_LOG, f"{name}'s trust for {match} {'accepted' if accepted else 'left to answer in tmux'}")
+        accepted = answer and await loop.run_in_executor(None, tmux.accept_trust, tab, match, agent, wait)
+        log(HANDSFREE_LOG, f"{name}'s trust for {match} {'accepted' if accepted else 'left to answer in tmux'}")
         if accepted:  # said on the phone too: a request from anything else on the tailnet can't do this unseen
             loop.run_in_executor(None, notice, f"{name} now trusts a folder",
                                  f"Started from a new chat, {name}'s trust question was answered yes for {match.name}.")
@@ -3064,9 +3157,14 @@ class LocalHost:
         return to_agent(text, session_id, Heard.TEXTED, False)
 
     def chats(self) -> list[dict]:
+        # As the laptop's own list has them: the running agents (with their boss, for nesting, and their hard hat),
+        # then the ones heard lately that aren't running now (state gone or ended), as running: false
         listed = agents()
-        return [{"session_id": a["session"], "name": a["name"], "current": a["session"] == listed["current"]}
-                for a in listed["agents"]]
+        running = [{"session_id": a["session"], "name": a["name"], "current": a["session"] == listed["current"],
+                    "running": True, "state": "running", "agent": a["session"].split("-", 1)[0],
+                    "boss": a.get("boss", ""), "team": a.get("team", "")} for a in listed["agents"]]
+        return running + [{"session_id": o["session"], "name": o["name"], "current": False, "running": False,
+                           "state": o["state"], "agent": o["session"].split("-", 1)[0]} for o in listed["others"]]
 
     def texts(self) -> list[dict]:
         found = []

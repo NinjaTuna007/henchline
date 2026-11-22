@@ -363,18 +363,62 @@ async def revoke_device(request: web.Request, api: Api, signed_request: SignedRe
 
 
 async def chats(request: web.Request, api: Api, signed_request: SignedRequest) -> web.Response:
+    """The chats here (with_ledger), a page at a time. The cursor is an offset into a list that is built again for
+    each page and can change between them (a chat starts, a text arrives): a page may repeat or skip one. The phone
+    asks for limit=200, so a computer's list is one page in practice."""
     rid = signed_request.request_id
     limit = limit_of(request, rid)
     start = request.query.get("cursor", "")
     if start and not start.isdigit():
         raise ApiError(400, "invalid_request", "invalid cursor", request_id=rid)
-    listed = await asyncio.get_running_loop().run_in_executor(None, api.host.chats)
+    loop = asyncio.get_running_loop()
+    running = await loop.run_in_executor(None, api.host.chats)
+    listed = await loop.run_in_executor(None, with_ledger, api, running)
     offset = int(start or 0)
     page = listed[offset:offset + limit]
     more = offset + limit < len(listed)
     return ok(signed_request, {"host_id": api.config.host_id,
                                "chats": [{**chat, "host_id": api.config.host_id} for chat in page],
                                "next_cursor": str(offset + limit) if more else None})
+
+
+RECENT_CHAT = 3 * 86400  # a chat known only from its events is listed this long after its last one (as the laptop's)
+MAX_LAST = 200  # characters of a chat's last line in the list
+
+
+def last_of(row: Any) -> dict[str, Any]:
+    """A chat's newest event as its list entry shows it: when, and the line ({text, mine, kind})."""
+    try:
+        body = json.loads(row["body"])
+    except (ValueError, TypeError):
+        body = {}
+    content = body.get("content") if isinstance(body.get("content"), dict) else {}
+    text = body.get("text") if isinstance(body.get("text"), str) else content.get("text", "")
+    mine = row["kind"] == "message" or (row["kind"] == "call_line" and str(body.get("from", "")).lower() == "you")
+    return {"last_at": rfc3339(row["created_at"]),
+            "last": {"text": str(text or "")[:MAX_LAST], "mine": mine, "kind": row["kind"]}}
+
+
+def with_ledger(api: Api, chats: list[dict[str, Any]], now: float | None = None) -> list[dict[str, Any]]:
+    """The host's chats, each with its last line from the ledger (last_at, last), then the chats known only from
+    their events lately (a timer's or a script's texts: reminders-*; an agent no longer running), newest first,
+    as running: false; Reminders named so. Not the switchboard's own (handsfree-*)."""
+    cutoff = (time.time() if now is None else now) - RECENT_CHAT
+    latest = api.store.latest()
+    out = []
+    for chat in chats:
+        row = latest.get(str(chat.get("session_id", "")))
+        out.append({"running": True, **chat, **(last_of(row) if row is not None else {})})
+    seen = {str(chat.get("session_id", "")) for chat in chats}
+    for session, row in sorted(latest.items(), key=lambda item: item[1]["created_at"], reverse=True):
+        if session in seen or session.startswith("handsfree-") or row["created_at"] < cutoff:
+            continue
+        agent = session.split("-", 1)[0]
+        name = ("Reminders" if agent == "reminders" else agent.capitalize() if agent in ("claude", "cursor", "codex")
+                else session[:32])  # never nameless
+        out.append({"session_id": session, "name": name, "current": False, "running": False, "agent": agent,
+                    **last_of(row)})
+    return out
 
 
 async def chat_events(request: web.Request, api: Api, signed_request: SignedRequest) -> web.Response:

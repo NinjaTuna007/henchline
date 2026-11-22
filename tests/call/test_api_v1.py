@@ -564,5 +564,52 @@ class CallLines(Base):
         self.assertEqual([json.loads(r["body"])["text"] for r in self.store.events("claude-1", 50)], ["Done, tests pass."])
 
 
+class ChatList(Base):
+    """A host's chats with their last line, and the chats known only from their events lately (Reminders)."""
+
+    async def chats(self, key, device):
+        status, body = await self.call(key, device, "GET", "/api/v1/chats?limit=200")
+        self.assertEqual(status, 200, body)
+        return {c["session_id"]: c for c in body["chats"]}
+
+    async def test_a_running_chat_carries_its_last_line(self):
+        key, device = await self.enrolled()
+        now = time.time()
+        self.store.append_event("claude-1", "agent_text", json.dumps({"agent": "claude", "text": "Older."}).encode(), now=now - 20)
+        self.store.append_event("claude-1", "message", json.dumps({"content": {"type": "text", "text": "Thanks!"}}).encode(),
+                                now=now - 10)
+        self.store.append_event("claude-2", "call_line", json.dumps({"from": "you", "text": "Said."}).encode(), now=now - 5)
+        chats = await self.chats(key, device)
+        self.assertEqual(chats["claude-1"]["last"], {"text": "Thanks!", "mine": True, "kind": "message"})
+        self.assertEqual(chats["claude-1"]["last_at"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 10)))
+        self.assertTrue(chats["claude-2"]["last"]["mine"])
+        self.assertTrue(chats["claude-1"]["running"])
+        self.assertNotIn("last", chats["claude-3"])  # nothing kept for it yet
+        self.assertEqual(len(chats), 5)
+
+    async def test_reminders_and_lately_quiet_chats_are_listed_as_not_running(self):
+        key, device = await self.enrolled()
+        now = time.time()
+        for session, ago in (("reminders-desk", 60), ("reminders-reminders", 30), ("codex-gone", 90),
+                             ("handsfree-1", 10), ("reminders-old", 4 * 86400)):
+            self.store.append_event(session, "agent_text", json.dumps({"agent": "x", "text": session}).encode(), now=now - ago)
+        status, body = await self.call(key, device, "GET", "/api/v1/chats?limit=200")
+        extra = [c for c in body["chats"] if not c["running"]]
+        self.assertEqual([c["session_id"] for c in extra], ["reminders-reminders", "reminders-desk", "codex-gone"])  # newest first
+        self.assertEqual([c["name"] for c in extra], ["Reminders", "Reminders", "Codex"])  # never nameless
+        self.assertEqual(extra[0]["agent"], "reminders")
+        self.assertEqual(extra[0]["last"]["text"], "reminders-reminders")
+        self.assertEqual([c["session_id"] for c in body["chats"][:5]], [f"claude-{i}" for i in range(5)])  # running first
+
+    def test_a_chat_of_no_known_agent_is_named_by_its_key(self):
+        self.store.append_event("x" * 40, "agent_text", b"{}", now=time.time())
+        self.assertEqual(api_v1.with_ledger(self.api, [])[0]["name"], "x" * 32)
+
+    def test_an_unreadable_event_body_still_lists_its_chat(self):
+        self.store.append_event("reminders-x", "agent_text", b"not json", now=time.time())
+        listed = api_v1.with_ledger(self.api, [])
+        self.assertEqual(listed[0]["last"], {"text": "", "mine": False, "kind": "agent_text"})
+
+
 if __name__ == "__main__":
     unittest.main()

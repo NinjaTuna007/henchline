@@ -25,7 +25,9 @@ per phone). It is off unless asked for, and it needs `~/.config/henchline/host.j
 - Agents' texts to the phone are kept as chat history in `~/.local/share/henchline/host.sqlite3` for
   `ledger_days` (in host.json, default 30), so paired phones can read them; older ones are pruned and not
   taken in again. What is said on a call (your words as heard, the agents' talkback, lines typed in a terminal) is
-  kept there the same way, for phones that ask for it.
+  kept there the same way, for phones that ask for it. A paired phone's list of this computer's chats gives each
+  one's last line and time from that history, and also lists, as not running, the chats heard from in the last
+  three days that have no agent running now (a timer's or a script's texts, under Reminders).
 - With `"legacy_routes": true` in host.json's capabilities, the server's other routes (texts, agents, the
   call...) also take a request signed by a paired phone, as that phone (revoking it cuts it off there too).
   Unsigned requests still need the call page's Origin, unless `--signed-only` is also given: then only paired

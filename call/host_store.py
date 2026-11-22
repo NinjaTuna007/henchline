@@ -330,6 +330,17 @@ class HostStore:
         with self._lock, self._db:
             return self._db.execute("DELETE FROM host_events WHERE created_at < ?", (before,)).rowcount
 
+    def latest(self) -> dict[str, sqlite3.Row]:
+        """Each chat's newest event, by session: what a chat list shows as its last line and time."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT e.* FROM host_events e JOIN (SELECT session_id, MAX(created_at) AS at FROM host_events"
+                " GROUP BY session_id) m ON e.session_id=m.session_id AND e.created_at=m.at ORDER BY e.event_id"
+            ).fetchall()
+        # Two events at the very same time: the one whose (random) id sorts last stands for the chat, an arbitrary
+        # but stable pick, not the newer one
+        return {row["session_id"]: row for row in rows}
+
     def events(self, session_id: str, limit: int = 50,
                after: tuple[float, str] | None = None, without: tuple[str, ...] = ()) -> list[sqlite3.Row]:
         """A chat's events, oldest first; after=(created_at, event_id) of the last one already seen; without: kinds
