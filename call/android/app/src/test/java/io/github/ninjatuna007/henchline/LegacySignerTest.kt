@@ -90,6 +90,47 @@ class LegacySignerTest {
         assertNull(sign(once))
     }
 
+    @Test fun anUploadThatHashesItselfIsNeverWrittenToBeHashed() {
+        val data = "a shared file".toByteArray()
+        var written = 0
+        val upload = object : RequestBody(), SelfHashing {
+            override fun contentType() = null
+            override fun sha256Hex() = Canonical.sha256Hex(data)
+            override fun writeTo(sink: BufferedSink) { written++; sink.write(data) }
+        }
+        val signed = sign(Request.Builder().url("https://laptop.example.ts.net/share/file?name=a").post(upload).build())!!
+        assertEquals(0, written)  // no extra pass: its progress shows once, and a pipe is read once
+        assertEquals(Canonical.sha256Hex(data), signed.header("X-Henchline-Content-SHA256"))
+        assertTrue(verifies(signed, Canonical.sha256Hex(data)))
+    }
+
+    @Test fun anUploadThatCouldNotBeHashedFailsRatherThanGoUnsigned() {
+        var written = 0
+        val upload = object : RequestBody(), SelfHashing {
+            override fun contentType() = null
+            override fun sha256Hex(): String = throw java.io.IOException("No space left on device")
+            override fun writeTo(sink: BufferedSink) { written++ }
+        }
+        val request = Request.Builder().url("https://laptop.example.ts.net/share/file?name=a").post(upload).build()
+        val failed = runCatching { LegacySigning.signOrAsIs(request, listOf(host()), { key }) }.exceptionOrNull()
+        assertTrue(failed is UploadNotPrepared)
+        assertTrue(failed!!.message!!.contains("No space left"))
+        assertEquals(0, written)
+    }
+
+    @Test fun anyOtherSigningFailureSendsTheRequestAsBefore() {
+        val text = Request.Builder().url("https://laptop.example.ts.net/text").post("{}".toRequestBody()).build()
+        assertTrue(LegacySigning.signOrAsIs(text, listOf(host()), { throw IllegalStateException("keystore") }) === text)
+    }
+
+    @Test fun leftoverUploadCopiesAreSwept() {
+        val dir = kotlin.io.path.createTempDirectory().toFile()
+        java.io.File(dir, "a").writeText("x"); java.io.File(dir, "b").writeText("y")
+        UploadService.sweep(dir)
+        assertEquals(0, dir.listFiles()!!.size)
+        UploadService.sweep(java.io.File(dir, "missing"))  // no folder yet: nothing to do
+    }
+
     @Test fun aBodyThatCanBeReadOnlyOnceGoesUnsigned() {
         val oneShot = object : RequestBody() {
             override fun contentType() = null

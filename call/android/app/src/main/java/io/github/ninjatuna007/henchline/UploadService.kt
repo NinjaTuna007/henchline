@@ -35,6 +35,7 @@ class UploadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "Sharing with your crew", NotificationManager.IMPORTANCE_LOW))
+        if (busy == 0) sweep(java.io.File(cacheDir, COPIES))  // copies left by uploads a killed process never finished
         startForeground(PROGRESS, progress("Sharing with your crew…", 0, 0), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         if (intent == null) {
             if (busy == 0) stopSelf()
@@ -91,7 +92,9 @@ class UploadService : Service() {
         uris.forEachIndexed { i, uri ->
             val name = names.getOrNull(i) ?: "file"
             val answer = try {
-                post("$origin/share/file?name=${URLEncoder.encode(name, "UTF-8")}", origin, Streamed(uri, name, i + 1, uris.size))
+                Streamed(uri, name, i + 1, uris.size).use { body ->
+                    post("$origin/share/file?name=${URLEncoder.encode(name, "UTF-8")}", origin, body)
+                }
             } catch (e: Exception) {
                 JSONObject().put("note", e.message ?: "no connection")
             }
@@ -121,21 +124,64 @@ class UploadService : Service() {
             try { JSONObject(text) } catch (_: Exception) { JSONObject().put("note", "the laptop said ${answer.code}") }
         }
 
-    /** A shared file read straight from the app that shared it, never copied on the phone first. */
-    private inner class Streamed(val uri: Uri, val name: String, val n: Int, val of: Int) : RequestBody() {
+    /** A shared file read straight from the app that shared it, never copied on the phone first, unless it is to
+     *  be signed (a computer that takes signed requests, multi-host on) and its source can't be read twice (a pipe):
+     *  then the hashing pass keeps a private copy in the cache, sent from there and deleted after (close).
+     *  Signed, it is read twice: once quietly to hash it (no progress), then to send it. If the second read isn't
+     *  the same length as the first, the send fails here ("changed while it was being shared"); a change of the
+     *  same length is refused by the computer, which checks the digest. */
+    private inner class Streamed(val uri: Uri, val name: String, val n: Int, val of: Int) : RequestBody(), SelfHashing, AutoCloseable {
         private val size = try {
             contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use {
                 if (it.moveToFirst() && !it.isNull(0)) it.getLong(0) else -1L
             } ?: -1L
         } catch (_: Exception) { -1L }
+        @Volatile private var copy: java.io.File? = null
+        @Volatile private var hashed = -1L  // bytes read by the hashing pass; -1: not signed
 
         override fun contentType() = (contentResolver.getType(uri) ?: "application/octet-stream").toMediaTypeOrNull()
-        override fun contentLength() = size
+        override fun contentLength() = copy?.length() ?: size
+
+        private fun open(): java.io.InputStream = copy?.inputStream()
+            ?: contentResolver.openInputStream(uri) ?: throw java.io.IOException("can't read $name")
+
+        /** A file descriptor with a size can be read again; a pipe (size unknown to it) can't. */
+        private fun readableTwice(): Boolean = try {
+            contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize >= 0 } ?: false
+        } catch (_: Exception) { false }
+
+        override fun sha256Hex(): String {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val keep = if (copy != null || readableTwice()) null else java.io.File(java.io.File(cacheDir, COPIES).apply { mkdirs() },
+                java.util.UUID.randomUUID().toString())
+            if (keep != null && size >= 0 && cacheDir.usableSpace < size + KEEP_FREE)
+                throw UploadNotPrepared("not enough room on the phone to prepare $name (${Files.sizeText(size)})")
+            var read = 0L
+            try {
+                open().use { input ->
+                    (keep?.outputStream() ?: object : java.io.OutputStream() { override fun write(b: Int) {} }).use { out ->
+                        val buffer = ByteArray(1 shl 16)
+                        while (true) {
+                            val got = input.read(buffer)
+                            if (got < 0) break
+                            digest.update(buffer, 0, got); out.write(buffer, 0, got); read += got
+                            if (keep != null && read % (16L shl 20) < got && cacheDir.usableSpace < KEEP_FREE)  // size unknown up front
+                                throw UploadNotPrepared("not enough room on the phone to prepare $name")
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                keep?.delete(); throw e
+            }
+            copy = keep ?: copy  // a retried hop hashes the copy already made
+            hashed = read
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        }
 
         override fun writeTo(sink: BufferedSink) {
-            val input = contentResolver.openInputStream(uri) ?: throw IllegalStateException("can't read $name")
-            input.use {
+            open().use {
                 val buffer = ByteArray(1 shl 16)
+                val total = contentLength()
                 var sent = 0L
                 var shown = 0L
                 while (true) {
@@ -143,14 +189,18 @@ class UploadService : Service() {
                     if (got < 0) break
                     sink.write(buffer, 0, got)
                     sent += got
+                    if (hashed >= 0 && sent > hashed) break
                     if (sent - shown > 1 shl 20) {  // a megabyte at a time is enough for the bar
                         shown = sent
                         val title = if (of > 1) "Sharing $name ($n of $of)" else "Sharing $name"
-                        manager.notify(PROGRESS, progress(title, sent, size))
+                        manager.notify(PROGRESS, progress(title, sent, total))
                     }
                 }
+                if (hashed >= 0 && sent != hashed) throw java.io.IOException("$name changed while it was being shared")
             }
         }
+
+        override fun close() { copy?.delete(); copy = null }
     }
 
     private fun progress(title: String, sent: Long, size: Long): Notification =
@@ -173,6 +223,11 @@ class UploadService : Service() {
         }
 
         const val NAMES = "names"
+        const val COPIES = "uploads"  // in cacheDir: copies of uploads whose source can't be read twice, while signed
+        private const val KEEP_FREE = 64L shl 20  // a copy never leaves the phone with less than this free
+
+        /** Everything in the copies folder: called only when no upload is running in this process. */
+        fun sweep(dir: java.io.File) { dir.listFiles()?.forEach { it.delete() } }
         const val SNAP = "snap"  // from the call's camera button: kept for the next turn, not told at once
         const val INTO_CHAT = "into_chat"  // a share from another app: its lines in the chat come from here
         const val TEXT = "text"

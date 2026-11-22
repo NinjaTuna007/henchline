@@ -31,20 +31,37 @@ object LegacySigner : Interceptor {
         val request = chain.request()
         val ctx = context
         if (ctx == null || Build.VERSION.SDK_INT < MultiHost.MIN_SDK || !MultiHost.enabled(ctx)) return chain.proceed(request)
-        val signed = try {
-            LegacySigning.sign(request, HostRegistry.of(ctx).all(), keyFor = { host ->
-                if (HostKeys.exists("host", host.hostId)) HostKeys.forAuthority("host", host.hostId) else null  // never a new key
-            })
-        } catch (e: Exception) {
-            android.util.Log.w("LegacySigner", "not signed: ${e.javaClass.simpleName}")
-            null
-        }
-        return chain.proceed(signed ?: request)
+        return chain.proceed(LegacySigning.signOrAsIs(request, HostRegistry.of(ctx).all(), keyFor = { host ->
+            if (HostKeys.exists("host", host.hostId)) HostKeys.forAuthority("host", host.hostId) else null  // never a new key
+        }))
     }
 }
 
+/** A request body that hashes itself for signing, instead of being written out an extra time: an upload, whose
+ *  writing shows progress and whose source may not be readable twice. */
+interface SelfHashing {
+    /** Hex SHA-256 of exactly what writeTo will then send (or writeTo fails). */
+    fun sha256Hex(): String
+}
+
+/** An upload that couldn't be made ready to sign (its hashing pass failed: no room for its copy, a broken pipe).
+ *  It fails the request: never sent unsigned instead, since its source may already be used up. */
+class UploadNotPrepared(why: String, cause: Throwable? = null) : java.io.IOException(why, cause)
+
 /** The signing itself, apart from Android (tested on the JVM). */
 object LegacySigning {
+    /** The request signed, or as it was when signing it failed (logged): it then goes with its Origin, as before
+     *  signing existed. Except an upload whose hashing pass failed: that fails (UploadNotPrepared). */
+    fun signOrAsIs(request: Request, hosts: List<Host>, keyFor: (Host) -> RequestKey?,
+                   clock: () -> Long = { System.currentTimeMillis() / 1000 }): Request = try {
+        sign(request, hosts, keyFor, clock) ?: request
+    } catch (e: UploadNotPrepared) {
+        throw e
+    } catch (e: Exception) {
+        try { android.util.Log.w("LegacySigner", "not signed: ${e.javaClass.simpleName}") } catch (_: Throwable) {}
+        request
+    }
+
     /** Uploads the computer reads as they stream in: it checks them against the digest declared beside the signature. */
     val STREAMED = setOf("/share/file", "/voice-note")
 
@@ -63,7 +80,11 @@ object LegacySigning {
         val body = request.body
         if (body != null && (body.isOneShot() || body.isDuplex())) return null
         val key = keyFor(host) ?: return null
-        val digest = if (body == null) Canonical.sha256Hex(ByteArray(0)) else HashingSink.sha256(blackholeSink()).let { hashing ->
+        val digest = if (body == null) Canonical.sha256Hex(ByteArray(0))
+        else if (body is SelfHashing) try { body.sha256Hex() } catch (e: Exception) {
+            throw e as? UploadNotPrepared ?: UploadNotPrepared("couldn't prepare it to send (${e.message ?: e.javaClass.simpleName})", e)
+        }
+        else HashingSink.sha256(blackholeSink()).let { hashing ->
             val sink = hashing.buffer()
             body.writeTo(sink)
             sink.flush()

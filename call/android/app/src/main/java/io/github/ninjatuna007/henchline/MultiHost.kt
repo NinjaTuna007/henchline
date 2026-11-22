@@ -13,8 +13,10 @@ object MultiHost {
 
     fun available(): Boolean = Build.VERSION.SDK_INT >= MIN_SDK && selfTest
 
+    /** The switch first: with it off this is one preference read, and the Ed25519 self-test never runs (it is on
+     *  every request's path, through LegacySigner). */
     fun enabled(context: android.content.Context): Boolean =
-        available() && context.getSharedPreferences("call", android.content.Context.MODE_PRIVATE).getBoolean(PREF, false)
+        context.getSharedPreferences("call", android.content.Context.MODE_PRIVATE).getBoolean(PREF, false) && available()
 
     /** Once per process: this phone's Ed25519 and org.json agree with the laptop's vectors. */
     val selfTest: Boolean by lazy {
