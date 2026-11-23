@@ -18,7 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * move recorded first, so it can be given back), never copied, never deleted.
  */
 class ModelDownload(private val context: Context, private val spec: Spec,
-                    private val progress: (done: Long, total: Long, name: String) -> Unit) {
+                    private val progress: (done: Long, total: Long, name: String) -> Unit,
+                    private val stage: (DownloadPhase) -> Unit = {}) {  // checking files, or fetching one (reporting only)
 
     class Spec(
         val route: String,  // "/phone-voice": the manifest at <route>/manifest, the files at <route>/file/<name>
@@ -49,6 +50,7 @@ class ModelDownload(private val context: Context, private val spec: Spec,
      *  finds itself off Wi-Fi midway stops until Wi-Fi is back (what's fetched is kept). Copies already on the phone
      *  cost nothing and are taken only once the download goes ahead. */
     fun run(mobileOk: Boolean = false): Outcome {
+        stage(DownloadPhase.CHECKING)
         val origin = Files.origin(context) ?: return Outcome.Failed("Set the laptop's address in Settings first.")
         val manifest = try {
             Files.client.newCall(okhttp3.Request.Builder().url("$origin${spec.route}/manifest")
@@ -80,7 +82,7 @@ class ModelDownload(private val context: Context, private val spec: Spec,
         marker(spec.dir).delete()
         var done = have
         for (f in missing) {
-            fetch(origin, folder, f, done, total, mobileOk)?.let { return Outcome.Failed(it) }
+            fetch(origin, folder, f, done, total, mobileOk, last = f === missing.last())?.let { return Outcome.Failed(it) }
             done += f.size
         }
         marker(spec.dir).writeText(manifest.toString())
@@ -98,8 +100,10 @@ class ModelDownload(private val context: Context, private val spec: Spec,
         return null
     }
 
-    /** One file into "<name>.part" (resumed from what's there), checked, then put in place; null when it's whole. */
-    private fun fetch(origin: String, folder: File, f: Entry, before: Long, total: Long, mobileOk: Boolean): String? {
+    /** One file into "<name>.part" (resumed from what's there), checked, then put in place; null when it's whole.
+     *  last: the final one, whose check is reported as such (between files it stays "downloading"). */
+    private fun fetch(origin: String, folder: File, f: Entry, before: Long, total: Long, mobileOk: Boolean,
+                      last: Boolean): String? {
         val target = File(folder, f.name)
         target.parentFile?.mkdirs()
         val part = File(folder, "${f.name}.part")
@@ -110,6 +114,7 @@ class ModelDownload(private val context: Context, private val spec: Spec,
             Files.client.newCall(request.build()).execute().use { answer ->
                 if (!answer.isSuccessful) return "The laptop couldn't send ${f.name}."
                 val append = have > 0 && answer.code == 206
+                stage(DownloadPhase.DOWNLOADING)
                 java.io.FileOutputStream(part, append).use { out ->
                     var got = if (append) have else 0L
                     val input = answer.body!!.byteStream()
@@ -128,6 +133,7 @@ class ModelDownload(private val context: Context, private val spec: Spec,
                 }
             }
         } catch (e: Exception) { return "The download broke off: try again to carry on." }
+        if (last) stage(DownloadPhase.CHECKING)
         if (part.length() != f.size || sha256(part) != f.sha256) { part.delete(); return "${f.name} didn't match the laptop's copy: try again." }
         if (!part.renameTo(target)) return "Couldn't keep ${f.name} on this phone."
         return null
@@ -235,6 +241,14 @@ class ModelJob(private val threadName: String) {
         private set
     @Volatile var note: String? = null  // why the last one stopped, until the next starts
         private set
+    @Volatile var bytes = 0L  // the model's bytes on the phone so far (files already whole count), of size
+        private set
+    @Volatile var size = 0L  // the model's bytes in all; 0 until the laptop's list is read
+        private set
+    /** What it is doing: CHECKING or DOWNLOADING while it runs; once stopped, DONE, WAITING_WIFI, or null (cancelled,
+     *  failed, never run). */
+    @Volatile var phase: DownloadPhase? = null
+        private set
     private val listeners = java.util.concurrent.CopyOnWriteArraySet<() -> Unit>()
 
     fun listen(listener: () -> Unit) { listeners.add(listener) }
@@ -248,16 +262,28 @@ class ModelJob(private val threadName: String) {
     fun start(context: Context, spec: ModelDownload.Spec, mobileOk: Boolean, askMobile: ((Long) -> Unit)? = null,
               done: () -> Unit = {}) {
         if (job != null) return
-        val download = ModelDownload(context.applicationContext, spec) { got, total, _ ->
-            val now = if (total > 0) (got * 100 / total).toInt() else 0
-            if (now != percent) { percent = now; tell() }
-        }
-        note = null; percent = 0
+        val download = ModelDownload(context.applicationContext, spec, { got, all, _ ->
+            val now = if (all > 0) (got * 100 / all).toInt() else 0
+            // Told each whole percent and each megabyte (the sheets' "X of Y MB"), not every read
+            val moved = now != percent || got / 1_000_000 != bytes / 1_000_000 || all != size
+            bytes = got; size = all
+            if (moved) { percent = now; tell() }
+        }, { stage -> if (stage != phase) { phase = stage; tell() } })
+        // A run that carries on keeps the last amounts until the laptop's list is read (its bar doesn't drop to 0
+        // and climb back); one after a whole download starts from nothing
+        if (phase == DownloadPhase.DONE) { percent = 0; bytes = 0; size = 0 }
+        note = null; phase = DownloadPhase.CHECKING
         job = download
         tell()
         Thread {
             val outcome = try { download.run(mobileOk) } catch (e: Throwable) {
                 ModelDownload.Outcome.Failed("The download broke off: try again to carry on.")
+            }
+            phase = when {
+                outcome == ModelDownload.Outcome.Done -> DownloadPhase.DONE
+                outcome is ModelDownload.Outcome.Failed && outcome.why == ModelDownload.WAITING_WIFI -> DownloadPhase.WAITING_WIFI
+                outcome is ModelDownload.Outcome.AskMobile && askMobile == null -> DownloadPhase.WAITING_WIFI
+                else -> null
             }
             job = null
             note = when (outcome) {

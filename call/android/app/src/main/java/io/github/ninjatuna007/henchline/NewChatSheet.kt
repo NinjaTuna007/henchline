@@ -1613,14 +1613,20 @@ class VoicesSheet(
     private val onVoice: () -> Unit = {
         activity.runOnUiThread { body?.let { if (isOpen) draw(it) } }
     }
-    private var earsStatus: TextView? = null  // the speech model's progress line, updated without a redraw
+    private var earsBar: DownloadBar? = null  // the speech model's progress, moved without a redraw
     private var earsDrawnRunning = false
     private val onEars: () -> Unit = {
         activity.runOnUiThread {
             if (!isOpen) return@runOnUiThread
-            val status = earsStatus
-            if (PhoneAsr.download.job != null && earsDrawnRunning && status != null) status.text = earsDownloading()
-            else body?.let { draw(it) }
+            val bar = earsBar?.takeIf { it.isAttachedToWindow && earsDrawnRunning }
+            val job = PhoneAsr.download
+            val running = job.job != null
+            val phase = barPhase(job.phase, running, job.bytes)
+            when {
+                bar != null && running && phase != null -> bar.show(phase, job.bytes, job.size)
+                bar != null && !running && PhoneAsr.ready(activity) -> bar.finish { if (isOpen) body?.let { draw(it) } }
+                else -> body?.let { draw(it) }
+            }
         }
     }
 
@@ -1642,8 +1648,6 @@ class VoicesSheet(
         PhoneAsr.download.forget(onEars)
         if (CallService.Bus.voiceListener === onVoice) CallService.Bus.voiceListener = null
     }
-
-    private fun earsDownloading() = "Downloading… ${PhoneAsr.download.percent}%"
 
     /** "LISTENING ON THE PHONE": who hears the user on a call (PhoneEar), and the speech model it needs: its size,
      *  Download (Cancel while it runs; on mobile data the user is asked first, with the size), or Delete. */
@@ -1683,20 +1687,21 @@ class VoicesSheet(
             text = PhoneEar.line(chosen, ready); textSize = 13f; setTextColor(colour(R.color.muted))
         }, wide(8))
         val running = PhoneAsr.download.job != null
+        val justStopped = earsDrawnRunning && !running
         earsDrawnRunning = running
-        val status = TextView(activity).apply {
+        val ears = PhoneAsr.download
+        val phase = if (ready) null else barPhase(ears.phase, running, ears.bytes)
+        val grow = earsBar == null  // the sheet's first bar grows in; one redrawn (it paused, say) stays where it was
+        earsBar = phase?.let { DownloadBar(activity).apply { show(it, ears.bytes, ears.size, grow, justPaused = justStopped) } }
+        earsBar?.let { body.addView(it, wide(14)) }
+        if (!running && phase == null) body.addView(TextView(activity).apply {  // the bar says it while there is one
             textSize = 14f; setTextColor(colour(R.color.text))
-            text = when {
-                running -> earsDownloading()
-                ready -> "${PhoneAsr.NAME} · ready · ${PhoneAsr.sizeOnPhone(activity) / 1_000_000} MB on this phone"
-                else -> PhoneAsr.download.note ?: "${PhoneAsr.NAME} · about ${PhoneAsr.ABOUT_MB} MB, from your laptop (Wi-Fi)"
-            }
-        }
-        earsStatus = status
-        body.addView(status, wide(10))
+            text = if (ready) "${PhoneAsr.NAME} · ready · ${PhoneAsr.sizeOnPhone(activity) / 1_000_000} MB on this phone"
+                else PhoneAsr.download.note ?: "${PhoneAsr.NAME} · about ${PhoneAsr.ABOUT_MB} MB, from your laptop (Wi-Fi)"
+        }, wide(10))
         if (running) body.addView(quiet("Cancel") { PhoneAsr.download.cancel() },
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                gravity = Gravity.START; topMargin = px(4) })
+                gravity = Gravity.END; topMargin = px(6) })
         else if (!ready) body.addView(primary("Download the speech model").apply {
             setOnClickListener { startEars(body, mobileOk = false) }
         }, wide(8, px(52)))
