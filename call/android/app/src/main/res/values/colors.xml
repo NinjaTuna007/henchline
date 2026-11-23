@@ -16,4 +16,11 @@
     <color name="call_live">#4CD08A</color>
     <!-- Waiting for the user (a delegated chat finished: End or Keep) -->
     <color name="wait">#E0A93B</color>
+    <!-- Each computer's colour in the list (its card's tint, its heading's square): the laptop's, then the others'
+         by pairing order; the user can pick another -->
+    <color name="host_lavender">#A99BFF</color>
+    <color name="host_coral">#FF9E80</color>
+    <color name="host_sky">#7FB2FF</color>
+    <color name="host_rose">#F48FB1</color>
+    <color name="host_sand">#D9C08A</color>
 </resources>

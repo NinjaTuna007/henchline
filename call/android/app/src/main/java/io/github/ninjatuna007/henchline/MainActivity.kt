@@ -576,6 +576,7 @@ class MainActivity : Activity() {
         getSystemService(android.media.AudioManager::class.java).unregisterAudioDeviceCallback(devicesWatch)
         main.removeCallbacks(recordClock)
         lockHint?.dismiss(); lockHint = null
+        stopFold()  // a card's fold holds the views (and this screen) until it ends
         super.onDestroy()
     }
 
@@ -778,7 +779,12 @@ class MainActivity : Activity() {
      *  which agent (the user's choice, 2026-11-16). Ordered newest first, or grouped by project or by agent; the
      *  search box matches project and agent names first, then what was said, showing the matching line. */
     private fun showCrew() {
+        // A card folding or unfolding on the list: this redraw waits for it to end (then runs once)
+        // (Not when the list shows something else now, a tab or a screen changed mid-fold: that fold stops)
+        if (foldGuard.busy && (tab != "chats" || listScreen.visibility != View.VISIBLE)) stopFold()
+        if (!foldGuard.ask()) return
         crew.removeAllViews()
+        cards.clear()
         main.removeCallbacks(searchSoon)
         if (tab == "calls") return showCalls()
         if (tab == "usage") return showUsage()
@@ -859,16 +865,17 @@ class MainActivity : Activity() {
         }
         // A crew chat goes under its manager's row when that row is in the list; otherwise it keeps its own place
         val shown = if (query.isEmpty()) groups.flatMap { g -> g.second.map { it.session } }.toSet() else emptySet()
+        var into: LinearLayout = crew  // where rows go: the list, or a computer's card
         fun drawGroups(list: List<Pair<String, List<Chat>>>, inComputer: Boolean) {
             for ((heading, members) in list) {
-                if (heading.isNotEmpty() && members.any { nestedUnder(it.session, shown) == null }) crew.addView(sortHeading(heading, inComputer))
+                if (heading.isNotEmpty() && members.any { nestedUnder(it.session, shown) == null }) into.addView(sortHeading(heading, inComputer))
                 for (chat in members) {
                     if (nestedUnder(chat.session, shown) != null) continue  // drawn under its manager, wherever that is
-                    crew.addView(chatRow(chat.session, chat.agent, chat.project, chat.last, chat.found, state = chat.state))
+                    into.addView(chatRow(chat.session, chat.agent, chat.project, chat.last, chat.found, state = chat.state))
                     // Its crew right under it, indented (the user's pick, 2026-11-21: the hard-hat mock-up's nested list),
                     // even a helper working in another project. Not in a search: results stay flat.
                     if (query.isEmpty()) for (helper in byRecent.filter { bosses[it.session] == chat.session && it.session !in pins })
-                        crew.addView(chatRow(helper.session, helper.agent, helper.project, helper.last, helper.found, nested = true, state = helper.state))
+                        into.addView(chatRow(helper.session, helper.agent, helper.project, helper.last, helper.found, nested = true, state = helper.state))
                 }
             }
         }
@@ -878,6 +885,9 @@ class MainActivity : Activity() {
             // then the others in pairing order, each with the sort inside it. A search shows each one's hits flat.
             val now = System.currentTimeMillis()
             val folded = HostLists.collapsed(this)
+            // Each computer's colour: the user's pick, else the laptop's lavender and the others' by pairing order
+            val accents = ComputerCards.accents(LAPTOP, computers.map { it.hostId }, ComputerCards.chosen(this))
+                .mapValues { getColor(it.value.colourId) }
             // A pinned row, the laptop's or another computer's, and its helpers (HostLists.pinnedRows nests them)
             class Pin(val at: Long, val helpers: List<Pin>, val draw: (nested: Boolean) -> Unit)
             fun laptopPin(c: Chat, nested: Boolean = false): Pin = Pin(c.last?.optLong("at") ?: 0L,
@@ -891,7 +901,8 @@ class MainActivity : Activity() {
                     HostLists.pinKey(h.hostId, it.sessionId) !in pins && Strays.listed(it.state, false, false) }
                     .sortedByDescending { it.lastAt }.map { hostPin(h, all, it, nested = true) }) { inside ->
                 crew.addView(hostRow(h, c, seenThere, inside, where = h.label, dim = false,
-                    bossName = if (inside) all.firstOrNull { it.sessionId == c.boss }?.let { HostLists.named(it).first } else null))
+                    bossName = if (inside) all.firstOrNull { it.sessionId == c.boss }?.let { HostLists.named(it).first } else null,
+                    accent = accents[h.hostId]))
             }
             val pinRows = if (query.isNotEmpty()) emptyList() else pinned.map { laptopPin(it) } + computers.flatMap { h ->
                 val all = looks[h.hostId]?.summaries ?: emptyList()
@@ -904,10 +915,11 @@ class MainActivity : Activity() {
             val laptopChats = if (query.isEmpty()) groups.filter { it.first != "Pinned" } else listOf("" to byRecent)
             if (query.isEmpty() || byRecent.isNotEmpty()) {
                 val open = query.isNotEmpty() || LAPTOP !in folded
-                crew.addView(computerHeading(LAPTOP, HostPush.laptopLabel(this) ?: "This laptop",
+                into = computerCard(LAPTOP, HostPush.laptopLabel(this) ?: "This laptop",
                     if (names.isNotEmpty()) HostLists.Dot.LIVE else HostLists.Dot.UNKNOWN, "",
-                    rest.sumOf { unread(it.session, it.last) }, open, null))
+                    rest.sumOf { unread(it.session, it.last) }, open, null, accents.getValue(LAPTOP))
                 if (open) drawGroups(laptopChats.filter { it.second.isNotEmpty() }, inComputer = true)
+                into = crew
             }
             for (h in computers) {
                 val look = looks[h.hostId]
@@ -917,16 +929,16 @@ class MainActivity : Activity() {
                 if (query.isNotEmpty() && drawn.isEmpty()) continue
                 val (dot, words) = HostLists.status(look, now)
                 val open = query.isNotEmpty() || h.hostId !in folded
-                crew.addView(computerHeading(h.hostId, h.label, dot, words,
+                val body = computerCard(h.hostId, h.label, dot, words,
                     summaries.map { it.sessionId }.toSet().let { all -> summaries.count { !HostLists.inPinned(it, hostPins, all) &&
                         HostLists.unread(it, seenThere[HostLists.pinKey(h.hostId, it.sessionId)] ?: 0L) } },
-                    open, h))
+                    open, h, accents.getValue(h.hostId))
                 if (!open) continue
-                if (summaries.isEmpty() && dot == HostLists.Dot.OFFLINE) crew.addView(quietLine("Can't reach ${h.label} right now."))
+                if (summaries.isEmpty() && dot == HostLists.Dot.OFFLINE) body.addView(quietLine("Can't reach ${h.label} right now."))
                 val dim = dot == HostLists.Dot.OFFLINE
                 for ((heading, members) in drawn) {
-                    if (heading.isNotEmpty()) crew.addView(sortHeading(heading, inComputer = true))
-                    for ((c, nested) in members) crew.addView(hostRow(h, c, seenThere, nested, where = "", dim = dim,
+                    if (heading.isNotEmpty()) body.addView(sortHeading(heading, inComputer = true))
+                    for ((c, nested) in members) body.addView(hostRow(h, c, seenThere, nested, where = "", dim = dim,
                         bossName = summaries.firstOrNull { it.sessionId == c.boss }?.let { HostLists.named(it).first }))
                 }
             }
@@ -2623,6 +2635,10 @@ class MainActivity : Activity() {
         })
         words.addView(top)
         val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        // Pinned from another computer: a small dot of that computer's colour before its name
+        if (remote?.accent != null && !remote.where.isNullOrEmpty()) bottom.addView(View(this).apply {
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(remote.accent) }
+        }, LinearLayout.LayoutParams(dp(ComputerCards.PIN_DOT_DP), dp(ComputerCards.PIN_DOT_DP)).apply { marginEnd = dp(6) })
         TextView(this).apply {
             // A workflow running in it says so instead of the last line (the design review, 2026-11-17)
             val flow = flows[session]?.takeIf { found.isEmpty() && remote == null }
@@ -2652,16 +2668,17 @@ class MainActivity : Activity() {
 
     /** A chat on another paired computer, as its row is drawn (chatRow): which computer, its hard hat, its boss's
      *  name for "Crew of", whether it's unread, the computer's name when it is drawn outside its group (Pinned),
-     *  and greyed while that computer can't be reached. */
-    private class Remote(val host: Host, val team: String, val bossName: String?, val unread: Int, val where: String, val dim: Boolean)
+     *  and greyed while that computer can't be reached; drawn outside its group, its computer's colour (accent). */
+    private class Remote(val host: Host, val team: String, val bossName: String?, val unread: Int, val where: String, val dim: Boolean,
+                         val accent: Int? = null)
 
     private fun hostRow(host: Host, c: ChatSummary, seen: Map<String, Long>, nested: Boolean, where: String, dim: Boolean,
-                        bossName: String? = null): View {
+                        bossName: String? = null, accent: Int? = null): View {
         val (agent, project) = HostLists.named(c)
         val last = if (c.lastAt > 0 || c.lastText.isNotEmpty()) JSONObject().put("at", c.lastAt).put("text", c.lastText).put("mine", c.lastMine) else null
         val unread = if (HostLists.unread(c, seen[HostLists.pinKey(host.hostId, c.sessionId)] ?: 0L)) 1 else 0
         val state = if (c.running) "" else c.state.ifEmpty { if (HostChatRules.isReminders(c.sessionId)) "" else "gone" }
-        return chatRow(c.sessionId, agent, project, last, "", nested, state, Remote(host, c.team, bossName, unread, where, dim))
+        return chatRow(c.sessionId, agent, project, last, "", nested, state, Remote(host, c.team, bossName, unread, where, dim, accent))
     }
 
     /** The small uppercase heading of a sort group (By project, By agent) or of Pinned; inside a computer, a little
@@ -2676,20 +2693,71 @@ class MainActivity : Activity() {
         text = words; setTextColor(getColor(R.color.muted)); textSize = 14f; setPadding(dp(20), dp(8), dp(20), dp(8))
     }
 
-    /** A computer's heading in the list (multi-host): a dot (reachable, offline, messages waiting), its name, a few
-     *  words of state, the unread count when folded, and a chevron. A tap folds it; a long press offers Refresh and
-     *  the computer's settings. */
-    private fun computerHeading(key: String, label: String, dot: HostLists.Dot, words: String, unread: Int, open: Boolean, host: Host?): View {
+    /** A computer's card in the list (multi-host), added to it; its rows go in the returned body. The card is the
+     *  surface tinted with the computer's colour (accent), with a 56 dp heading: a square of that colour with the
+     *  computer's glyph and a dot (reachable, offline, messages waiting) on its corner, its name, a few words of
+     *  state, the unread count when folded, and a chevron. Folded, it is just that heading, as a pill; offline, it
+     *  is plain and muted. A tap folds or unfolds it; a long press offers New chat, Refresh, its colour and the
+     *  computer's settings. */
+    private fun computerCard(key: String, label: String, dot: HostLists.Dot, words: String, unread: Int, open: Boolean,
+                             host: Host?, accent: Int): LinearLayout {
+        val offline = dot == HostLists.Dot.OFFLINE
+        val surface = getColor(R.color.surface)
+        val fill = if (offline) surface else ComputerCards.mix(surface, accent, ComputerCards.TINT)
+        val cardShape = GradientDrawable().apply {
+            setColor(fill)
+            cornerRadius = dp(if (open) ComputerCards.RADIUS_DP else ComputerCards.HEADING_DP / 2).toFloat()
+        }
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardShape
+            clipToOutline = true  // the heading's ripple and the rows stay inside the rounded corners
+        }
         val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; minimumHeight = dp(48)
-            setPadding(dp(20), 0, dp(8), 0)
-            setOnClickListener { HostLists.setCollapsed(this@MainActivity, key, open); showCrew() }
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), 0, dp(8), 0)
+            // Its state as kept now, not as drawn: a tap while it folds turns it back
+            setOnClickListener { fold(key, key !in HostLists.collapsed(this@MainActivity)) }
             setOnLongClickListener {
                 performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
-                computerMenu(label, host); true
+                computerMenu(key, label, host); true
+            }
+            // Read out as one: its name, state, unread count and whether it is folded; expand and collapse offered
+            contentDescription = ComputerCards.describe(label, words, unread, open)
+            if (Build.VERSION.SDK_INT >= 30) stateDescription = if (open) "Expanded" else "Collapsed"
+            accessibilityDelegate = object : View.AccessibilityDelegate() {
+                override fun onInitializeAccessibilityNodeInfo(v: View, info: android.view.accessibility.AccessibilityNodeInfo) {
+                    super.onInitializeAccessibilityNodeInfo(v, info)
+                    info.addAction(if (open) android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_COLLAPSE
+                        else android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction.ACTION_EXPAND)
+                }
+                override fun performAccessibilityAction(v: View, action: Int, args: android.os.Bundle?): Boolean {
+                    val expand = android.view.accessibility.AccessibilityNodeInfo.ACTION_EXPAND
+                    val collapse = android.view.accessibility.AccessibilityNodeInfo.ACTION_COLLAPSE
+                    if (action == expand || action == collapse) {
+                        val nowOpen = key !in HostLists.collapsed(this@MainActivity)
+                        if (nowOpen == (action == collapse)) fold(key, nowOpen)
+                        return true
+                    }
+                    return super.performAccessibilityAction(v, action, args)
+                }
             }
         }
-        row.addView(View(this).apply {
+        val square = android.widget.FrameLayout(this).apply {
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS  // the glyph and the dot
+        }
+        square.addView(ImageView(this).apply {
+            setImageResource(if (host == null) R.drawable.ic_laptop else R.drawable.ic_computer)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            imageTintList = android.content.res.ColorStateList.valueOf(getColor(R.color.navy))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            background = GradientDrawable().apply {
+                setColor(if (offline) getColor(R.color.muted) else accent); cornerRadius = dp(10).toFloat()
+            }
+        }, android.widget.FrameLayout.LayoutParams(dp(ComputerCards.SQUARE_DP), dp(ComputerCards.SQUARE_DP)))
+        square.addView(View(this).apply {
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(getColor(when (dot) {
@@ -2697,10 +2765,14 @@ class MainActivity : Activity() {
                     HostLists.Dot.WAITING -> R.color.wait
                     else -> R.color.muted
                 }))
+                setStroke(dp(2), fill)  // a ring of the card's colour, cutting it from the square
             }
-        }, LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginEnd = dp(10) })
+        }, android.widget.FrameLayout.LayoutParams(dp(12), dp(12), Gravity.END or Gravity.BOTTOM))
+        row.addView(square, LinearLayout.LayoutParams(dp(ComputerCards.SQUARE_DP + 4), dp(ComputerCards.SQUARE_DP + 4))
+            .apply { marginEnd = dp(12) })
         row.addView(TextView(this).apply {
-            text = label; setTextColor(getColor(R.color.text)); textSize = 15f; typeface = android.graphics.Typeface.DEFAULT_BOLD
+            text = label; setTextColor(getColor(if (offline) R.color.muted else R.color.text)); textSize = 15f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
             maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
         }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         row.addView(TextView(this).apply {
@@ -2713,11 +2785,112 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER; minWidth = dp(22); setPadding(dp(6), dp(1), dp(6), dp(1))
             background = GradientDrawable().apply { setColor(getColor(R.color.cyan)); cornerRadius = dp(11).toFloat() }
         }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(8) })
-        row.addView(TextView(this).apply {
-            text = if (open) "⌄" else "›"; setTextColor(getColor(R.color.muted)); textSize = 20f; gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(dp(32), LinearLayout.LayoutParams.WRAP_CONTENT))
-        return row.also { it.layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) } }
+        val chevron = ImageView(this).apply {
+            setImageResource(R.drawable.ic_expand)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            imageTintList = android.content.res.ColorStateList.valueOf(getColor(R.color.muted))
+            scaleType = ImageView.ScaleType.CENTER
+            rotation = ComputerCards.chevronAngle(if (open) 1f else 0f)
+        }
+        row.addView(chevron, LinearLayout.LayoutParams(dp(32), dp(32)))
+        // The heading is read as one (its description): its parts aren't read again on their own
+        for (i in 0 until row.childCount) row.getChildAt(i).importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        card.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(ComputerCards.HEADING_DP)))
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(8))
+            visibility = if (open) View.VISIBLE else View.GONE
+        }
+        card.addView(body, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        crew.addView(card, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            val gap = dp(ComputerCards.GAP_DP)
+            setMargins(gap, gap, gap, 0)
+        })
+        cards[key] = Card(card, cardShape, body, chevron)
+        return body
+    }
+
+    /** A computer's card as drawn last, for its fold to move. */
+    private class Card(val card: LinearLayout, val shape: GradientDrawable, val body: LinearLayout, val chevron: ImageView)
+    private val cards = HashMap<String, Card>()
+    private val foldGuard = RedrawGuard()
+
+    private var folding: android.animation.ValueAnimator? = null  // a card's fold, while it runs
+    private var foldingKey = ""
+    private var foldTurn = 0  // a fold stopped short: its end does nothing
+
+    /** The running fold stopped where it is (its end not run); the caller redraws the list. */
+    private fun stopFold() {
+        foldTurn++
+        folding?.cancel(); folding = null
+        foldGuard.reset()
+    }
+
+    /** Every view under view enabled or not: rows fading out of a folding card can't be tapped. */
+    private fun setTreeEnabled(view: View, on: Boolean) {
+        view.isEnabled = on
+        if (view is android.view.ViewGroup) for (i in 0 until view.childCount) setTreeEnabled(view.getChildAt(i), on)
+    }
+
+    /** A computer's card folded (wasOpen) or unfolded: kept so, then moved there. Its rows' height closes in 250 ms
+     *  or opens in 400, the rows fading out early (and no longer tappable) or in late, the chevron turning half a
+     *  turn and the corners rounding to a pill or back; a card of many rows only fades them. The list isn't redrawn
+     *  meanwhile (the guard holds a redraw until it ends). A tap during a fold turns it back from where it is (the
+     *  same card) or stops it (another). At once in a search (every card is open there) or with animations off. */
+    private fun fold(key: String, wasOpen: Boolean) {
+        HostLists.setCollapsed(this, key, wasOpen)
+        val searching = ::search.isInitialized && search.text.toString().trim().isNotEmpty()
+        // Mid-fold: the same card turns back from the height it has reached; another's fold stops, drawn as kept
+        var from = -1
+        if (foldGuard.busy) {
+            val same = foldingKey == key
+            if (same) from = cards[key]?.body?.height ?: -1
+            stopFold()
+            if (!same && wasOpen) showCrew()  // (unfolding redraws below anyway)
+        }
+        if (!Motion.on() || searching) return showCrew()
+        val opening = !wasOpen
+        if (opening) showCrew()  // the rows exist only once it is drawn open
+        val c = cards[key] ?: return
+        val body = c.body
+        val gap = dp(ComputerCards.GAP_DP)
+        // Its rows' whole height (measured: a card turned back mid-fold is only part open)
+        val full = run {
+            val width = (crew.width - 2 * gap).coerceAtLeast(0)
+            body.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
+            body.measuredHeight
+        }
+        if (full <= 0 || crew.width == 0) return if (opening) Unit else showCrew()
+        val start = if (from in 0..full) from else if (opening) 0 else full
+        val openR = dp(ComputerCards.RADIUS_DP).toFloat()
+        val foldedR = dp(ComputerCards.HEADING_DP / 2).toFloat()
+        val fade = ComputerCards.crossfades(body.childCount)
+        val params = body.layoutParams
+        if (!opening) setTreeEnabled(body, false)
+        fun frame(t: Float) {
+            val target = if (opening) full else 0
+            val height = ComputerCards.heightAt(t, start, target)
+            val openness = height.toFloat() / full
+            if (!fade) { params.height = height; body.layoutParams = params }
+            body.alpha = if (fade) (if (opening) t else 1f - t) else ComputerCards.rowsAlpha(if (opening) openness else 1f - openness, opening)
+            c.chevron.rotation = ComputerCards.chevronAngle(openness)
+            c.shape.cornerRadius = ComputerCards.cornerAt(openness, openR, foldedR)
+            c.card.invalidateOutline()
+        }
+        foldGuard.begin()
+        foldingKey = key
+        val mine = ++foldTurn
+        frame(0f)
+        folding = Motion.run(ComputerCards.foldMs(opening), Motion.emphasized, ::frame) {
+            if (mine != foldTurn) return@run  // stopped short: whoever stopped it draws
+            folding = null
+            body.alpha = 1f
+            params.height = LinearLayout.LayoutParams.WRAP_CONTENT; body.layoutParams = params
+            // Folded: drawn again as its pill (with its unread count); unfolded: only if a redraw was held back
+            if (foldGuard.end() || !opening) showCrew()
+        }
     }
 
     /** The other paired computers whose chats the list shows (multi-host on): none means the list is as before. */
@@ -2739,10 +2912,16 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun computerMenu(label: String, host: Host?) {
+    private fun computerMenu(key: String, label: String, host: Host?) {
         panel = ActionsSheet(this, label, if (host == null) "This phone's laptop" else host.baseUrl, buildList {
             add(Triple("➕", "New chat on $label") { newChat(host?.hostId ?: LAPTOP) })
             add(Triple("↻", "Refresh") { if (host == null) findCrew() else HostLists.refresh(this@MainActivity, host) })
+            add(Triple("🎨", "Colour") {
+                val all = ComputerCards.accents(LAPTOP, otherComputers().map { it.hostId }, ComputerCards.chosen(this@MainActivity))
+                val now = all[key] ?: ComputerCards.defaultAccent(-1)
+                panel = AccentSheet(this@MainActivity, label, now) { ComputerCards.choose(this@MainActivity, key, it); showCrew() }
+                    .also { it.show() }
+            })
             if (host != null && Build.VERSION.SDK_INT >= MultiHost.MIN_SDK) add(Triple("⚙", "Computer settings") { HostsSheet(this@MainActivity).show() })
         }).also { it.show() }
     }
