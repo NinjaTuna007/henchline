@@ -18,15 +18,14 @@ import numpy as np
 from faster_whisper.vad import get_speech_timestamps
 
 import routing
-from routing import Heard, Meaning
+from routing import Heard
 from sensing import PER_SECOND, RATE, SPEECH, level
 from talkover import TalkOver, our_own_words, own_share, word_keys
 from voicegate import START_DB
 from voice.speech import nemotron, whisper
-from voice.state import (BY_HANDSFREE, CALL_HANGUP, CALL_PUSH, HANDSFREE_LOG, HANDSFREE_WAV, Phase, in_call,
-                         last_speaker, log, ptt_busy, release_phase, set_phase, set_target)
+from voice.state import (BY_HANDSFREE, CALL_PUSH, HANDSFREE_LOG, HANDSFREE_WAV, Phase, in_call, log, ptt_busy,
+                         release_phase, set_phase, set_target)
 
-THINK_WINDOW = 180  # seconds after "give me a minute"
 BUDS_LEAVING = 1.0  # seconds: buds that disconnect this soon before a tap turn starts, or during it, drop it
 WAIT_FOR_WORDS = 5.0  # after the wake word, seconds to start talking before it gives up
 CHIME_GRACE = 1.2  # the listening chime is loud in the mic; it must not count as them starting, then the pause close the turn
@@ -262,44 +261,11 @@ class Turn:
             HANDSFREE_WAV.unlink(missing_ok=True)
 
     def act(self, text: str, rich: str, heard: Heard) -> float | None:
-        meaning = routing.meaning(text)
-        # Before anything is said or sent: talkback may speak again, and knows whether an agent got words
-        to = last_speaker() if meaning is Meaning.MESSAGE else None  # who deliver() will type it to
-        set_target(meaning is Meaning.MESSAGE, to.session if to else "")
-        set_phase(Phase.IDLE, BY_HANDSFREE)
-        if meaning is Meaning.TIME:
-            log(HANDSFREE_LOG, "heard: give me a minute")
-            routing.say("Take your time.")
-            return THINK_WINDOW
-        if meaning is Meaning.ROUTING:
-            if routing.route(text, self.last_message):
-                whisper.ding(self.cfg)
-            return 0.0
-        if meaning is Meaning.HANGUP:
-            log(HANDSFREE_LOG, "heard: hang up")
-            if in_call():  # it may have ended while the words were transcribed
-                goodbye = routing.say("Bye! Hanging up.")
-                # Only once the goodbye is queued: the server ends the call when talkback has nothing left to say,
-                # and until say.py has run, there is nothing in the queue yet
-                threading.Thread(target=lambda: (goodbye.wait(timeout=15), CALL_HANGUP.touch()), daemon=True).start()
-            return None
-        if meaning is Meaning.OFF:
-            log(HANDSFREE_LOG, "heard: hands-free off")
-            self.stop.set()
-            routing.say("Hands-free off.")
-        elif meaning is Meaning.CANCEL:
-            log(HANDSFREE_LOG, "heard: never mind")
-        elif meaning is Meaning.NOTHING:
-            log(HANDSFREE_LOG, f"ignored {len(text.split())} words")
-            if heard is Heard.OVER_YOU:  # nothing said over a clip: our echo cut it; no cut-resume-cut loop
-                self.echo_slipped("echo cut a clip")
-            return None
-        elif routing.deliver(rich, heard, to=to, urgent=cut_in(heard, to)):  # the one noted as the target above
-            whisper.ding(self.cfg)
-            self.last_message = (rich, heard)
-            if routing.interrupt_waiting():
-                routing.clear_interrupt()
-        return THINK_WINDOW if routing.THINK.search(text) else 0.0
+        def sent(message: tuple[str, Heard]) -> None:
+            self.last_message = message
+
+        return routing.act_on_turn(text, rich, heard, self.last_message, ding=lambda: whisper.ding(self.cfg),
+                                   off=self.stop.set, echo=self.echo_slipped, sent=sent)
 
     def sentence_done(self, longer: int = 0) -> bool:
         """Nemotron's words so far end a sentence, not on a filler or a word that leads on: no need to wait out the
@@ -331,22 +297,3 @@ class Turn:
             except Exception as exc:
                 log(HANDSFREE_LOG, f"whistle failed ({exc}): Whisper checks for over")
         return bool(OVER.search(self.transcriber.quick_text(tail).strip()))
-
-
-ON_THE_CALL = (Heard.CALL, Heard.PUSHED, Heard.OVER_YOU, Heard.FOLLOW_ON, Heard.REPLY)
-# Hands-free, including the wake word and "give me a minute": the words are the turn, and the Cursor CLI parks
-# them until it finishes. Push-to-talk does not come through here, so it still queues.
-HANDS_FREE = (Heard.WOKE, Heard.REPLY, Heard.THINK, Heard.FOLLOW_ON, Heard.OVER_YOU)
-
-
-def cut_in(heard: Heard, to: routing.Speaker | None) -> bool:
-    """A spoken turn cuts into the Cursor CLI, on a call or over hands-free, or it sits in the follow-up queue.
-    On a call the phone can choose to let it wait. Off a call, hands-free to that CLI steers, wake word included.
-    Claude and Codex wait unless the call says to cut in."""
-    if not in_call():
-        if heard not in HANDS_FREE:
-            return False
-        return bool(to and to.agent == "cursor" and not to.in_editor)
-    if heard is Heard.WOKE or heard not in ON_THE_CALL:
-        return False
-    return routing.interrupt_waiting() or routing.cuts_in(to)

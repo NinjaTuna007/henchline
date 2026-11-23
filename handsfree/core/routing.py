@@ -17,16 +17,19 @@ import threading
 import time
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 from voice import snaps
 from voice.delivery import Delivery, Refusal
 from voice.agents import SPOKEN_TO, identity, process, started
 from voice.desktop import Tab, current as desktop, cursor_bridge, cursor_cdp
-from voice.state import (AWAY, BY_HANDSFREE, file_lock, CALL_CUT_IN, CALL_INTERRUPT, CALL_PINNED, CALL_RING_NOTE, CALL_TOLD, CHAT_KEY, HANDSFREE_LOG, INTRODUCED, LAST, LISTEN, SPEAKERS, STATE, Sent,
-                         Speaker, in_call, last_speaker, log, read_json, recent_speakers, renamed)
+from voice.state import (AWAY, BY_HANDSFREE, file_lock, CALL_CUT_IN, CALL_HANGUP, CALL_INTERRUPT, CALL_PINNED, CALL_RING_NOTE, CALL_TOLD, CHAT_KEY, HANDSFREE_LOG, INTRODUCED, LAST, LISTEN, SPEAKERS, STATE, Phase, Sent,
+                         Speaker, in_call, last_speaker, log, read_json, recent_speakers, renamed, set_phase, set_target)
 
 SAY = Path(__file__).resolve().parents[2] / "talkback/scripts/say.py"
 AFTER_SWITCH = 30.0  # seconds to start talking after "Now talking to …"
+THINK_WINDOW = 180  # seconds after "give me a minute"
+PHONE_EARS = "phone ears"  # the phone transcribed the words, not the laptop
 
 
 class Heard(str, Enum):
@@ -680,21 +683,22 @@ def is_command(text: str, speaker: Speaker | None) -> bool:
 
 
 def deliver(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = False,
-            sender: str | None = None) -> Delivery:
+            sender: str | None = None, ear: str = "") -> Delivery:
     """`deliver_words`, with the photos the user took on the call screen since the last turn going along with these
-    words (a spoken or typed turn on a call; a command, a text or a share carries none). Put back if not delivered."""
+    words (a spoken or typed turn on a call; a command, a text or a share carries none). Put back if not delivered.
+    ear: "phone" when the phone, not the laptop, transcribed the words (said in their tag)."""
     from voice import chains
     # A child's report is not the user's turn: no call photos, and it does not move the pinned call.
     if text.lstrip().startswith(chains.REPORT) or sender is not None:
         return deliver_words(text, heard, to, urgent, sender=sender)
     speaker = to or last_speaker()
     if not in_call() or heard in PHONE or heard is Heard.SCHEDULED or speaker is None or is_command(text, speaker):
-        return deliver_words(text, heard, to, urgent)
+        return deliver_words(text, heard, to, urgent, ear=ear)
     photos = snaps.take(speaker.session)
     claimed = claim_ring_note()  # this turn's alone: two turns delivered at once can't both carry it
     delivered: Delivery | None = None
     try:
-        delivered = deliver_words(text, heard, to, urgent, snaps.words(photos), before=ring_note(claimed))
+        delivered = deliver_words(text, heard, to, urgent, snaps.words(photos), before=ring_note(claimed), ear=ear)
     finally:
         if photos and not delivered:
             snaps.put_back(photos)
@@ -728,13 +732,14 @@ def ring_note(claimed: Path | None) -> str:
 
 
 def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = False,
-                  extra: str = "", sender: str | None = None, before: str = "") -> Delivery:
+                  extra: str = "", sender: str | None = None, before: str = "", ear: str = "") -> Delivery:
     """Type the words, tagged with how they were heard, to `to`, or else to the agent that spoke last. When it
     can't, says why out loud and returns the reason, for the phone to show too. urgent: the phone's
     "send now" (held send button): the agent's work is interrupted first, so the words reach it at once instead of
     waiting in its queue (Escape in a terminal; in a Cursor chat, Enter again, which sends a queued message now).
     sender: the words are a reminder an agent (or a script, "") set, not the user: tagged with who set it and never
-    typed as a slash command, so one agent can't run another's commands or pass for the user."""
+    typed as a slash command, so one agent can't run another's commands or pass for the user. ear: "phone" when
+    the phone transcribed the words: "[hands-free · call · phone ears]" (no tone marks, names may be misheard)."""
     from voice import chains
     from voice.desktop import typeable
     # No control characters from anywhere (a shared web page, a child's report, a reminder): an ESC or a carriage
@@ -748,6 +753,8 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
     # when it starts with "/", so no tag, introduction or call note in front of it (none of those is then given)
     command = report or (sender is None and is_command(text, speaker))
     tag = heard.tag if sender is None else Heard.SCHEDULED.tagged(sender)
+    if ear == "phone" and sender is None:
+        tag = f"{tag[:-1]} · {PHONE_EARS}]"
     message = text.strip() if command \
         else f"{tag} {introduce(speaker, heard)}{on_a_call(speaker, heard)}{before}{text}{extra}"
     if speaker is None:
@@ -860,3 +867,74 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
         introduced(speaker, heard)
         told_on_call(speaker, heard)
     return Delivery.done()
+
+
+ON_THE_CALL = (Heard.CALL, Heard.PUSHED, Heard.OVER_YOU, Heard.FOLLOW_ON, Heard.REPLY)
+# Hands-free, including the wake word and "give me a minute": the words are the turn, and the Cursor CLI parks
+# them until it finishes. Push-to-talk does not come through here, so it still queues.
+HANDS_FREE = (Heard.WOKE, Heard.REPLY, Heard.THINK, Heard.FOLLOW_ON, Heard.OVER_YOU)
+
+
+def cut_in(heard: Heard, to: Speaker | None) -> bool:
+    """A spoken turn cuts into the Cursor CLI, on a call or over hands-free, or it sits in the follow-up queue.
+    On a call the phone can choose to let it wait. Off a call, hands-free to that CLI steers, wake word included.
+    Claude and Codex wait unless the call says to cut in."""
+    if not in_call():
+        if heard not in HANDS_FREE:
+            return False
+        return bool(to and to.agent == "cursor" and not to.in_editor)
+    if heard is Heard.WOKE or heard not in ON_THE_CALL:
+        return False
+    return interrupt_waiting() or cuts_in(to)
+
+
+def _none(*_args) -> None:
+    return None
+
+
+def act_on_turn(text: str, rich: str, heard: Heard, last: tuple[str, Heard] | None = None, *, ear: str = "",
+                ding: Callable[[], None] = _none, off: Callable[[], None] = _none,
+                echo: Callable[[str], None] = _none, sent: Callable[[tuple[str, Heard]], None] = _none
+                ) -> float | None:
+    """Act on a finished turn's words (`text` plain, `rich` with tone marks): give them time, switch, hang up, drop
+    them, or deliver them. Shared by every ear that hears a turn. `last` is the last message sent ("send that to …");
+    `ding` confirms a switch or a delivery, `off` stops hands-free, `echo` is told nothing said over a clip cut it,
+    `sent` gets the message delivered. Returns seconds to keep listening (0: the default), None for none."""
+    kind = meaning(text)
+    # Before anything is said or sent: talkback may speak again, and knows whether an agent got words
+    to = last_speaker() if kind is Meaning.MESSAGE else None  # who deliver() will type it to
+    set_target(kind is Meaning.MESSAGE, to.session if to else "")
+    set_phase(Phase.IDLE, BY_HANDSFREE)
+    if kind is Meaning.TIME:
+        log(HANDSFREE_LOG, "heard: give me a minute")
+        say("Take your time.")
+        return THINK_WINDOW
+    if kind is Meaning.ROUTING:
+        if route(text, last):
+            ding()
+        return 0.0
+    if kind is Meaning.HANGUP:
+        log(HANDSFREE_LOG, "heard: hang up")
+        if in_call():  # it may have ended while the words were transcribed
+            goodbye = say("Bye! Hanging up.")
+            # Only once the goodbye is queued: the server ends the call when talkback has nothing left to say,
+            # and until say.py has run, there is nothing in the queue yet
+            threading.Thread(target=lambda: (goodbye.wait(timeout=15), CALL_HANGUP.touch()), daemon=True).start()
+        return None
+    if kind is Meaning.OFF:
+        log(HANDSFREE_LOG, "heard: hands-free off")
+        off()
+        say("Hands-free off.")
+    elif kind is Meaning.CANCEL:
+        log(HANDSFREE_LOG, "heard: never mind")
+    elif kind is Meaning.NOTHING:
+        log(HANDSFREE_LOG, f"ignored {len(text.split())} words")
+        if heard is Heard.OVER_YOU:  # nothing said over a clip: our echo cut it; no cut-resume-cut loop
+            echo("echo cut a clip")
+        return None
+    elif deliver(rich, heard, to=to, urgent=cut_in(heard, to), ear=ear):  # the one noted as the target above
+        ding()
+        sent((rich, heard))
+        if interrupt_waiting():
+            clear_interrupt()
+    return THINK_WINDOW if THINK.search(text) else 0.0
