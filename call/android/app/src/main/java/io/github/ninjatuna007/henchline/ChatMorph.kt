@@ -163,8 +163,17 @@ class ChatContainer(private val screens: ViewGroup, private val chat: View, priv
         }
         frame(0f)
         val mine = ++turn
-        running = Motion.run(ChatMorph.MS, LinearInterpolator(), ::frame) { if (mine == turn) finish() }
-        if (running == null) finish()
+        // The clock starts once the chat's first frame is on screen: a long chat can take a third of a second to lay
+        // out and draw, which ate most of the grow when it started at once (the first chat in the list, 2026-11-23)
+        var begun = false
+        fun begin() {
+            if (begun || mine != turn) return
+            begun = true
+            running = Motion.run(ChatMorph.MS, LinearInterpolator(), ::frame) { if (mine == turn) finish() }
+            if (running == null) finish()
+        }
+        chat.viewTreeObserver.registerFrameCommitCallback { begin() }
+        chat.postDelayed({ begin() }, FIRST_FRAME_WAIT_MS)  // no frame drawn (hidden meanwhile): never stuck clipped
     }
 
     /**
@@ -172,7 +181,7 @@ class ChatContainer(private val screens: ViewGroup, private val chat: View, priv
      * back swipe left it, else its own place). Null with animations off: the list just appears.
      */
     fun captureClose(swipe: SwipeLook?): Closing? {
-        val mid = growing.takeIf { running != null }  // closed while still growing: back from where it got to
+        val mid = growing  // closed while still growing (or waiting for its first frame): back from where it got to
         val midScrim = growScrim
         stop()
         if (!Motion.on() || chat.visibility != View.VISIBLE || !chat.isLaidOut || chat.width == 0) return null
@@ -288,6 +297,9 @@ class ChatContainer(private val screens: ViewGroup, private val chat: View, priv
     }
 
     companion object {
+        /** Longest the grow waits for the chat's first frame before its clock starts anyway. */
+        const val FIRST_FRAME_WAIT_MS = 600L
+
         /** The opaque colour a view is drawn on: its own background's or the nearest one's under it; else base. */
         fun surfaceBehind(view: View, base: Int): Int {
             var v: View? = view
