@@ -107,7 +107,7 @@ class MainActivity : Activity() {
                 val next = mapOf("recent" to "project", "project" to "agent", "agent" to "recent")[sortMode()]
                 prefs().edit().putString("sort", next).apply()
                 text = label()
-                showCrew()
+                showCrewKeyed()
             }
         }
         findViewById<SwipeRefreshLayout>(R.id.refresh).apply {
@@ -429,6 +429,11 @@ class MainActivity : Activity() {
             MotionEvent.ACTION_UP -> {
                 if (edgeStart >= 0 && event.x - edgeStart > dp(100)) {
                     edgeStart = -1f
+                    // Not a tap or a swipe on whatever row the finger ended on: told it's over (a reply swipe
+                    // springs home) before the chat's picture is taken
+                    val cancel = MotionEvent.obtain(event).apply { action = MotionEvent.ACTION_CANCEL }
+                    super.dispatchTouchEvent(cancel)
+                    cancel.recycle()
                     // The top menu first, then the one under it, and only then the chat (a second menu used to
                     // stay drawn while this went back to the list, 2026-11-19)
                     when {
@@ -631,6 +636,9 @@ class MainActivity : Activity() {
         statusTurn++; statusFade?.cancel(); statusFade = null
         barSlide.stop()
         chatMorph.stop()  // nor a chat growing or shrinking, its picture or its clip
+        listMoves.stop()  // nor the list's rows moving, or gone ones left on its overlay
+        selectFade?.cancel(); selectFade = null; dropSelectBar()  // nor the selection bar fading
+        for (k in 0 until chat.childCount) (chat.getChildAt(k).getTag(R.id.picked) as? Picked)?.let { it.fade?.cancel(); it.fade = null }  // nor a row's tint
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) predictiveBack?.release()  // nor a back swipe's look, nor its callback
         predictiveBack = null
         super.onDestroy()
@@ -839,8 +847,12 @@ class MainActivity : Activity() {
         // (Not when the list shows something else now, a tab or a screen changed mid-fold: that fold stops)
         if (foldGuard.busy && (tab != "chats" || listScreen.visibility != View.VISIBLE)) stopFold()
         if (!foldGuard.ask()) return
+        // So does one while the rows move after something the user did (and not on another tab or screen)
+        if (listMoves.busy && (tab != "chats" || listScreen.visibility != View.VISIBLE)) listMoves.stop()
+        if (!listMoves.ask()) return
         crew.removeAllViews()
         cards.clear()
+        unreadNow.clear()
         main.removeCallbacks(searchSoon)
         if (tab == "calls") return showCalls()
         if (tab == "usage") return showUsage()
@@ -1004,8 +1016,11 @@ class MainActivity : Activity() {
             setTextColor(getColor(R.color.muted)); textSize = 13f; gravity = Gravity.CENTER
             setPadding(dp(20), dp(28), dp(20), dp(36))
             setOnClickListener { show(settingsScreen) }
+            transitionName = "settings"
         })
         Motion.rippleAll(crew)  // the rows just made
+        // The counts as drawn now: the next redraw pops the ones that went up
+        unreadDrawn = HashMap(unreadNow)
         val name = names[current] ?: prefs().getString("current_name", "")?.ifEmpty { null }.takeIf { current.isNotEmpty() }
         who.text = name?.substringBefore(",") ?: "Henchline"
         avatar.setImageResource(if (name != null) avatarOf(current, teams[current] ?: "") else R.drawable.avatar_handsfree)
@@ -1939,8 +1954,7 @@ class MainActivity : Activity() {
                 }
                 visibility = View.VISIBLE
                 if ("$kind$badge" != badgeShown) {
-                    scaleX = 0.6f; scaleY = 0.6f
-                    animate().scaleX(1f).scaleY(1f).setDuration(180).setInterpolator(android.view.animation.OvershootInterpolator()).start()
+                    Motion.pop(this)  // springs up from small (a poll's news: the one redraw that moves)
                     maybeHintHelpers()
                 }
             }
@@ -2615,6 +2629,7 @@ class MainActivity : Activity() {
         // coming or going is part of the move. animate false: something else shows next (a chat), no move
         val dir = TabMotion.direction(tabs.indexOf(tab), tabs.indexOf(which))
         val shown = animate && listScreen.visibility == View.VISIBLE
+        if (which == "usage" && tab != "usage") usageFills = true  // come to Usage: its bars fill, once
         tabPill.to(tabs.indexOf(which).toFloat().coerceAtLeast(0f), animate = shown && dir != 0)
         tabAxis.switch(findViewById(R.id.listBody), if (shown) dir else 0) {
             tab = which
@@ -2639,8 +2654,9 @@ class MainActivity : Activity() {
 
     /** Every AI on the laptop at once (the user's wish, 2026-11-17): a card each, its plan's limits as bars, with
      *  when each resets. Asked of the laptop each time the tab is shown (it keeps Cursor's for ten minutes). */
+    private var usageFills = false  // the Usage tab's next drawing fills its bars (the first since it was chosen)
+
     private fun showUsage(fresh: Boolean = false) {
-        val draw = UsageDraw(this)
         val waiting = TextView(this).apply {
             text = if (fresh) "Asking every AI again…" else "Asking the laptop…"
             setTextColor(getColor(R.color.muted)); setPadding(dp(20), dp(24), dp(20), dp(24))
@@ -2651,6 +2667,9 @@ class MainActivity : Activity() {
             refresh.isRefreshing = false
             if (tab != "usage") return@ask
             crew.removeAllViews()
+            // Filled once: the first answer drawn since Usage was chosen; a pull to refresh or a redraw just shows
+            val draw = UsageDraw(this, fills = usageFills && listScreen.visibility == View.VISIBLE)
+            usageFills = false
             val agents = answer.optJSONArray("agents")
             if (agents == null || agents.length() == 0) {
                 crew.addView(waiting.apply { text = answer.optString("note").ifEmpty { "No usage reported yet." } })
@@ -2692,6 +2711,34 @@ class MainActivity : Activity() {
         prefs().edit().putStringSet("pinned", next).apply()
     }
 
+    /** The rows moving as the list redraws (after something the user did); a redraw meanwhile waits for them. */
+    private val listMoves by lazy { KeyedMoves(crew) }
+    /** Each row's and folded card's unread count as last drawn, and as being drawn now (by key): a count that went
+     *  up pops ([ListMotion.pops]), on a poll's redraw too. */
+    private var unreadDrawn: Map<String, Int> = emptyMap()
+    private val unreadNow = HashMap<String, Int>()
+
+    /** The count badge on a row or a folded card, made: it pops if its count went up since the last drawing seen.
+     *  Drawn while the list is hidden (a chat open), a count that went up isn't taken as seen (it pops when the list
+     *  shows); one that went down (the chat read) is. */
+    private fun countBadge(key: String, unread: Int, badge: View?) {
+        if (key in unreadNow) return  // drawn twice (pinned and in its place): counted once
+        val before = unreadDrawn[key]
+        val seen = listScreen.visibility == View.VISIBLE
+        unreadNow[key] = ListMotion.seenCount(before, unread, seen)
+        if (seen && badge != null && ListMotion.pops(before, unread)) Motion.pop(badge)
+    }
+
+    /** The list redrawn after something the user did (a pin, the sort, a chat cleared, removed or ended): its rows
+     *  move from where they were to where they are now ([KeyedMoves]). A poll's or a push's redraw, a search and a
+     *  fold just draw (showCrew). */
+    private fun showCrewKeyed() {
+        if (foldGuard.busy || tab != "chats" || listScreen.visibility != View.VISIBLE) return showCrew()
+        val before = listMoves.capture()  // (a move under way stops: this redraw draws what it owed)
+        showCrew()
+        if (before != null) listMoves.play(before) { showCrew() }
+    }
+
     /** The manager a crew chat is drawn under in the list, when that manager's row is shown (and the crew isn't pinned:
      *  a pinned chat stays in Pinned). Null: the chat keeps its own place. */
     private fun nestedUnder(session: String, shown: Set<String>): String? =
@@ -2713,6 +2760,7 @@ class MainActivity : Activity() {
                 else RemoteChatMotion.open(this@MainActivity, HostChatActivity.open(this@MainActivity, ChatKey(remote.host.hostId, session)), this)
             }
             if (remote == null) setTag(R.id.rowOf, session)  // the row the chat shrinks back into ([rowOf])
+            transitionName = rowKey(remote?.host?.hostId, session)  // known across redraws, to move ([KeyedMoves])
             setOnLongClickListener { if (remote == null) chatMenu(session, project, agent) else hostChatMenu(remote.host, session, project, this); true }
         }
         row.addView(ImageView(this).apply {
@@ -2753,16 +2801,22 @@ class MainActivity : Activity() {
             ellipsize = android.text.TextUtils.TruncateAt.END
             if (unread > 0) typeface = android.graphics.Typeface.DEFAULT_BOLD  // unread: something to look at
         }.let { line -> bottom.addView(line, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)) }
-        if (unread > 0) bottom.addView(TextView(this).apply {  // the count, as a messaging app shows it
+        val count = if (unread <= 0) null else TextView(this).apply {  // the count, as a messaging app shows it
             text = if (unread > 99) "99+" else unread.toString()
             setTextColor(getColor(R.color.navy)); textSize = 12f; typeface = android.graphics.Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER; minWidth = dp(22); setPadding(dp(6), dp(1), dp(6), dp(1))
             background = GradientDrawable().apply { setColor(getColor(R.color.cyan)); cornerRadius = dp(11).toFloat() }
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
+        }
+        if (count != null) bottom.addView(count,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(8) })
+        countBadge(row.transitionName, unread, count)
         words.addView(bottom)
         row.addView(words, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         return row
     }
+
+    /** A chat's row's key in the list: its computer (null: the laptop) and its session. */
+    private fun rowKey(hostId: String?, session: String) = "row|${hostId ?: LAPTOP}|$session"
 
     /** A chat on another paired computer, as its row is drawn (chatRow): which computer, its hard hat, its boss's
      *  name for "Crew of", whether it's unread, the computer's name when it is drawn outside its group (Pinned),
@@ -2785,6 +2839,7 @@ class MainActivity : Activity() {
         text = heading.replace("_", " ").uppercase()
         setTextColor(getColor(R.color.muted)); textSize = 12f; typeface = android.graphics.Typeface.DEFAULT_BOLD
         setPadding(dp(20), dp(if (inComputer) 12 else 16), dp(20), dp(4))
+        transitionName = "heading|$heading"  // (the same heading in two cards: told apart by its turn)
     }
 
     private fun quietLine(words: String) = TextView(this).apply {
@@ -2810,6 +2865,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             background = cardShape
             clipToOutline = true  // the heading's ripple and the rows stay inside the rounded corners
+            transitionName = "card|$key"
         }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
@@ -2877,12 +2933,15 @@ class MainActivity : Activity() {
             text = if (words.isEmpty()) "" else "  $words"; setTextColor(getColor(R.color.muted)); textSize = 12f; maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        if (!open && unread > 0) row.addView(TextView(this).apply {
+        val count = if (open || unread <= 0) null else TextView(this).apply {
             text = if (unread > 99) "99+" else unread.toString()
             setTextColor(getColor(R.color.navy)); textSize = 12f; typeface = android.graphics.Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER; minWidth = dp(22); setPadding(dp(6), dp(1), dp(6), dp(1))
             background = GradientDrawable().apply { setColor(getColor(R.color.cyan)); cornerRadius = dp(11).toFloat() }
-        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(8) })
+        }
+        if (count != null) row.addView(count,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(8) })
+        countBadge("card|$key", unread, count)
         val chevron = ImageView(this).apply {
             setImageResource(R.drawable.ic_expand)
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -2937,6 +2996,8 @@ class MainActivity : Activity() {
      *  meanwhile (the guard holds a redraw until it ends). A tap during a fold turns it back from where it is (the
      *  same card) or stops it (another). At once in a search (every card is open there) or with animations off. */
     private fun fold(key: String, wasOpen: Boolean) {
+        // Rows still moving after a pin or a sort: put in place at once (and a redraw they held done) before the fold
+        if (listMoves.busy) { listMoves.stop(); showCrew() }
         HostLists.setCollapsed(this, key, wasOpen)
         val searching = ::search.isInitialized && search.text.toString().trim().isNotEmpty()
         // Mid-fold: the same card turns back from the height it has reached; another's fold stops, drawn as kept
@@ -3029,7 +3090,7 @@ class MainActivity : Activity() {
         val key = HostLists.pinKey(host.hostId, session)
         val pinned = key in pins()
         panel = ActionsSheet(this, project.replace("_", " "), "On ${host.label}", listOf(
-            Triple("📌", if (pinned) "Unpin" else "Pin") { setPinned(key, !pinned); showCrew() },
+            Triple("📌", if (pinned) "Unpin" else "Pin") { setPinned(key, !pinned); showCrewKeyed() },
             Triple("💬", "Open") { RemoteChatMotion.open(this@MainActivity, HostChatActivity.open(this@MainActivity, ChatKey(host.hostId, session)), row) }
         )).also { it.show() }
     }
@@ -3037,6 +3098,7 @@ class MainActivity : Activity() {
     /** One screen at a time: the chat list, a chat, or settings. */
     private fun show(screen: View) {
         chatMorph.stop()  // a chat growing or shrinking belongs to the screen change it began with
+        listMoves.stop()  // as do the list's rows moving (the list is drawn again as it shows)
         BottomPanel.closeAll()  // a menu belongs to the screen it opened on, including one opened on top of another
         if (screen !== chatScreen) stopSelecting()  // and a selection to the chat it was made in
         (shownUndo?.parent as? android.view.ViewGroup)?.removeView(shownUndo)
@@ -3076,6 +3138,7 @@ class MainActivity : Activity() {
     /** A laptop chat opened from its row on the list: it grows out of the row (when there is one on screen and
      *  animations are on; else it just appears, as from a notification or the call bar). */
     private fun openFrom(session: String, row: View) {
+        listMoves.stop()  // the row in its own place, to grow from
         val from = chatMorph.capture(row, listScreen, crew.parent as? View)
         open(session)
         if (from != null && chatScreen.visibility == View.VISIBLE) chatMorph.grow(from)
@@ -3961,7 +4024,7 @@ class MainActivity : Activity() {
     /** Held on a message: copy it, open its file elsewhere, or delete it from this phone, with the files it saved
      *  if no other message has them (the user's wish, 2026-11-16). */
     private fun messageMenu(session: String, ats: List<Long>, words: String? = null) {
-        if (selected != null) return toggleSelected(ats)
+        if (selected != null) return toggleSelected(ats, tick = false)  // a hold: its long press was felt
         val kept = Chats.load(this, session)
         // A line shown as it arrived (kept by the call, not this screen) has the time it was kept: found by its words
         val lines = kept.filter { it.optLong("at") in ats }.ifEmpty {
@@ -4003,7 +4066,30 @@ class MainActivity : Activity() {
     private var selectBar: View? = null
     private var selectCount: TextView? = null
 
+    private var selectFade: android.animation.ValueAnimator? = null  // the bar fading in, or out
+    private var selectGoing: View? = null  // a bar fading out after selecting ended
+
+    /** The selection bar faded in (over the chat's header) or out, then taken away. */
+    private fun fadeSelectBar(bar: View, showing: Boolean) {
+        selectFade?.cancel(); selectFade = null
+        if (showing) bar.alpha = 0f
+        val from = bar.alpha
+        selectFade = Motion.run(Motion.MEDIUM, if (showing) Motion.standard else Motion.emphasizedAccelerate, { t ->
+            bar.alpha = if (showing) from + (1f - from) * t else from * (1f - t)
+        }) {
+            selectFade = null
+            if (!showing) dropSelectBar()
+        }
+    }
+
+    /** A bar fading out, gone now. */
+    private fun dropSelectBar() {
+        selectGoing?.let { (it.parent as? android.view.ViewGroup)?.removeView(it) }
+        selectGoing = null
+    }
+
     private fun startSelecting(ats: List<Long>) {
+        selectFade?.cancel(); selectFade = null; dropSelectBar()  // the last bar still fading out: gone at once
         selected = mutableSetOf()
         hideKeyboard(this)
         val bar = LinearLayout(this).apply {
@@ -4018,7 +4104,10 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(10), dp(14), dp(10)); setOnClickListener { then() }
         }.also { Motion.ripple(it) }
         bar.addView(button("✕") { stopSelecting() })
-        selectCount = TextView(this).apply { setTextColor(getColor(R.color.text)); textSize = 17f; typeface = android.graphics.Typeface.DEFAULT_BOLD }
+        selectCount = TextView(this).apply {
+            setTextColor(getColor(R.color.text)); textSize = 17f; typeface = android.graphics.Typeface.DEFAULT_BOLD
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE  // "3 selected" read out as it changes
+        }
         bar.addView(selectCount, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         bar.addView(button("📋 Copy") { copySelected() })
         bar.addView(button("↗ Share") { shareSelected() })
@@ -4026,23 +4115,57 @@ class MainActivity : Activity() {
         addContentView(bar, android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
             android.widget.FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
         selectBar = bar
+        fadeSelectBar(bar, showing = true)
         toggleSelected(ats)
     }
 
     private fun stopSelecting() {
         if (selected == null) return
         selected = null
-        (selectBar?.parent as? android.view.ViewGroup)?.removeView(selectBar)
+        selectBar?.let { bar ->
+            setTreeEnabled(bar, false); bar.isClickable = false  // fading out: nothing on it acts any more
+            selectGoing = bar
+            fadeSelectBar(bar, showing = false)
+        }
         selectBar = null
-        for (k in 0 until chat.childCount) chat.getChildAt(k).let { if (it.getTag(R.id.ats) != null) it.background = null }
+        for (k in 0 until chat.childCount) chat.getChildAt(k).let { if (it.getTag(R.id.ats) != null) tintRow(it, false) }
     }
 
-    /** Picked, or unpicked; each row showing a picked line is tinted. None left: selecting ends. */
-    private fun toggleSelected(ats: List<Long>) {
+    /** Picked, or unpicked (a tick felt each time); each row showing a picked line is tinted. None left: selecting
+     *  ends. */
+    private fun toggleSelected(ats: List<Long>, tick: Boolean = true) {
         val picked = selected ?: return
         if (ats.isEmpty()) return
         if (ats.all { it in picked }) picked.removeAll(ats.toSet()) else picked.addAll(ats)
+        // A tick for each pick, unless a hold made it (its long press has buzzed already: one feel is enough)
+        if (tick) chat.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
         tintSelected()
+    }
+
+    /** A row's tint while selecting, and its fade. */
+    private class Picked(val drawable: android.graphics.drawable.ColorDrawable) {
+        var on = false
+        var fade: android.animation.ValueAnimator? = null
+    }
+
+    /** A row tinted as picked, or not: crossfading when it changes, at once on a row just drawn (a redraw). Read out
+     *  as selected or not. */
+    private fun tintRow(row: View, on: Boolean) {
+        val had = (row.getTag(R.id.picked) as? Picked)?.takeIf { row.background === it.drawable }
+        val held = had ?: Picked(android.graphics.drawable.ColorDrawable(getColor(R.color.cyan) and 0x33FFFFFF)).also {
+            it.drawable.alpha = 0
+            row.setTag(R.id.picked, it); row.background = it.drawable
+        }
+        row.isSelected = on
+        if (held.on == on) return
+        held.on = on
+        held.fade?.cancel(); held.fade = null
+        val from = held.drawable.alpha
+        val to = if (on) 255 else 0
+        if (had == null) { held.drawable.alpha = to; return }
+        held.fade = Motion.run(Motion.MEDIUM, Motion.standard, { t -> held.drawable.alpha = (from + (to - from) * t).toInt() }) {
+            held.fade = null
+        }
     }
 
     /** The rows showing a picked line, tinted; picks no longer in the chat dropped (after a redraw too). */
@@ -4057,7 +4180,7 @@ class MainActivity : Activity() {
         for (k in 0 until chat.childCount) {
             val row = chat.getChildAt(k)
             @Suppress("UNCHECKED_CAST") val rowAts = row.getTag(R.id.ats) as? List<Long> ?: continue
-            row.setBackgroundColor(if (rowAts.any { it in picked }) (getColor(R.color.cyan) and 0x33FFFFFF) else android.graphics.Color.TRANSPARENT)
+            tintRow(row, rowAts.any { it in picked })
         }
         selectCount?.text = "${picked.size} selected"
     }
@@ -4321,7 +4444,7 @@ class MainActivity : Activity() {
         val saved = Media.onlyIn(this, session, Media.savedFor(this, lines), except = lines.map { it.optLong("at") }.toSet())
         val pinned = session in pins()
         panel = ChatActionsSheet(this, agent, project.replace("_", " "), startedHere(session), gone = session !in names,
-            pinned = pinned, onPin = { on -> setPinned(session, on); showCrew() },
+            pinned = pinned, onPin = { on -> setPinned(session, on); showCrewKeyed() },
             savedFiles = saved.size,
             onClear = { alsoFiles ->
                 Chats.clear(this, session)
@@ -4329,7 +4452,7 @@ class MainActivity : Activity() {
                 Media.dropPreviews(this, lines)
                 if (alsoFiles) deleted(saved, Media.delete(this, saved))
                 if (session == current) showHistory()
-                showCrew()
+                showCrewKeyed()
             },
             onRemove = {
                 setPinned(session, false)
@@ -4339,7 +4462,7 @@ class MainActivity : Activity() {
                 val crew = org.json.JSONArray((0 until kept.length()).map { kept.getJSONObject(it) }.filter { it.optString("session") != session })
                 prefs().edit().putString("crew", crew.toString()).apply()
                 if (session == current) { current = ""; prefs().edit().putString("current", "").apply() }
-                showCrew()
+                showCrewKeyed()
             },
             onEnd = { done ->
                 ask("/crew/end", JSONObject().put("session", session)) { answer ->
@@ -4352,7 +4475,7 @@ class MainActivity : Activity() {
                     val crew = org.json.JSONArray((0 until kept.length()).map { kept.getJSONObject(it) }.filter { it.optString("session") != session })
                     prefs().edit().putString("crew", crew.toString()).apply()
                     if (session == current) { current = ""; prefs().edit().putString("current", "").apply() }
-                    showCrew()
+                    showCrewKeyed()
                 }
             },
             // As typing /rename in it: Claude and Codex rename themselves, a Cursor editor chat is renamed by Cursor
@@ -4382,45 +4505,10 @@ class MainActivity : Activity() {
         if (words.isNotEmpty()) text.requestFocus()
     }
 
-    /** A message dragged to the right far enough is the one being replied to, as in a messaging app. */
-    private fun swipeToReply(row: View, words: String, onLong: (() -> Unit)? = null) {
-        var startX = 0f
-        var startY = 0f
-        var dragging = false
-        var longDone = false
-        val slop = android.view.ViewConfiguration.get(this).scaledTouchSlop
-        // Held still: the message's menu (the row takes every touch for the swipe, so it sees the hold itself)
-        val held = Runnable { longDone = true; row.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS); onLong?.invoke() }
-        row.setOnTouchListener { view, event ->
-            when (event.actionMasked) {
-                // Kept from the start (a row that doesn't take the DOWN never sees the drag); the list still
-                // scrolls, as the ScrollView takes over a vertical move
-                MotionEvent.ACTION_DOWN -> {
-                    startX = event.rawX; startY = event.rawY; dragging = false; longDone = false
-                    if (onLong != null) view.postDelayed(held, android.view.ViewConfiguration.getLongPressTimeout().toLong())
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = event.rawX - startX
-                    val dy = event.rawY - startY
-                    if (kotlin.math.abs(dx) > slop || kotlin.math.abs(dy) > slop) view.removeCallbacks(held)
-                    if (!dragging && dx > dp(12) && dx > 2 * kotlin.math.abs(dy)) {  // sideways, not a slow scroll
-                        dragging = true
-                        view.parent.requestDisallowInterceptTouchEvent(true)
-                    }
-                    if (dragging) view.translationX = dx.coerceIn(0f, dp(96).toFloat())
-                    dragging
-                }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    view.removeCallbacks(held)
-                    if (dragging && !longDone && view.translationX >= dp(72)) setQuote(words)
-                    view.animate().translationX(0f).setDuration(150).start()
-                    dragging.also { dragging = false }
-                }
-                else -> false
-            }
-        }
-    }
+    /** A message dragged to the right far enough is the one being replied to, as in a messaging app: it follows the
+     *  finger, ticks at the threshold, and springs home ([ReplySwipe]). */
+    private fun swipeToReply(row: View, words: String, onLong: (() -> Unit)? = null) =
+        ReplySwipe.attach(row, { setQuote(words) }, onLong)
 
     private fun askName(view: TextView) {
         val box = EditText(this).apply { setText(view.text) }

@@ -54,8 +54,8 @@ class IncomingActivity : Activity() {
             textSize = 28f
             gravity = Gravity.CENTER
         })
-        screen.addView(ImageView(this).apply { setImageResource(MainActivity.avatarOf(agent)) },
-            LinearLayout.LayoutParams((220 * dp).toInt(), (220 * dp).toInt()).apply { topMargin = (32 * dp).toInt() })
+        val face = ImageView(this).apply { setImageResource(MainActivity.avatarOf(agent)) }
+        screen.addView(face, LinearLayout.LayoutParams((220 * dp).toInt(), (220 * dp).toInt()).apply { topMargin = (32 * dp).toInt() })
         screen.addView(TextView(this).apply {  // the banner: what it is saying
             text = "“${lines.getOrElse(phrase) { lines[0] }}”"  // the line this ring says
             setTextColor(getColor(R.color.cyan))
@@ -71,23 +71,29 @@ class IncomingActivity : Activity() {
         })
         screen.addView(android.view.View(this), LinearLayout.LayoutParams(1, 0, 1f))
         val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        fun round(icon: Int, background: Int, what: String, then: () -> Unit) = ImageButton(this).apply {
+        fun round(icon: Int, background: Int, what: String, then: (android.view.View) -> Unit) = ImageButton(this).apply {
             setImageResource(icon)
             setBackgroundResource(background)
             setColorFilter(getColor(android.R.color.white))
             contentDescription = what
-            setOnClickListener { then() }
+            setOnClickListener { then(it) }
         }
-        buttons.addView(round(R.drawable.ic_call_end, R.drawable.round_hang, "Decline") { tell("declined"); Ringing.end(this); stop() },
-            LinearLayout.LayoutParams((76 * dp).toInt(), (76 * dp).toInt()).apply { marginEnd = (88 * dp).toInt() })
-        buttons.addView(round(R.drawable.ic_phone, R.drawable.round_call, "Answer") {
+        val decline = round(R.drawable.ic_call_end, R.drawable.round_hang, "Decline") {
+            it.performHapticFeedback(RingMotion.declineHaptic(android.os.Build.VERSION.SDK_INT))
+            tell("declined"); Ringing.end(this); stop()
+        }
+        buttons.addView(decline, LinearLayout.LayoutParams((76 * dp).toInt(), (76 * dp).toInt()).apply { marginEnd = (88 * dp).toInt() })
+        val answer = round(R.drawable.ic_phone, R.drawable.round_call, "Answer") {
+            it.performHapticFeedback(RingMotion.answerHaptic(android.os.Build.VERSION.SDK_INT))
             told = true  // the call tells the laptop the rest (answered, or couldn't connect)
             ended = true
             RingService.answerIntent(this, reply)?.let { startActivity(it) }  // the laptop's call, or the ringing computer's
             stop()
-        }, LinearLayout.LayoutParams((76 * dp).toInt(), (76 * dp).toInt()))
+        }
+        buttons.addView(answer, LinearLayout.LayoutParams((76 * dp).toInt(), (76 * dp).toInt()))
         screen.addView(buttons)
         setContentView(screen)
+        if (RingMotion.enters(Motion.on(), savedInstanceState != null)) enter(face, listOf(decline, answer), dp)
 
         // The very sound the banner rings with (banner_mix.py: the tone, the phrases on its beat), so the two
         // never differ (2026-11-15: they said different phrases)
@@ -97,6 +103,31 @@ class IncomingActivity : Activity() {
         // the screen's sound has started, so the banner's stops into it rather than before it)
         RingService.ringNow(this, agent, why, reply, quiet = true, seconds = maxOf(1, Ringing.secondsLeft(this)), phrase = phrase)
         main.postDelayed({ tell("missed"); Ringing.end(this); stop() }, maxOf(1, Ringing.secondsLeft(this)) * 1000)
+    }
+
+    private val springs = ArrayList<androidx.dynamicanimation.animation.SpringAnimation>()
+    private var moving: List<android.view.View> = emptyList()
+
+    /** Coming up ([RingMotion]): the henchman springs up from small as it fades in; the buttons rise 24 dp into
+     *  place and fade in, Decline then Answer. Taps work throughout. */
+    private fun enter(face: android.view.View, buttons: List<android.view.View>, dp: Float) {
+        moving = buttons + face
+        face.scaleX = RingMotion.AVATAR_FROM; face.scaleY = RingMotion.AVATAR_FROM; face.alpha = 0f
+        Motion.spring(face, androidx.dynamicanimation.animation.DynamicAnimation.SCALE_X, 1f)?.let { springs.add(it) }
+        Motion.spring(face, androidx.dynamicanimation.animation.DynamicAnimation.SCALE_Y, 1f)?.let { springs.add(it) }
+        face.animate().alpha(1f).setDuration(Motion.MEDIUM).setInterpolator(Motion.standard).start()
+        buttons.forEachIndexed { place, button ->
+            button.translationY = RingMotion.SLIDE_DP * dp; button.alpha = 0f
+            button.animate().translationY(0f).alpha(1f).setStartDelay(RingMotion.delayOf(place))
+                .setDuration(RingMotion.BUTTON_MS).setInterpolator(Motion.emphasizedDecelerate).start()
+        }
+    }
+
+    /** The coming up stopped where it is, everything in place and whole. */
+    private fun settle() {
+        springs.forEach { it.cancel() }; springs.clear()
+        for (v in moving) { v.animate().cancel(); v.scaleX = 1f; v.scaleY = 1f; v.translationY = 0f; v.alpha = 1f }
+        moving = emptyList()
     }
 
     /** In Do Not Disturb the ring plays as an alarm, and the alarm volume is usually far above the ringer's (15 of 15
@@ -169,6 +200,7 @@ class IncomingActivity : Activity() {
     }
 
     override fun onDestroy() {
+        settle()  // nothing of the coming up outlives the screen
         stop()
         if (showing?.get() === this) showing = null
         super.onDestroy()

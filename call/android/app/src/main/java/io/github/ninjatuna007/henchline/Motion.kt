@@ -234,6 +234,62 @@ object Motion {
         }
     }
 
+    /** A badge whose count went up: from [ListMotion.POP_FROM] of its size, springing (a little past) to whole about
+     *  its centre. A pop under way starts again; taken off the screen, it stops whole. Nothing when off. */
+    fun pop(view: View) {
+        val held = view.getTag(R.id.popping) as? Popping ?: Popping().also { p ->
+            view.setTag(R.id.popping, p)
+            view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {}
+                override fun onViewDetachedFromWindow(v: View) { p.stop(v) }
+            })
+        }
+        held.stop(view)
+        if (!on()) return
+        if (!view.isAttachedToWindow) {  // a badge just made (a row redrawn): it pops as it comes on screen
+            if (held.waiting) return
+            held.waiting = true
+            view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {
+                    v.removeOnAttachStateChangeListener(this)
+                    held.waiting = false
+                    pop(v)
+                }
+                override fun onViewDetachedFromWindow(v: View) {}
+            })
+            return
+        }
+        view.scaleX = ListMotion.POP_FROM; view.scaleY = ListMotion.POP_FROM
+        held.x = spring(view, DynamicAnimation.SCALE_X, 1f, spring = FAST)
+        held.y = spring(view, DynamicAnimation.SCALE_Y, 1f, spring = FAST)
+    }
+
+    private class Popping {
+        var waiting = false
+        var x: SpringAnimation? = null
+        var y: SpringAnimation? = null
+        fun stop(view: View) {
+            x?.cancel(); y?.cancel(); x = null; y = null
+            view.scaleX = 1f; view.scaleY = 1f
+        }
+    }
+
+    /** A bar's fill growing from its start to its length, once (the first time its numbers are shown): scaled across
+     *  from its left edge, so nothing is laid out again. Taken off the screen, it is whole. Nothing when off. */
+    fun fill(view: View, duration: Long = LONGEST) {
+        if (!on()) return
+        view.pivotX = 0f
+        view.scaleX = 0f
+        view.animate().scaleX(1f).setDuration(duration).setInterpolator(emphasizedDecelerate).start()
+        view.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {}
+            override fun onViewDetachedFromWindow(v: View) {
+                v.removeOnAttachStateChangeListener(this)
+                v.animate().cancel(); v.scaleX = 1f
+            }
+        })
+    }
+
     /** A view coming into being: from 0.8 of its size about (pivotX, pivotY) and transparent, to whole. */
     fun appear(view: View, pivotX: Float = view.width / 2f, pivotY: Float = view.height / 2f,
                duration: Long = LONG) {

@@ -998,9 +998,9 @@ class CursorChatsSheet(
 /**
  * Usage drawn as bars (the user's wish, 2026-11-17: not a text dump), for the /usage sheet and the Usage tab: each
  * plan limit with when it resets, the context with what fills it. Green while there's room, amber past 70 %, red past
- * 90 %.
+ * 90 %. fills: the bars fill from empty as they are shown (the first time their numbers are: a redraw just shows).
  */
-class UsageDraw(private val activity: Activity) {
+class UsageDraw(private val activity: Activity, private val fills: Boolean = false) {
     private val dp = activity.resources.displayMetrics.density
     private fun px(v: Int) = (v * dp).toInt()
     private fun colour(id: Int) = activity.getColor(id)
@@ -1035,21 +1035,23 @@ class UsageDraw(private val activity: Activity) {
         }
     }
 
-    /** A rounded track, filled to the share given, in segments when there are several. */
-    fun bar(segments: List<Pair<Double, Int>>) = LinearLayout(activity).apply {
-        orientation = LinearLayout.HORIZONTAL
+    /** A rounded track, filled to the share given, in segments when there are several (filling once: [fills]). */
+    fun bar(segments: List<Pair<Double, Int>>) = android.widget.FrameLayout(activity).apply {
         background = rounded(colour(R.color.surface_high), 6f)
         clipToOutline = true
         outlineProvider = android.view.ViewOutlineProvider.BACKGROUND
+        val fill = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
         var used = 0.0
         for ((share, tint) in segments) {
             val part = share.coerceIn(0.0, 100.0 - used)
             if (part <= 0) continue
             used += part
-            addView(View(activity).apply { setBackgroundColor(tint) },
+            fill.addView(View(activity).apply { setBackgroundColor(tint) },
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, part.toFloat()))
         }
-        if (used < 100) addView(View(activity), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, (100 - used).toFloat()))
+        if (used < 100) fill.addView(View(activity), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, (100 - used).toFloat()))
+        addView(fill, android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        if (fills && used > 0) Motion.fill(fill)
     }
 
     fun heading(title: String, right: String, rightColour: Int) = LinearLayout(activity).apply {
@@ -1109,7 +1111,7 @@ class UsageDraw(private val activity: Activity) {
 /** /usage and /context in a chat: that agent's plan limits and its context, as bars. */
 class UsageSheet(activity: Activity, private val usage: JSONObject) : BottomPanel(activity) {
     fun show() {
-        val draw = UsageDraw(activity)
+        val draw = UsageDraw(activity, fills = true)  // the sheet is new: its bars fill as it opens
         val agent = usage.optString("agent").replaceFirstChar { it.uppercase() }
         val sheet = open("$agent usage", usage.optString("model"))
         val body = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }

@@ -6,4 +6,12 @@
     <item name="rippled" type="id" />
     <!-- On a laptop chat's row in the list: its session, for the chat to shrink back into on close -->
     <item name="rowOf" type="id" />
+    <!-- On a keyed view of a list while it moves: its key made unique (a chat drawn twice) -->
+    <item name="listKey" type="id" />
+    <!-- On a chat's row while selecting: the tint drawn over it, and its fade -->
+    <item name="picked" type="id" />
+    <!-- On a badge that pops: its springs, stopped when it pops again or leaves the screen -->
+    <item name="popping" type="id" />
+    <!-- A chat line's Reply, offered to a screen reader in place of the swipe -->
+    <item name="replyAction" type="id" />
 </resources>
