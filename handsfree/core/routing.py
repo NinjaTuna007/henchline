@@ -23,7 +23,7 @@ from voice import snaps
 from voice.delivery import Delivery, Refusal
 from voice.agents import SPOKEN_TO, identity, process, started
 from voice.desktop import Tab, current as desktop, cursor_bridge, cursor_cdp
-from voice.state import (AWAY, BY_HANDSFREE, file_lock, CALL_CUT_IN, CALL_HANGUP, CALL_INTERRUPT, CALL_PINNED, CALL_RING_NOTE, CALL_TOLD, CHAT_KEY, HANDSFREE_LOG, INTRODUCED, LAST, LISTEN, SPEAKERS, STATE, Phase, Sent,
+from voice.state import (AWAY, BY_HANDSFREE, file_lock, CALL_CUT_IN, CALL_HANGUP, CALL_INTERRUPT, CALL_PINNED, CALL_RING_NOTE, CALL_TOLD, CHAT_KEY, HANDSFREE_LOG, INTRODUCED, LAST, LISTEN, SPEAKERS, STATE, Ears, Phase, Sent,
                          Speaker, in_call, last_speaker, log, read_json, recent_speakers, renamed, set_phase, set_target)
 
 SAY = Path(__file__).resolve().parents[2] / "talkback/scripts/say.py"
@@ -683,22 +683,26 @@ def is_command(text: str, speaker: Speaker | None) -> bool:
 
 
 def deliver(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = False,
-            sender: str | None = None, ear: str = "") -> Delivery:
+            sender: str | None = None, ear: Ears = Ears.LAPTOP, said_at: float | None = None) -> Delivery:
     """`deliver_words`, with the photos the user took on the call screen since the last turn going along with these
     words (a spoken or typed turn on a call; a command, a text or a share carries none). Put back if not delivered.
-    ear: "phone" when the phone, not the laptop, transcribed the words (said in their tag)."""
+    ear: Ears.PHONE when the phone, not the laptop, transcribed the words; said_at: when a turn the phone kept
+    through a dropped line was said (both said in their tag)."""
     from voice import chains
     # A child's report is not the user's turn: no call photos, and it does not move the pinned call.
     if text.lstrip().startswith(chains.REPORT) or sender is not None:
         return deliver_words(text, heard, to, urgent, sender=sender)
     speaker = to or last_speaker()
-    if not in_call() or heard in PHONE or heard is Heard.SCHEDULED or speaker is None or is_command(text, speaker):
-        return deliver_words(text, heard, to, urgent, ear=ear)
+    # A late turn (said_at) was said long before this call's photos and ring note: they wait for a turn of now
+    if not in_call() or heard in PHONE or heard is Heard.SCHEDULED or speaker is None or said_at is not None \
+            or is_command(text, speaker):
+        return deliver_words(text, heard, to, urgent, ear=ear, said_at=said_at)
     photos = snaps.take(speaker.session)
     claimed = claim_ring_note()  # this turn's alone: two turns delivered at once can't both carry it
     delivered: Delivery | None = None
     try:
-        delivered = deliver_words(text, heard, to, urgent, snaps.words(photos), before=ring_note(claimed), ear=ear)
+        delivered = deliver_words(text, heard, to, urgent, snaps.words(photos), before=ring_note(claimed), ear=ear,
+                                  said_at=said_at)
     finally:
         if photos and not delivered:
             snaps.put_back(photos)
@@ -731,15 +735,26 @@ def ring_note(claimed: Path | None) -> str:
             else "(This call began as a ring from a reminder, with no reason given.) ")
 
 
+def with_ears(tag: str, heard: Heard, ear: Ears, said_at: float | None = None) -> str:
+    """A spoken call turn's tag, saying the phone's ears heard it (only such a turn: a text is the phone's anyway),
+    and when, if it was said a while ago."""
+    more = [PHONE_EARS] if ear == Ears.PHONE and heard in ON_THE_CALL else []
+    if said_at:
+        more.append(f"late, said {time.strftime('%H:%M', time.localtime(said_at))}")
+    return f"{tag[:-1]} · {' · '.join(more)}]" if more else tag
+
+
 def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = False,
-                  extra: str = "", sender: str | None = None, before: str = "", ear: str = "") -> Delivery:
+                  extra: str = "", sender: str | None = None, before: str = "", ear: Ears = Ears.LAPTOP,
+                  said_at: float | None = None) -> Delivery:
     """Type the words, tagged with how they were heard, to `to`, or else to the agent that spoke last. When it
     can't, says why out loud and returns the reason, for the phone to show too. urgent: the phone's
     "send now" (held send button): the agent's work is interrupted first, so the words reach it at once instead of
     waiting in its queue (Escape in a terminal; in a Cursor chat, Enter again, which sends a queued message now).
     sender: the words are a reminder an agent (or a script, "") set, not the user: tagged with who set it and never
-    typed as a slash command, so one agent can't run another's commands or pass for the user. ear: "phone" when
-    the phone transcribed the words: "[hands-free · call · phone ears]" (no tone marks, names may be misheard)."""
+    typed as a slash command, so one agent can't run another's commands or pass for the user. ear: Ears.PHONE when
+    the phone transcribed a turn on a call: "[hands-free · call · phone ears]" (no tone marks, names may be
+    misheard). said_at: a turn the phone kept through a dropped line, delivered late: "· late, said 14:05"."""
     from voice import chains
     from voice.desktop import typeable
     # No control characters from anywhere (a shared web page, a child's report, a reminder): an ESC or a carriage
@@ -753,8 +768,8 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
     # when it starts with "/", so no tag, introduction or call note in front of it (none of those is then given)
     command = report or (sender is None and is_command(text, speaker))
     tag = heard.tag if sender is None else Heard.SCHEDULED.tagged(sender)
-    if ear == "phone" and sender is None:
-        tag = f"{tag[:-1]} · {PHONE_EARS}]"
+    if sender is None:
+        tag = with_ears(tag, heard, ear, said_at)
     message = text.strip() if command \
         else f"{tag} {introduce(speaker, heard)}{on_a_call(speaker, heard)}{before}{text}{extra}"
     if speaker is None:
@@ -892,19 +907,23 @@ def _none(*_args) -> None:
     return None
 
 
-def act_on_turn(text: str, rich: str, heard: Heard, last: tuple[str, Heard] | None = None, *, ear: str = "",
-                ding: Callable[[], None] = _none, off: Callable[[], None] = _none,
-                echo: Callable[[str], None] = _none, sent: Callable[[tuple[str, Heard]], None] = _none
-                ) -> float | None:
+def act_on_turn(text: str, rich: str, heard: Heard, last: tuple[str, Heard] | None = None, *,
+                ear: Ears = Ears.LAPTOP, ding: Callable[[], None] = _none, off: Callable[[], None] = _none,
+                off_words: str = "Hands-free off.", phase: bool = True,
+                echo: Callable[[str], None] = _none, sent: Callable[[tuple[str, Heard]], None] = _none,
+                unsent: Callable[[Delivery], None] = _none) -> float | None:
     """Act on a finished turn's words (`text` plain, `rich` with tone marks): give them time, switch, hang up, drop
     them, or deliver them. Shared by every ear that hears a turn. `last` is the last message sent ("send that to …");
-    `ding` confirms a switch or a delivery, `off` stops hands-free, `echo` is told nothing said over a clip cut it,
-    `sent` gets the message delivered. Returns seconds to keep listening (0: the default), None for none."""
+    `ding` confirms a switch or a delivery, `off` stops hands-free (then `off_words` are said), `echo` is told nothing
+    said over a clip cut it, `sent` gets the message delivered, `unsent` why it wasn't. `phase`: False leaves the
+    phase alone (the phone has opened a newer turn since). Returns seconds to keep listening (0: the default), None
+    for none."""
     kind = meaning(text)
     # Before anything is said or sent: talkback may speak again, and knows whether an agent got words
     to = last_speaker() if kind is Meaning.MESSAGE else None  # who deliver() will type it to
     set_target(kind is Meaning.MESSAGE, to.session if to else "")
-    set_phase(Phase.IDLE, BY_HANDSFREE)
+    if phase:
+        set_phase(Phase.IDLE, BY_HANDSFREE)
     if kind is Meaning.TIME:
         log(HANDSFREE_LOG, "heard: give me a minute")
         say("Take your time.")
@@ -924,7 +943,7 @@ def act_on_turn(text: str, rich: str, heard: Heard, last: tuple[str, Heard] | No
     if kind is Meaning.OFF:
         log(HANDSFREE_LOG, "heard: hands-free off")
         off()
-        say("Hands-free off.")
+        say(off_words)
     elif kind is Meaning.CANCEL:
         log(HANDSFREE_LOG, "heard: never mind")
     elif kind is Meaning.NOTHING:
@@ -932,9 +951,11 @@ def act_on_turn(text: str, rich: str, heard: Heard, last: tuple[str, Heard] | No
         if heard is Heard.OVER_YOU:  # nothing said over a clip: our echo cut it; no cut-resume-cut loop
             echo("echo cut a clip")
         return None
-    elif deliver(rich, heard, to=to, urgent=cut_in(heard, to), ear=ear):  # the one noted as the target above
+    elif delivered := deliver(rich, heard, to=to, urgent=cut_in(heard, to), ear=ear):  # the target noted above
         ding()
         sent((rich, heard))
         if interrupt_waiting():
             clear_interrupt()
+    else:
+        unsent(delivered)
     return THINK_WINDOW if THINK.search(text) else 0.0

@@ -28,8 +28,8 @@ from voicegate import VoiceGate
 from voice.speech import whisper, whistle
 from voice.spool import queued
 from voice.state import (AWAY, BY_HANDSFREE, CALL_BUTTON_ONLY, CALL_PUSH, CALL_SOUND, CLOSE, HANDSFREE_LOG,
-                         HANDSFREE_MODE, LISTEN, PAUSE, PLAYING, WORKER_PID, in_call, log, mic_source, ptt_busy,
-                         read_json, release_phase)
+                         HANDSFREE_MODE, LISTEN, PAUSE, PLAYING, WORKER_PID, in_call, log, mic_source, phone_listens,
+                         ptt_busy, read_json, release_phase)
 
 WINDOW = 8.0  # seconds to answer after a clip
 FOLLOW = 6.0  # seconds to carry on after their own message (once, never chained)
@@ -293,9 +293,17 @@ class Listener:
                 self.restart_due |= self.echo_watch.clip_over()
         self.play_started = (self.play_started or time.monotonic()) if playing else 0.0
         button_only = calling and CALL_BUTTON_ONLY.exists()  # a noisy place: noise must not talk over us
-        open_ = ((playing or calling or self.window.is_open()) and not button_only
+        # The phone hears the user itself (a bad line): it sends the words, so nothing here opens a turn, the talk
+        # button's and the wake word's included; what arrives on the line meanwhile is not the user's turn
+        phone_ears = calling and phone_listens(calling)
+        open_ = ((playing or calling or self.window.is_open()) and not button_only and not phone_ears
                  and not ptt_busy() and not PAUSE.exists())
         self.show(Mode.LISTENING if open_ else Mode.WAITING)
+        if phone_ears:
+            self.gate.clear()
+            self.preroll.clear()
+            self.talkover.reset()
+            return False
         if calling and CALL_PUSH.exists() and not ptt_busy():  # the call page's talk button: a turn until let go
             self.turn(list(self.preroll), Heard.PUSHED, floor_of(self.room, db))
             return True

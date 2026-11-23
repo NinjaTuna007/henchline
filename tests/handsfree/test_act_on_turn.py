@@ -48,7 +48,7 @@ class Acting(unittest.TestCase):
     def test_plain_words_are_delivered_to_the_last_speaker(self):
         self.assertEqual(self.act("check the logs please", rich="check the *logs* please"), 0.0)
         self.fake["deliver"].assert_called_once_with("check the *logs* please", Heard.CALL, to=CLAUDE, urgent=False,
-                                                     ear="")
+                                                     ear=routing.Ears.LAPTOP)
         self.fake["set_target"].assert_called_once_with(True, CLAUDE.session)
         self.fake["set_phase"].assert_called_once_with(routing.Phase.IDLE, routing.BY_HANDSFREE)
         self.ding.assert_called_once_with()
@@ -56,8 +56,8 @@ class Acting(unittest.TestCase):
         self.assertEqual(self.said, [])
 
     def test_the_phone_ear_goes_along(self):
-        self.act("check the logs", ear="phone")
-        self.assertEqual(self.fake["deliver"].call_args.kwargs["ear"], "phone")
+        self.act("check the logs", ear=routing.Ears.PHONE)
+        self.assertEqual(self.fake["deliver"].call_args.kwargs["ear"], routing.Ears.PHONE)
 
     def test_a_held_send_is_cleared_by_the_turn_it_waited_for(self):
         self.fake["interrupt_waiting"].return_value = True
@@ -133,6 +133,19 @@ class Acting(unittest.TestCase):
         self.assertIsNone(self.act("uh", heard=Heard.OVER_YOU))
         self.echo.assert_called_once_with("echo cut a clip")
 
+    def test_why_words_did_not_arrive_goes_to_the_caller(self):
+        refused = routing.Delivery.refused(routing.Refusal.NOBODY, "x")
+        self.fake["deliver"].return_value = refused
+        unsent = mock.Mock()
+        self.act("check the logs", unsent=unsent)
+        unsent.assert_called_once_with(refused)
+
+    def test_not_for_anything_but_a_message(self):
+        unsent = mock.Mock()
+        self.act("never mind", unsent=unsent)
+        self.act("give me a minute", unsent=unsent)
+        unsent.assert_not_called()
+
 
 class TurnActs(unittest.TestCase):
     """The laptop's turn hands its words to act_on_turn with its own ding, stop, echo report and last message."""
@@ -150,7 +163,8 @@ class TurnActs(unittest.TestCase):
             self.assertEqual(taker.act("check the logs", "check the *logs*", Heard.REPLY), 0.0)
             ding.assert_called_once_with(taker.cfg)
             self.assertEqual(taker.last_message, ("check the *logs*", Heard.REPLY))
-            deliver.assert_called_once_with("check the *logs*", Heard.REPLY, to=CLAUDE, urgent=False, ear="")
+            deliver.assert_called_once_with("check the *logs*", Heard.REPLY, to=CLAUDE, urgent=False,
+                                            ear=routing.Ears.LAPTOP)
             taker.act("turn off hands-free", "turn off hands-free", Heard.REPLY)
             taker.stop.set.assert_called_once_with()
             say.assert_called_once_with("Hands-free off.")
@@ -176,9 +190,48 @@ class PhoneEarsTag(unittest.TestCase):
         self.assertEqual(self.deliver(Heard.PUSHED), "[hands-free · call, held the talk button] check the logs")
 
     def test_the_phones_ears(self):
-        self.assertEqual(self.deliver(Heard.CALL, ear="phone"), "[hands-free · call · phone ears] check the logs")
-        self.assertEqual(self.deliver(Heard.PUSHED, ear="phone"),
+        self.assertEqual(self.deliver(Heard.CALL, ear=routing.Ears.PHONE),
+                         "[hands-free · call · phone ears] check the logs")
+        self.assertEqual(self.deliver(Heard.PUSHED, ear=routing.Ears.PHONE),
                          "[hands-free · call, held the talk button · phone ears] check the logs")
+
+    def test_only_on_a_spoken_call_turn(self):
+        """A typed line or a text is the phone's anyway: never "phone ears", whatever the caller passes."""
+        self.assertEqual(self.deliver(Heard.TYPED, ear=routing.Ears.PHONE), "[hands-free · call, typed] check the logs")
+        with mock.patch.object(routing, "introduce", return_value=""):
+            self.assertEqual(self.deliver(Heard.TEXTED, ear=routing.Ears.PHONE), "[phone · text] check the logs")
+        self.assertEqual(self.deliver(Heard.WOKE, ear=routing.Ears.PHONE), "[hands-free · woke] check the logs")
+
+    def test_late_says_when_it_was_said(self):
+        said = time.mktime((2026, 11, 23, 14, 5, 0, 0, 0, -1))
+        self.assertEqual(self.deliver(Heard.CALL, ear=routing.Ears.PHONE, said_at=said),
+                         "[hands-free · call · phone ears · late, said 14:05] check the logs")
+
+    def test_an_agents_reminder_is_never_tagged_with_ears(self):
+        self.assertEqual(routing.with_ears("[henchline · scheduled]", Heard.SCHEDULED, routing.Ears.PHONE),
+                         "[henchline · scheduled]")
+
+
+
+class LateTurnsKeepTheCallsPhotos(unittest.TestCase):
+    def test_no_photos_or_ring_note_with_a_late_turn(self):
+        with mock.patch.object(routing, "in_call", return_value=True), \
+                mock.patch.object(routing, "is_command", return_value=False), \
+                mock.patch.object(routing.snaps, "take") as take, \
+                mock.patch.object(routing, "claim_ring_note", return_value=None) as claim, \
+                mock.patch.object(routing, "deliver_words", return_value=routing.Delivery.done()) as words:
+            routing.deliver("check the logs", Heard.CALL, to=CLAUDE, ear=routing.Ears.PHONE, said_at=1000.0)
+            take.assert_not_called()
+            claim.assert_not_called()
+            self.assertEqual(words.call_args.kwargs["said_at"], 1000.0)
+            routing.deliver("check the logs", Heard.CALL, to=CLAUDE, ear=routing.Ears.PHONE)
+            take.assert_called_once()  # a turn of now takes them, as ever
+
+    def test_the_phones_off_words(self):
+        with mock.patch.object(routing, "say") as say, mock.patch.object(routing, "set_target"), \
+                mock.patch.object(routing, "set_phase"):
+            routing.act_on_turn("hands-free off", "hands-free off", Heard.CALL, off_words="Open line off.")
+        say.assert_called_once_with("Open line off.")
 
 
 if __name__ == "__main__":

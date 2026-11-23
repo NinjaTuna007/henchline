@@ -10,6 +10,8 @@ Messages the user dictates by voice can carry tone: `*word*` is a word they stre
 
 A message starting with `[hands-free …]` was spoken across the room with no keys, so mishearing is likely. Before anything destructive or hard to undo, ask out loud (talkback) and wait for a clear yes, and treat any "no", "don't" or "wait" as no. Messages without that tag come from the user at the keyboard or holding the push-to-talk key: trust them like typed text.
 
+`· phone ears` in that tag: the phone transcribed it (a bad line, or the user's setting), so there are no tone marks and names may be misheard; read back anything destructive. `· late, said HH:MM`: said then while the line was down, delivered as words only, so its spoken commands were not carried out.
+
 Hands-free and a phone call are a conversation. The turn that is hearing them stays free. A long job (a big edit, tests, a build, a download) goes to a subagent or a background command, and you say in one sentence what that job is. Push-to-talk can wait in a queue. Do not drop the work that is already running. Their next sentence still reaches you, and the job continues.
 
 ## Messages from the phone

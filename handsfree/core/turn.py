@@ -23,13 +23,15 @@ from sensing import PER_SECOND, RATE, SPEECH, level
 from talkover import TalkOver, our_own_words, own_share, word_keys
 from voicegate import START_DB
 from voice.speech import nemotron, whisper
-from voice.state import (BY_HANDSFREE, CALL_PUSH, HANDSFREE_LOG, HANDSFREE_WAV, Phase, in_call, log, ptt_busy,
-                         release_phase, set_phase, set_target)
+from voice.state import (BY_HANDSFREE, CALL_PUSH, HANDSFREE_LOG, HANDSFREE_WAV, Phase, gap_since, in_call, log,
+                         phone_listens, phone_took_ears_since, ptt_busy, release_phase, set_phase, set_target)
 
 BUDS_LEAVING = 1.0  # seconds: buds that disconnect this soon before a tap turn starts, or during it, drop it
 WAIT_FOR_WORDS = 5.0  # after the wake word, seconds to start talking before it gives up
 CHIME_GRACE = 1.2  # the listening chime is loud in the mic; it must not count as them starting, then the pause close the turn
 END_DB, END_FRAMES = 6, 50  # 1.5 s at most END_DB over the floor ends the turn
+GAP_CHECK = 5  # frames between looks for the phone taking a call turn over (150 ms)
+TAKEOVER_WAIT = 3.0  # seconds a call turn whose audio paused waits for the phone to say it took it over
 CALL_END_FRAMES = 30  # 0.9 s on a phone call: the user found 1.5 s slow there; a longer pause becomes a follow-on
 # Nemotron's words so far end a sentence ("…tests.", not "…and uh"): the turn ends after this much quiet instead
 # (the user's wish, 2026-11-17: answers sooner, now that the words are ready as they speak)
@@ -140,7 +142,7 @@ class Turn:
             release_phase(BY_HANDSFREE)  # act() normally has already, before anything is sent
 
     def record(self, frames: list[np.ndarray], floor: float, heard: Heard) -> list[np.ndarray] | None:
-        """Frames until a pause, "over", or the limit; None if push-to-talk took over."""
+        """Frames until a pause, "over", or the limit; None if push-to-talk or the phone's own ears took over."""
         set_phase(Phase.RECORDING, BY_HANDSFREE)  # talkback goes quiet and holds
         self.show(Mode.RECORDING)
         if self.live:  # a turn that failed before it was transcribed: its decoding stops
@@ -150,6 +152,7 @@ class Turn:
             if self.live:
                 self.live.feed(frame)
         since, quiet, peak = time.monotonic(), 0, -120.0
+        began = time.monotonic() - len(frames) / PER_SECOND  # for the phone's takeover: from the pre-roll on
         started = heard is not Heard.WOKE  # after "hey Claude" people pause for the chime
         calling = in_call()
         end = CALL_END_FRAMES if calling else END_FRAMES
@@ -183,6 +186,8 @@ class Turn:
                 self.buds_left = True
                 release_phase(BY_HANDSFREE)  # take() releases only a turn it transcribes; talkback must not hold on
                 return None
+            if calling and len(frames) % GAP_CHECK == 0 and phone_listens(calling):
+                return self.phone_took_over()
             frame = samples.astype(np.float32) / 32768
             frames.append(frame)
             if self.live:
@@ -210,11 +215,36 @@ class Turn:
                 elif time.monotonic() - voice_at > (VOICE_GONE if spoke else WAIT_FOR_WORDS):
                     voiceless = True  # their words ended a second ago, or none came at all
                     break
+        # The pause that ended it may be the phone taking over: it says so in a moment, or the words are delivered here
+        if calling and (phone_listens(calling) or gap_since(began) and self.phone_takes_it(began, calling)):
+            return self.phone_took_over()
         reason = ("the button" if released else "limit" if time.monotonic() - since >= MAX_SECONDS
                   else "no voice for a second (steady sound on the line)" if voiceless
                   else "a finished sentence" if finished else "over" if quiet == OVER_FRAMES else "pause")
         log(HANDSFREE_LOG, f"recorded {time.monotonic() - since:.1f}s, ended by {reason} (floor {floor:.0f} dB)")
         return frames
+
+    @staticmethod
+    def phone_takes_it(began: float, calling: bool) -> bool:
+        """The phone's audio paused during this turn while the phone could take it over: whether it says, within
+        TAKEOVER_WAIT, that it did. If not, the turn is the laptop's (a duplicate beats words lost)."""
+        until = time.monotonic() + TAKEOVER_WAIT
+        while True:
+            if phone_took_ears_since(began, calling):
+                return True
+            if time.monotonic() >= until:
+                log(HANDSFREE_LOG, "the phone's audio paused, but it didn't take the turn over: delivered here")
+                return False
+            time.sleep(0.1)
+
+    def phone_took_over(self) -> None:
+        """The phone hears the user itself now and delivers the whole utterance: this half of it is dropped."""
+        log(HANDSFREE_LOG, "the phone took the turn over: dropped the laptop's half of it")
+        if self.live:
+            self.live.cancel()
+            self.live = None
+        release_phase(BY_HANDSFREE)  # take() releases only a turn it transcribes; talkback must not hold on
+        return None
 
     def transcribe(self, frames: list[np.ndarray]) -> tuple[str, str]:
         """(plain text, text with tone marks); empty when there was no speech."""

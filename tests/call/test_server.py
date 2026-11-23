@@ -132,7 +132,8 @@ class ToAgent(unittest.TestCase):
                 mock.patch.object(server.routing, "switch_to") as switch, \
                 mock.patch.object(server.routing, "deliver", return_value=True) as deliver:
             self.assertEqual(server.to_agent("hi", "claude-1", server.Heard.TEXTED, False), ("Claude", ""))
-            deliver.assert_called_once_with("hi", server.Heard.TEXTED, to=target, urgent=False, sender=None)
+            deliver.assert_called_once_with("hi", server.Heard.TEXTED, to=target, urgent=False, sender=None,
+                                            ear=server.Ears.LAPTOP, said_at=None)
             switch.assert_not_called()
 
 

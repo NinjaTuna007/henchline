@@ -43,7 +43,9 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from aiohttp import WSMsgType, web
 
@@ -58,7 +60,8 @@ from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
 from voice.delivery import Refusal  # noqa: E402
 from voice.desktop import current as desktop, cursor_bridge, tmux  # noqa: E402
 from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CALL_SILENT, CALL_STAY_ON, CALL_HANGUP, CALL_MIRROR, CALL_ORIGIN,  # noqa: E402
-                         CALL_DROPPED, REJOIN,
+                         CALL_DROPPED, REJOIN, CALL_EAR, CALL_EAR_SINCE, CALL_GAP, LINE_DOWN_HOLD, BY_PHONE_EAR, Ears,
+                         release_phase, set_phase,
                          CALL_PINNED, CALL_RANG_BACK, CALL_SOUND, CALL_TOLD, PHASE,
                          SPAWNED, TEXTS, VOICE_NOTE_STALE, VOICE_NOTES,
                          CALL_PORT, CALL_PUSH, CALL_INTERRUPT, CALL_CUT_IN, CALL_CHECK, CLAUDE_MODE,
@@ -151,7 +154,7 @@ class Status:
             return {"mode": mode, "state": f"{playing.agent.capitalize()} is speaking",
                     "speaker": {"agent": playing.agent, "session": playing.session}}
         phase, by = phase_now()
-        if by == BY_HANDSFREE and phase is Phase.RECORDING:
+        if by in (BY_HANDSFREE, BY_PHONE_EAR) and phase is Phase.RECORDING:
             return {"mode": mode, "state": "Hearing you…"}
         if by == BY_HANDSFREE and phase is Phase.TRANSCRIBING:
             return {"mode": mode, "state": "Writing it down…"}
@@ -454,8 +457,66 @@ def confirm_switch(message: dict) -> str:
         return ""
 
 
-async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None) -> str:
-    """The talk button held or let go, a switch, or a typed chat message; a note for the page, if any."""
+def heard_turn(message: object) -> bool:
+    """A turn the phone's own ears heard: {"heard": {...}}. Not the phone voice's fallback, whose "heard" is a count."""
+    return isinstance(message, dict) and isinstance(message.get("heard"), dict) and "tts" not in message
+
+
+QUEUED = ("chat", "switch")  # messages that may take a while: in order, one at a time, behind each other
+
+
+def queued(message: object) -> bool:
+    """Waits its turn behind the slow messages (a typed line, a heard turn, a switch); the rest (flags, pings, the
+    phone voice's reports) is handled as it comes, as before."""
+    return isinstance(message, dict) and (any(key in message for key in QUEUED) or heard_turn(message))
+
+
+class Inbox:
+    """The phone's messages on a call. The slow ones (queued()) are handled in the order sent, one at a time, by a
+    task of their own, so a typed line or a heard turn being typed into an agent never holds up a ping's answer or
+    the talk button's flag. The others are handled at once."""
+
+    def __init__(self, handle: Callable[[dict], Awaitable[str]], send: Callable[[str], Awaitable[None]],
+                 arrived: Callable[[dict], None] | None = None) -> None:
+        self.handle, self.send, self.arrived = handle, send, arrived  # arrived: told of each queued one as it comes
+        self.queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.task = asyncio.create_task(self.run())
+
+    async def take(self, message: dict) -> None:
+        if queued(message):
+            if self.arrived is not None:
+                self.arrived(message)
+            self.queue.put_nowait(message)
+            return
+        if note := await self.handle(message):
+            await self.send(note)
+
+    async def run(self) -> None:
+        while True:
+            message = await self.queue.get()
+            try:
+                if note := await self.handle(message):
+                    await self.send(note)  # a refused typed line, or the answer to a heard turn
+            except Exception as exc:  # noqa: BLE001  one message gone wrong doesn't end the call
+                log(HANDSFREE_LOG, f"call: a message from the phone failed ({exc.__class__.__name__})")
+            finally:
+                self.queue.task_done()
+
+    async def close(self, wait: float) -> None:
+        """The connection ended: what was sent still goes (a turn the user said is not lost), for up to `wait` s."""
+        try:
+            await asyncio.wait_for(self.queue.join(), wait)
+        except asyncio.TimeoutError:
+            log(HANDSFREE_LOG, f"call: {self.queue.qsize() + 1} messages from the phone left unhandled at the end")
+        self.task.cancel()
+
+
+async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None,
+                    listening: PhoneListening | None = None) -> str:
+    """The talk button held or let go, a switch, or a typed chat message; a note for the page, if any.
+    listening: the phone's own ears on this call (its speech-to-text): which ears hear, and the turns it heard."""
+    if "ping" in message and "tts" not in message:  # the phone's measure of the line, every second: at once
+        return json.dumps({"pong": message["ping"]})
     if "tts" in message:  # the phone can speak talkback itself, or can't keep up any more (voice/phonevoice.py)
         await asyncio.get_running_loop().run_in_executor(None, phonevoice.offer, message)
         TTS_CHANGED.set()  # the speaker loop's cached "the phone renders" is stale now (a fallback's first second)
@@ -469,6 +530,20 @@ async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None) ->
         return ""
     if "said" in message:  # the phone started a piece of a clip it speaks
         await asyncio.get_running_loop().run_in_executor(None, phonevoice.said, message)
+        return ""
+    # The phone's own ears. After the phone voice's messages: its fallback carries "heard" too (a count of what
+    # it played), which is not a turn
+    if listening is not None and heard_turn(message):
+        return json.dumps(await listening.heard(message["heard"]))
+    if listening is not None and "ear" in message:
+        listening.switch_ears(message["ear"])
+        return ""
+    if listening is not None and "ear_ready" in message:  # its recognizer loaded: a pause in its audio is a takeover
+        listening.ready = bool(message["ear_ready"])
+        log(HANDSFREE_LOG, f"call: the phone {'can' if listening.ready else 'can no longer'} take turns over")
+        return ""
+    if listening is not None and "hearing" in message:
+        listening.hears(bool(message["hearing"]))
         return ""
     if str(message.get("note") or "").startswith("dropped:"):  # why the phone's line last dropped (CallService)
         note = " ".join(str(message["note"]).split())[:200]  # one line per event, whatever the exception said
@@ -699,7 +774,7 @@ def typed(words: str, session: str, urgent: bool = False) -> tuple[bool, str]:
 
 
 def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent: bool = False,
-             sender: str | None = None) -> tuple[str, str]:
+             sender: str | None = None, ear: Ears = Ears.LAPTOP, said_at: float | None = None) -> tuple[str, str]:
     """Words for the agent whose chat the phone shows: (who got them, "") or ("", a note why nobody did).
 
     Another agent may have spoken since the phone last heard who is current: the chat shown wins, so the words
@@ -719,7 +794,8 @@ def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent
         if switch and (not current or current.session != session):
             routing.switch_to(target)
     # sender: a reminder an agent or a script set (see routing.deliver_words)
-    delivery = routing.deliver(words, heard, to=target, urgent=urgent, sender=sender)  # said out loud on the laptop too
+    # said out loud on the laptop too
+    delivery = routing.deliver(words, heard, to=target, urgent=urgent, sender=sender, ear=ear, said_at=said_at)
     if not delivery:
         return "", "Not sent: " + (delivery.why or "the laptop couldn't type it into the agent.")
     got = target or last_speaker()
@@ -927,6 +1003,254 @@ async def texted(request: web.Request) -> web.Response:
 
     typing.add_done_callback(typed)
     return web.json_response(await asyncio.shield(answer))
+
+
+HEARD: dict[str, tuple[float, asyncio.Future]] = {}  # a heard turn's id → its answer: one sent again isn't acted twice
+HEARD_FOR = 86400  # a turn the phone kept through a dropped line may come back hours later, from its outbox
+TAKEOVER_GAP = 0.5  # seconds without the phone's audio, once it can listen itself, that are its taking a turn over
+LINE_HOLD_MARGIN = 5.0  # seconds a dropped call is kept past the phone's own line-down hold
+MOST_HEARD = 20000  # characters in one heard turn: two minutes of speech is far less
+MOST_HEARING = 120.0  # seconds a phone turn may hold talkback (the laptop's own turns end at 120 s too)
+OPEN_LINE_OFF = "Open line off: hold the button to talk."  # "hands-free off", heard by the phone on a call
+
+
+class PhoneTurn(NamedTuple):
+    """A turn the phone's own speech-to-text heard: {"id", "text", "pushed", "said_at" (ms), "late", "session"}.
+    late: kept through a dropped line and sent once it was back: words only, never acted on as a command.
+    session: (optional) the agent a late turn was meant for; else the agent spoken to last."""
+
+    id: str
+    text: str
+    heard: Heard
+    said_at: float | None  # seconds since the epoch
+    late: bool
+    session: str = ""
+
+    @classmethod
+    def parse(cls, data: object, late: bool = False) -> PhoneTurn:
+        """ValueError when it isn't one (no id, words that aren't text, a late turn without its time)."""
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        tid, text, said_at = data.get("id"), data.get("text", ""), data.get("said_at")
+        if not isinstance(tid, str) or not 0 < len(tid) <= 128 or not isinstance(text, str):
+            raise ValueError("no id, or no text")
+        if said_at is not None and (isinstance(said_at, bool) or not isinstance(said_at, (int, float))
+                                    or said_at <= 0):
+            raise ValueError("said_at is not a time")
+        late = late or bool(data.get("late"))
+        if late and said_at is None:
+            raise ValueError("a late turn needs said_at")
+        return cls(tid, " ".join(text.split())[:MOST_HEARD], Heard.PUSHED if data.get("pushed") else Heard.CALL,
+                   said_at / 1000 if said_at is not None else None, late, str(data.get("session") or ""))
+
+    def logged(self) -> str:
+        """For the log: how many words and how long ago, never the words."""
+        ago = f", said {max(0.0, time.time() - self.said_at):.1f} s ago" if self.said_at else ""
+        return (f"{len(self.text.split())} words{ago}{', held the talk button' if self.heard is Heard.PUSHED else ''}"
+                f"{', late' if self.late else ''}")
+
+
+async def once(tid: str, work: Callable[[], dict]) -> dict:
+    """`work` (in the executor) for a heard turn the first time its id comes, its answer every time after. One not
+    delivered is forgotten, so sending it again tries again; nothing was acted on."""
+    now = time.time()
+    for old in [k for k, (at, _) in HEARD.items() if now - at > HEARD_FOR]:
+        del HEARD[old]
+    if tid in HEARD:
+        return await asyncio.shield(HEARD[tid][1])
+    loop = asyncio.get_running_loop()
+    answer = loop.create_future()
+    HEARD[tid] = (now, answer)
+
+    def settled(done: asyncio.Future) -> None:  # settled by the work itself, even if whoever asked is gone
+        if done.exception() is not None:
+            HEARD.pop(tid, None)
+            answer.set_exception(done.exception())
+            return
+        if "unsent" in done.result():
+            HEARD.pop(tid, None)
+        answer.set_result(done.result())
+
+    loop.run_in_executor(None, work).add_done_callback(settled)
+    return await asyncio.shield(answer)
+
+
+def late_words(turn: PhoneTurn) -> dict:
+    """A turn said while the line was down, delivered as words only (a "hang up" or a switch said then is moot now),
+    tagged with when it was said: to the agent it was meant for, or else the one spoken to last."""
+    if not turn.text or routing.FILLER.fullmatch(turn.text):
+        return {"taken": turn.id}
+    # Never typed as a slash command: said long ago, it runs nothing now
+    words = re.sub(r"^[\s/]+", "", turn.text)
+    if not words:
+        return {"taken": turn.id}
+    got, note = to_agent(words, turn.session, turn.heard, switch=False, ear=Ears.PHONE, said_at=turn.said_at)
+    return {"delivered": turn.id, "to": got} if got else {"note": note, "unsent": turn.id}
+
+
+class PhoneListening:
+    """The phone's own ears on this call (its speech-to-text, when the line is bad): which ears hear the user, whether
+    the phone can take a turn over, whether it hears them now, and the turns it heard.
+
+    The phone's turns act as the laptop's do (routing.act_on_turn), tagged "phone ears". Two differ: no chime (the
+    phone shows the answer), and "hands-free off", which here turns the call's open line off (only the talk button
+    gets in, on both ears): stopping the laptop's hands-free would not stop the phone hearing, and would leave nobody
+    listening once the line is good again."""
+
+    def __init__(self, send: Callable[[str], Awaitable[None]], resumed: bool = False) -> None:
+        self.send = send  # to the phone, from the event loop
+        self.loop = asyncio.get_running_loop()
+        self.ear = Ears.LAPTOP
+        if resumed:  # the phone listened on while the line was down, and says so again soon
+            try:
+                self.ear = Ears(CALL_EAR.read_text().strip())
+            except (OSError, ValueError):
+                pass
+        self.ready = False  # {"ear_ready"}: a pause in its audio is then its taking a turn over (CALL_GAP)
+        self.hearing = 0.0  # when it said {"hearing": true} (monotonic), until false: the phase is its to put back
+        self.opened = 0  # its turns opened ({"hearing": true}) so far
+        self.arrivals: dict[str, int] = {}  # a queued heard turn's id → turns opened when it arrived
+        self.gapped = False  # CALL_GAP written for the pause going on now
+        self.clip_told: str | None = None  # the clip last sent as {"playing"} ("": none), None: not told yet
+        self.last: tuple[str, Heard] | None = None  # its last message delivered, for "send that to …"
+
+    def switch_ears(self, said: object) -> None:
+        """{"ear": "phone"|"laptop"}: which ears hear the user from now on (and once more on reconnecting)."""
+        try:
+            ear = Ears(said)
+        except ValueError:
+            log(HANDSFREE_LOG, "call: the phone named ears there are none of: ignored")
+            return
+        CALL_EAR.parent.mkdir(parents=True, exist_ok=True)
+        CALL_EAR.write_text(ear.value)
+        if ear is Ears.PHONE:  # a laptop turn the phone took over midway is the phone's, even if it hands back soon
+            CALL_EAR_SINCE.write_text(f"{time.monotonic():.6f}")
+        if ear is not self.ear:
+            log(HANDSFREE_LOG, "call: the phone hears the user itself now" if ear is Ears.PHONE
+                else "call: the laptop hears the user again")
+        self.ear = ear
+        if ear is Ears.LAPTOP:
+            self.hears(False)
+
+    def hears(self, on: bool) -> None:
+        """{"hearing": true|false}: the phone's turn opened or closed. The phase says so, as hands-free's own does (in
+        its own name, so no laptop turn puts it back): talkback holds, the phone's queue is flushed and a quiet call
+        isn't nudged. Only while the phone listens."""
+        if on and self.ear is not Ears.PHONE:
+            return
+        if on:
+            self.opened += 1
+            set_phase(Phase.RECORDING, BY_PHONE_EAR)
+        elif self.hearing:
+            release_phase(BY_PHONE_EAR)
+        self.hearing = time.monotonic() if on else 0.0
+
+    def expire(self) -> None:
+        """A phone turn heard longer than a turn can last (its "false" lost): talkback no longer holds for it."""
+        if self.hearing and time.monotonic() - self.hearing > MOST_HEARING:
+            log(HANDSFREE_LOG, f"call: the phone's turn stayed open over {MOST_HEARING:.0f} s: no longer held for")
+            self.hears(False)
+
+    def arrived(self, message: dict) -> None:
+        """A heard turn came and waits in the inbox: a turn the phone opens meanwhile is newer than it."""
+        if heard_turn(message) and isinstance(message["heard"].get("id"), str):
+            self.arrivals[message["heard"]["id"]] = self.opened
+
+    async def heard(self, data: object) -> dict:
+        """{"heard": {...}}: a turn it heard. Answered {"delivered": id}, {"taken": id} (acted on, or nothing to
+        send), or {"note", "unsent": id}; the same answer for the same id again, without acting twice."""
+        try:
+            turn = PhoneTurn.parse(data)
+        except ValueError as exc:
+            log(HANDSFREE_LOG, f"call: the phone sent a turn that isn't one ({exc})")
+            tid = data.get("id") if isinstance(data, dict) and isinstance(data.get("id"), str) else ""
+            return {"note": "Not sent: that turn didn't arrive whole.", "unsent": tid[:128]}
+        # Another turn opened after this one came (it waited behind a slow message): that one is still being heard,
+        # and must keep its hold. A late turn, said long ago, leaves the turn of now alone too
+        newer = self.opened > self.arrivals.pop(turn.id, self.opened)
+        if not turn.late and not newer:  # its turn is over: act_on_turn puts the phase back first
+            self.hearing = 0.0
+        log(HANDSFREE_LOG, f"call: the phone heard a turn ({turn.logged()})")
+        return await once(turn.id, (lambda: late_words(turn)) if turn.late else (lambda: self.act(turn, not newer)))
+
+    def act(self, turn: PhoneTurn, phase: bool = True) -> dict:
+        """A turn said on the call, now: as the laptop's turns act (a switch, hang up, give me a minute, a message)."""
+        answer: dict = {"taken": turn.id}
+
+        def sent(message: tuple[str, Heard]) -> None:
+            self.last = message
+            answer.clear()
+            answer["delivered"] = turn.id
+
+        def unsent(delivery) -> None:
+            answer.clear()
+            answer.update({"note": "Not sent: " + (delivery.why or "the laptop couldn't type it into the agent."),
+                           "unsent": turn.id})
+
+        routing.act_on_turn(turn.text, turn.text, turn.heard, self.last, ear=Ears.PHONE, off=self.open_line_off,
+                            off_words=OPEN_LINE_OFF, sent=sent, unsent=unsent, phase=phase)
+        return answer
+
+    def open_line_off(self) -> None:
+        """"Hands-free off" heard by the phone: the call's open line goes off (as from the call menu), and the phone
+        is told, so its own ears honour it too."""
+        flag(CALL_BUTTON_ONLY, True)
+        asyncio.run_coroutine_threadsafe(self.send(json.dumps({"button_only": True})), self.loop)
+
+    def playing(self) -> dict | None:
+        """{"playing": {"clip", "text"}} (or null once nothing plays) when the clip changes while the phone listens:
+        it tells its own voice over a clip from the clip's words coming back (echo). None: nothing to send."""
+        if self.ear is not Ears.PHONE:
+            self.clip_told = None
+            return None
+        now = Playing.now()
+        clip = now.clip if now else ""
+        if clip == self.clip_told:
+            return None
+        self.clip_told = clip
+        return {"playing": {"clip": now.clip, "text": now.text} if now else None}
+
+    def gap(self, quiet: float, last_heard: float) -> None:
+        """No audio from the phone for `quiet` s (its mic last arrived at monotonic `last_heard`, the same clock in
+        every process here): past TAKEOVER_GAP, while it can take turns over and the laptop listens, the phone may be
+        taking this turn over (CALL_GAP): the laptop's turn waits a little before it is delivered."""
+        if quiet <= TAKEOVER_GAP:
+            self.gapped = False
+        elif self.ready and self.ear is Ears.LAPTOP and not self.gapped:
+            self.gapped = True
+            try:
+                CALL_GAP.write_text(f"{last_heard:.6f}")
+            except OSError as exc:  # the turn is then delivered as ever
+                log(HANDSFREE_LOG, f"call: couldn't note a pause in the phone's audio ({exc.__class__.__name__})")
+
+    def hold(self) -> float:
+        """Seconds a dropped call is kept: a phone that was listening itself stays on the call for LINE_DOWN_HOLD
+        with no connection at all; otherwise it reconnects within REJOIN or not at all."""
+        return LINE_DOWN_HOLD + LINE_HOLD_MARGIN if self.ear is Ears.PHONE else REJOIN
+
+    def over(self, line_lost: bool) -> None:
+        """The connection ended: the phone's turn, if open, is no longer heard. Its ears are kept through a drop
+        (it listens on, and says so again when back), forgotten when the call is over."""
+        if self.hearing:
+            release_phase(BY_PHONE_EAR)
+            self.hearing = 0.0
+        CALL_GAP.unlink(missing_ok=True)
+        if not line_lost:
+            CALL_EAR.unlink(missing_ok=True)
+            CALL_EAR_SINCE.unlink(missing_ok=True)
+
+
+async def heard_late(request: web.Request) -> web.Response:
+    """POST /call/heard: a turn the phone heard while no node could be reached, sent once one can, after its call
+    ended. Words only, tagged late with when they were said, to the agent named (else the one spoken to last).
+    Idempotent by id: {"id", "text", "pushed", "said_at" (ms), "session"} → as a {"heard"} on a call."""
+    trusted(request)
+    try:
+        turn = PhoneTurn.parse(await request.json(), late=True)
+    except (ValueError, AttributeError) as exc:
+        raise web.HTTPBadRequest(text=f"expected a heard turn ({exc})")
+    log(HANDSFREE_LOG, f"call: the phone sent a turn it heard with the line down ({turn.logged()})")
+    return web.json_response(await once(turn.id, lambda: late_words(turn)))
 
 
 async def crew(request: web.Request) -> web.Response:
@@ -2684,6 +3008,7 @@ async def sent_file(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(path, headers=files.headers(path))
 
 
+INBOX_DRAIN = 2.0  # seconds the phone's last messages may take to be handled once its connection ended
 LIVE: list[web.WebSocketResponse] = []  # this server's call connection, while one is up
 
 
@@ -2727,6 +3052,9 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             snaps.clear()  # photos taken on an earlier call
             CALL_RING_NOTE.unlink(missing_ok=True)  # and an earlier ring's reason
             phonevoice.call_over()  # a new call: no clip or offer left from an earlier one (a drop keeps them)
+            CALL_EAR.unlink(missing_ok=True)  # the laptop hears a new call until the phone says otherwise
+            CALL_EAR_SINCE.unlink(missing_ok=True)  # an earlier call's (or boot's: its clock starts again)
+        CALL_GAP.unlink(missing_ok=True)
         blank_words()  # words a killed server never blanked
         for stale in CALL_MIRROR.glob("*.json"):  # terminal lines from before this call
             stale.unlink(missing_ok=True)
@@ -2736,6 +3064,12 @@ async def call(request: web.Request) -> web.WebSocketResponse:
         await asyncio.get_running_loop().run_in_executor(None, turn_on_handsfree, False)  # with talkback
         log(HANDSFREE_LOG, "phone call resumed" if resume else "phone call started")
         LIVE.append(ws)
+
+        async def send(text: str) -> None:
+            if not ws.closed:
+                await ws.send_str(text)
+
+        listening = PhoneListening(send, resumed=resume)
 
         async def to_phone() -> None:
             renders, asked = False, 0.0  # whether the phone speaks talkback: read at most twice a second
@@ -2773,7 +3107,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                 # The user started talking (over a clip, or not): the phone drops the talkback it still has queued, up
                 # to a second and a fifth, so a cut clip stops there too (2026-11-21: it talked on after being cut)
                 phase, by = phase_now()
-                now_hearing = by == BY_HANDSFREE and phase is Phase.RECORDING
+                now_hearing = by in (BY_HANDSFREE, BY_PHONE_EAR) and phase is Phase.RECORDING
                 if now_hearing and not hearing:
                     await ws.send_json({"flush": True})
                     ear.flushed()
@@ -2805,6 +3139,8 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                     if now_agents != shown_agents:
                         await ws.send_json(now_agents)
                         shown_agents = now_agents
+                if told := listening.playing():  # the phone hears the user itself: what plays, for its echo check
+                    await ws.send_json(told)
                 for event in status.events():
                     await ws.send_json(event)
                     if CALL_LEDGER is not None and isinstance(event.get("chat"), dict):
@@ -2883,10 +3219,15 @@ async def call(request: web.Request) -> web.WebSocketResponse:
         async def watch_line() -> None:
             """The phone's mic arrives all the time: when it stops for 3 s the line has dropped, and talkback waits
             instead of speaking to nobody (the user's worry, 2026-11-17). It starts again when the phone is back,
-            or, if the call ends, the waiting words go to the phone as texts."""
+            or, if the call ends, the waiting words go to the phone as texts. While the phone hears the user itself
+            it sends no audio: any message (its pings, every second) is the line. A shorter pause may be the phone
+            taking a turn over (PhoneListening.gap)."""
             while not ws.closed:
-                await asyncio.sleep(0.5)
-                if time.monotonic() - last_audio[0] > 3:  # an earbud switch can pause it 1-3 s
+                await asyncio.sleep(0.1)
+                quiet = time.monotonic() - last_audio[0]
+                listening.gap(quiet, last_audio[0])
+                listening.expire()
+                if quiet > 3:  # an earbud switch can pause it 1-3 s
                     if not CALL_SILENT.exists():  # when it went quiet: talkback says again what played since
                         CALL_SILENT.write_text(f"{time.time() - (time.monotonic() - last_audio[0]):.3f}")
                 else:
@@ -2911,6 +3252,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
         speaker_text = asyncio.create_task(phone_voice())
         heard = 0  # bytes of the phone's mic, for the log
         silent = SilentMic()
+        inbox = Inbox(lambda message: from_page(message, ear, silent, listening), send, listening.arrived)
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
@@ -2920,11 +3262,15 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                         asyncio.get_running_loop().run_in_executor(None, tell_mic_silent)
                     mic.stdin.write(msg.data)
                     await mic.stdin.drain()
-                elif msg.type == WSMsgType.TEXT and (note := await from_page(msg.json(), ear, silent)):
-                    await ws.send_str(note)  # only a refused typed line has one
+                elif msg.type == WSMsgType.TEXT:
+                    message = msg.json()
+                    if listening.ear is Ears.PHONE:  # no audio comes while the phone listens: this is the line
+                        last_audio[0] = time.monotonic()
+                    await inbox.take(message)
                 elif msg.type == WSMsgType.ERROR:
                     break
         finally:
+            await inbox.close(INBOX_DRAIN)  # still in LIVE: a reconnect meanwhile takes over as from any drop
             if ws in LIVE:
                 LIVE.remove(ws)
             CALL_PUSH.unlink(missing_ok=True)
@@ -2934,6 +3280,8 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             CALL_SOUND.unlink(missing_ok=True)
             speaker_text.cancel()
             line_lost = dropped_line(ws.close_code, bool(hung_up_here))
+            hold = listening.hold()
+            listening.over(line_lost)
             if not line_lost:  # hung up: no clip is spoken any more. A drop keeps them: the phone may still be
                 phonevoice.call_over()  # speaking one, and says how far it got when it's back
                 CALL_RING_NOTE.unlink(missing_ok=True)  # a ring's reason no turn took is moot now
@@ -2947,7 +3295,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                 watcher.cancel()
             if line_lost:  # not a hang-up: the phone may come back
                 write_json(CALL_DROPPED, {"since": round(time.time() - (time.monotonic() - last_audio[0]), 3),
-                                          "until": round(time.time() + REJOIN, 3)})
+                                          "until": round(time.time() + hold, 3)})
             CALL.unlink(missing_ok=True)  # hands-free and talkback go back to the laptop first
             for target in call_back if hung_up_here else []:  # hung up for quiet (by us, not them): once
                 CALL_RANG_BACK.touch()
@@ -3320,6 +3668,7 @@ def main() -> int:
     app = web.Application()
     app.router.add_get("/", lambda _: web.FileResponse(HERE / "page.html"))
     app.router.add_get("/call", call)
+    app.router.add_post("/call/heard", heard_late)
     app.router.add_post("/share/file", share_file)
     app.router.add_post("/share/tell", share_tell)
     app.router.add_post("/share/snap", share_snap)

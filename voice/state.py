@@ -72,6 +72,40 @@ CALL_SILENT = STATE / "call.no-audio"  # the phone's mic stopped arriving mid-ca
 # once the window passes (the user's catch in a lift, 2026-11-22)
 CALL_DROPPED = STATE / "call.dropped"
 REJOIN = 35.0  # seconds a dropped call may come back: the phone retries for 30 s
+# The phone's own speech-to-text on a call (when the line is bad): which Ears hear the user, as its value. The call
+# server writes it from the phone's {"ear"}, only for a phone that can listen itself. Hands-free opens no turns while
+# it says Ears.PHONE
+CALL_EAR = STATE / "call.ear"
+CALL_EAR_SINCE = STATE / "call.ear.since"  # when the phone last took the ears (time.monotonic(): one clock here)
+# When the phone's audio paused (time.monotonic()) while the phone was ready to take the turn over: a laptop turn
+# that saw it waits a moment before it is delivered, and is dropped if the phone takes the ears meanwhile
+CALL_GAP = STATE / "call.gap"
+LINE_DOWN_HOLD = 180.0  # seconds a phone that listens itself stays on a call with no connection at all, then hangs up
+
+
+def phone_listens(calling: bool | None = None) -> bool:
+    """On a call, the phone hears the user itself (its speech-to-text), not the laptop. `calling`: in_call(),
+    when the caller knows it already."""
+    try:
+        said = CALL_EAR.read_text().strip()
+    except OSError:
+        return False
+    return said == Ears.PHONE.value and (in_call() if calling is None else calling)
+
+
+def gap_since(started: float) -> bool:
+    """The phone's audio paused for a takeover at or after `started` (time.monotonic())."""
+    found = _read_float(CALL_GAP)
+    return found is not None and found >= started
+
+
+def phone_took_ears_since(started: float, calling: bool | None = None) -> bool:
+    """The phone hears the user now, or took the ears at or after `started` (time.monotonic()) and has handed them
+    back since: either way it has the words said from then on."""
+    found = _read_float(CALL_EAR_SINCE)
+    # Not past now (give or take its last written decimal): one from before a reboot (the clock started again)
+    # says nothing about this turn
+    return phone_listens(calling) or (found is not None and started <= found <= time.monotonic() + 0.01)
 
 
 def line_dropped(now: float | None = None) -> dict | None:
@@ -226,12 +260,21 @@ CALL_TLS = SHARE / "henchline/call"  # cert.pem and key.pem: the call page's own
 # Who wrote the phase, and the agent name hands-free's own notices speak as
 BY_PTT = "ptt"
 BY_HANDSFREE = "handsfree"
+BY_PHONE_EAR = "phone-ear"  # on a call, the phone's own speech-to-text hearing a turn (call/server.py)
 
 STALE_PHASE = 300  # seconds after which a "recording" phase is a leftover from a crash
 # How long an agent is remembered after it last spoke. Whether it is still there is asked of the desktop (its
 # terminal tab, its Cursor window: routing.reachable), not of a clock: a quiet chat a day old fell off the crew list
 # while its window was still open (the user's catch, 2026-11-17). This only bounds the list
 SPEAKER_MEMORY = 30 * 86400
+
+
+class Ears(str, Enum):
+    """Which ears heard the user's words: the laptop's speech-to-text (the phone's mic streamed here, or the laptop's
+    own mic), or the phone's, which then sends the words (on a call over a bad line)."""
+
+    LAPTOP = "laptop"
+    PHONE = "phone"
 
 
 class Phase(str, Enum):
@@ -319,7 +362,7 @@ def release_phase(by: str) -> None:
 def ptt_busy() -> bool:
     """Push-to-talk itself has the mic (hands-free leaves it alone then)."""
     phase, by = phase_now()
-    return phase is not Phase.IDLE and by != BY_HANDSFREE
+    return phase is not Phase.IDLE and by not in (BY_HANDSFREE, BY_PHONE_EAR)
 
 
 def mic_busy() -> bool:
