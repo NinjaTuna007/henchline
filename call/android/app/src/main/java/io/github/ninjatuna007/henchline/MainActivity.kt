@@ -3230,12 +3230,12 @@ class MainActivity : Activity() {
         if (findViewById<View>(R.id.planRefresh).visibility == View.VISIBLE) showBuildBar(lastPlan)
         // Not a second model pill (the design review): an outlined option while in agent mode, solid cyan in plan mode
         chip.text = if (on) "☰ Plan" else "◇ Agent"
-        chip.setTextColor(getColor(if (on) R.color.navy else R.color.muted))
+        chip.setTextColor(getColor(if (on) R.color.navy else R.color.text))  // agent mode is live, not disabled: full text
         chip.typeface = if (on) android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL) else android.graphics.Typeface.DEFAULT
         // Drawn 40dp tall inside the 48dp chip, so the whole 48dp takes the tap (the design audit)
         chip.background = android.graphics.drawable.InsetDrawable(android.graphics.drawable.GradientDrawable().apply {
             cornerRadius = dp(18).toFloat()
-            if (on) setColor(getColor(R.color.cyan)) else { setColor(android.graphics.Color.TRANSPARENT); setStroke(dp(1), getColor(R.color.surface_high)) }
+            if (on) setColor(getColor(R.color.cyan)) else { setColor(android.graphics.Color.TRANSPARENT); setStroke(dp(1), getColor(R.color.muted)) }
         }, 0, dp(4), 0, dp(4))
         Motion.ripple(chip)
         chip.contentDescription = if (on) "Plan mode on: tap to leave it" else "Agent mode: tap for plan mode"

@@ -617,7 +617,7 @@
                     android:paddingHorizontal="12dp"
                     android:paddingVertical="0dp"
                     android:text="Plan"
-                    android:textColor="@color/muted"
+                    android:textColor="@color/text"
                     android:textSize="13sp"
                     android:visibility="gone" />
             </LinearLayout>
