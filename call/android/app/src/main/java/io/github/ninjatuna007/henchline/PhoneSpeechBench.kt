@@ -89,6 +89,7 @@ object SpeechBench {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return log("android: needs Android 13")
                 val asr = OnDevice(context, if (o.hint) names else emptyList())
                 if (!asr.available) return log("android: no on-device recognizer on this phone")
+                if (!asr.ready()) return  // its English model isn't on the phone yet: asked for, try again once it is
                 repeat(o.loops) {
                     for (t in takes) {
                         val heard = asr.hear(t.pcm) ?: Heard("", 0L, 0L, failed = true)  // scored as all words missed
@@ -248,8 +249,57 @@ object SpeechBench {
      *  take gives no text: an error, no answer in 30 s, or the recognizer no longer taking the audio. */
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.TIRAMISU)
     private class OnDevice(private val context: Context, private val hints: List<String>) {
+        private var language = "en-US"  // the installed English one, once ready() has looked
         private val main = android.os.Handler(android.os.Looper.getMainLooper())
         val available = android.speech.SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
+
+        /** Whether its English model is installed; if the phone could get it, asks for the download (once). */
+        @androidx.annotation.RequiresApi(Build.VERSION_CODES.TIRAMISU)
+        fun ready(): Boolean {
+            val done = java.util.concurrent.CountDownLatch(1)
+            var installed = false
+            var checker: android.speech.SpeechRecognizer? = null  // touched on the main thread only
+            fun release() = main.post { try { checker?.destroy() } catch (_: Throwable) {}; checker = null }
+            main.post {
+                try {
+                    val r = android.speech.SpeechRecognizer.createOnDeviceSpeechRecognizer(context).also { checker = it }
+                    val ask = android.content.Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                        .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+                    r.checkRecognitionSupport(ask, context.mainExecutor, object : android.speech.RecognitionSupportCallback {
+                        override fun onSupportResult(support: android.speech.RecognitionSupport) {
+                            val have = support.installedOnDeviceLanguages
+                            // en-US when it is there, so runs on one phone stay comparable; else any English
+                            val english = have.firstOrNull { it == "en-US" } ?: have.firstOrNull { it.startsWith("en") }
+                            val gettable = support.supportedOnDeviceLanguages.filter { it.startsWith("en") }
+                            installed = english != null
+                            if (english != null) language = english
+                            log("android: installed=$have pending=${support.pendingOnDeviceLanguages} downloadable=$gettable")
+                            when {
+                                english != null -> { log("android: using $english"); release() }
+                                gettable.isEmpty() -> { log("android: no English model on this phone, none to download"); release() }
+                                else -> {
+                                    val wanted = gettable.firstOrNull { it == "en-US" } ?: gettable.first()
+                                    try {
+                                        r.triggerModelDownload(Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                                            .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, wanted))
+                                        log("android: no English model yet; asked for $wanted, run again once it is in")
+                                    } catch (e: Throwable) { log("android: download of $wanted not started: $e") }
+                                    main.postDelayed({ release() }, 2000)
+                                }
+                            }
+                            done.countDown()
+                        }
+                        override fun onError(error: Int) { log("android: support check error $error"); release(); done.countDown() }
+                    })
+                } catch (e: Throwable) { log("android: support check failed: $e"); release(); done.countDown() }
+            }
+            if (!done.await(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                log("android: support check timed out")
+                release()
+                return false
+            }
+            return installed
+        }
 
         fun hear(pcm: FloatArray): Heard? {
             val (read, write) = android.os.ParcelFileDescriptor.createPipe()
@@ -261,28 +311,45 @@ object SpeechBench {
             // is over: held open, a recognizer that stopped reading would leave the writes waiting for ever
             val readClosed = java.util.concurrent.atomic.AtomicBoolean(false)
             fun closeRead() { if (readClosed.compareAndSet(false, true)) try { read.close() } catch (_: Exception) {} }
+            var began = false; var ended = false; var partials = 0; var loudest = -100f; var options = 0
+            var lastPartial = ""
             main.post {
                 try {
                     recognizer = android.speech.SpeechRecognizer.createOnDeviceSpeechRecognizer(context).apply {
                         setRecognitionListener(object : android.speech.RecognitionListener {
                             override fun onResults(results: android.os.Bundle?) {
                                 answeredAt = System.nanoTime()
-                                text = results?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: ""
+                                val all = results?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
+                                options = all?.size ?: 0
+                                // This recognizer, fed from a pipe, can end with an empty final and its words only in
+                                // the partials: the last partial is then what it heard
+                                text = all?.firstOrNull()?.takeIf { it.isNotBlank() } ?: lastPartial
                                 done.countDown()
                             }
-                            override fun onError(error: Int) { log("android: error $error"); done.countDown() }
+                            // An error after partials carried words (7, no match) is scored like an empty final: with the
+                            // last partial, so failed takes don't depend on which of the two this recognizer ends with
+                            override fun onError(error: Int) {
+                                log("android: error $error")
+                                if (lastPartial.isNotBlank()) { answeredAt = System.nanoTime(); text = lastPartial }
+                                done.countDown()
+                            }
                             // The request (and the pipe in it) is only sent once the service is bound: by now it has it
                             override fun onReadyForSpeech(params: android.os.Bundle?) { closeRead() }
-                            override fun onBeginningOfSpeech() {}
-                            override fun onRmsChanged(rmsdB: Float) {}
+                            override fun onBeginningOfSpeech() { began = true }
+                            override fun onRmsChanged(rmsdB: Float) { loudest = maxOf(loudest, rmsdB) }
                             override fun onBufferReceived(buffer: ByteArray?) {}
-                            override fun onEndOfSpeech() {}
-                            override fun onPartialResults(partialResults: android.os.Bundle?) {}
+                            override fun onEndOfSpeech() { ended = true }
+                            override fun onPartialResults(partialResults: android.os.Bundle?) {
+                                partials++
+                                partialResults?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
+                                    ?.firstOrNull()?.takeIf { it.isNotBlank() }?.let { lastPartial = it }
+                            }
                             override fun onEvent(eventType: Int, params: android.os.Bundle?) {}
                         })
                         startListening(Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                             .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                            .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+                            .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, language)
+                            .putExtra(android.speech.RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                             .putExtra(android.speech.RecognizerIntent.EXTRA_AUDIO_SOURCE, read)
                             .putExtra(android.speech.RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
                             .putExtra(android.speech.RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, android.media.AudioFormat.ENCODING_PCM_16BIT)
@@ -329,6 +396,9 @@ object SpeechBench {
             val answered = done.await(if (writeFailed) 5L else 30L, java.util.concurrent.TimeUnit.SECONDS)
             main.post { try { recognizer?.destroy() } catch (_: Throwable) {} }
             closeRead()
+            // Numbers only, never the words: how the session went when a take comes back empty
+            log("android: began=$began ended=$ended partials=$partials loudest_db=$loudest options=$options " +
+                "words=${text?.split(Regex("\\s+"))?.count { it.isNotBlank() } ?: -1}")
             if (!answered || text == null) return null
             return Heard(text!!.trim(), maxOf(0L, answeredAt - due) / 1_000_000, 0L)
         }
