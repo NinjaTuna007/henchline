@@ -14,11 +14,12 @@ import java.io.RandomAccessFile
  * chosen for calls with another computer. Nothing here runs in a call or
  * ships: the receiver is disabled in release builds (the same placeholder as PhoneVoiceBench) and needs DUMP.
  *
- * Files (pushed with adb, never bundled, never committed), under the app's external files folder
- * (/sdcard/Android/data/io.github.ninjatuna007.henchline/files):
+ * Files (put there from the laptop, never bundled, never committed), all under one base folder: the app's own files
+ * folder when it holds the set (filled with `adb exec-in run-as io.github.ninjatuna007.henchline tar -x -C files`, since
+ * files adb pushes to the external folder belong to the shell and are often unreadable to the app), else the external
+ * files folder (/sdcard/Android/data/io.github.ninjatuna007.henchline/files):
  *   asr/<model>/            a streaming transducer: encoder*.onnx, decoder*.onnx, joiner*.onnx (int8 preferred),
  *                           tokens.txt, and bpe.vocab for hint words (as the laptop's Nemotron has)
- *   (in the app's own files folder, or its external files folder)
  *   asr-set/refs.tsv        one "take.wav<TAB>what was said" per line; the takes beside it: 16 kHz mono 16-bit WAV
  *   asr-set/names.txt       the hint words, one per line (also how names are scored)
  * From the laptop:
@@ -26,8 +27,10 @@ import java.io.RandomAccessFile
  *     [--ei threads 2] [--ez hint true] [--ef score 2.0] [--ez jenny true] [--ez boost true] [--ei loops 1] [--es set asr-set]
  *   (--es model android: the phone's own on-device recognizer, Android 13+, if it has one)
  *   adb logcat -s Henchline | grep "speech bench"
- * Each take is fed in real time, 0.1 s at a time; "wait" is from its last real chunk to the final text (after 0.4 s of
- * silence and the end of input, as the laptop measured Nemotron). jenny: Jenny renders over and over meanwhile (her
+ * Each take is fed in real time, each 0.1 s chunk once its audio would have been heard; "wait" is from when the
+ * last chunk was due (the end of the take in real time, not when decoding let it be fed) to the final text (after 0.4 s
+ * of silence and the end of input, as the laptop measured Nemotron). A take the phone's own recognizer gives no text
+ * for (an error, or no answer in 30 s) counts as every word missed, and as a shortfall. jenny: Jenny renders over and over meanwhile (her
  * own bench lines show her speed alongside). boost: the call's performance hint session over the threads. loops: the
  * set again and again, with the battery's charge counter before and after (on battery only). Keep the app open, or
  * run it during a call, so the process isn't stopped mid-run.
@@ -58,7 +61,7 @@ object SpeechBench {
 
     private class Take(val name: String, val ref: String, val pcm: FloatArray)
 
-    private class Heard(val text: String, val waitMs: Long, val computeMs: Long)
+    private class Heard(val text: String, val waitMs: Long, val computeMs: Long, val failed: Boolean = false)
 
     fun run(context: Context, o: Options) {
         // The app's own files first (filled with `adb exec-in run-as … tar -x`: files adb pushes to the external
@@ -86,7 +89,13 @@ object SpeechBench {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return log("android: needs Android 13")
                 val asr = OnDevice(context, if (o.hint) names else emptyList())
                 if (!asr.available) return log("android: no on-device recognizer on this phone")
-                repeat(o.loops) { for (t in takes) asr.hear(t.pcm)?.let { results += t to it; line(o, t, it) } }
+                repeat(o.loops) {
+                    for (t in takes) {
+                        val heard = asr.hear(t.pcm) ?: Heard("", 0L, 0L, failed = true)  // scored as all words missed
+                        results += t to heard
+                        line(o, t, heard)
+                    }
+                }
             } else {
                 val dir = File(base, "asr/${o.model}")
                 val before = PhoneVoice.tasks()
@@ -111,25 +120,34 @@ object SpeechBench {
         }
         val minutes = (System.currentTimeMillis() - began) / 60_000.0
         val chargeAfter = battery?.getLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER) ?: 0L
+        val chargingAfter = battery?.isCharging ?: false
         val wer = SpeechScore.wer(results.map { it.first.ref to it.second.text })
         var said = 0; var heard = 0
         for ((t, h) in results) SpeechScore.names(t.ref, h.text, names).let { said += it.first; heard += it.second }
-        val waits = results.map { it.second.waitMs }
+        val failed = results.count { it.second.failed }
+        val waits = results.filter { !it.second.failed }.map { it.second.waitMs }  // a failed take has no wait
         val audio = results.sumOf { it.first.pcm.size.toDouble() / 16000 }
         val compute = results.sumOf { it.second.computeMs } / 1000.0
-        val shortfalls = SpeechScore.shortfalls(wer, said, heard, waits)
+        // The phone's own recognizer computes in another process: its compute isn't seen here
+        val rtf = if (o.model == "android" || audio <= 0) null else compute / audio
+        val shortfalls = SpeechScore.shortfalls(wer, said, heard, waits, rtf, failed)
         log("summary model=${o.model} threads=${o.threads} hint=${o.hint} score=${o.score} jenny=${o.jenny} boost=${o.boost} " +
-            "takes=${results.size} wer=${"%.1f".format(wer * 100)}% names=$heard/$said " +
-            "wait_median_ms=${SpeechScore.median(waits)} wait_p90_ms=${waits.sorted().let { if (it.isEmpty()) 0 else it[minOf(it.size - 1, it.size * 9 / 10)] }} " +
-            "wait_max_ms=${waits.maxOrNull() ?: 0} rtf=${"%.2f".format(if (audio > 0) compute / audio else 0.0)} " +
+            "takes=${results.size} failed=$failed wer=${"%.1f".format(wer * 100)}% names=$heard/$said " +
+            "wait_median_ms=${SpeechScore.median(waits)} wait_p90_ms=${SpeechScore.p90(waits)} " +
+            "wait_max_ms=${waits.maxOrNull() ?: 0} rtf=${rtf?.let { "%.2f".format(it) } ?: "n/a"} " +
             "rss_before_kb=$rssBefore rss_peak_kb=${memory("VmHWM")} minutes=${"%.1f".format(minutes)} " +
-            (if (charging) "battery=charging(not measured)" else "battery_uah=${chargeBefore - chargeAfter}") + " " +
+            when {
+                charging != chargingAfter -> "battery=charging_changed(not measured)"
+                charging -> "battery=charging(not measured)"
+                else -> "battery_uah=${chargeBefore - chargeAfter}"
+            } + " " +
             if (shortfalls.isEmpty()) "MEETS THE BAR (check Jenny's lines and the battery against today's call)" else "BELOW THE BAR: ${shortfalls.joinToString("; ")}")
     }
 
     /** One take's numbers (no words: the recordings and what was said stay on the phone). */
     private fun line(o: Options, t: Take, h: Heard, where: String = "") {
-        log(("take model=${o.model} file=${t.name} audio_s=${"%.2f".format(t.pcm.size / 16000.0)} wait_ms=${h.waitMs} " +
+        log(("take model=${o.model} file=${t.name} audio_s=${"%.2f".format(t.pcm.size / 16000.0)} " +
+            (if (h.failed) "FAILED(no text) " else "wait_ms=${h.waitMs} ") +
             "compute_ms=${h.computeMs} errors=${SpeechScore.edits(SpeechScore.words(t.ref), SpeechScore.words(h.text))}/" +
             "${SpeechScore.words(t.ref).size} $where").trim())
     }
@@ -161,24 +179,26 @@ object SpeechBench {
         } catch (e: Throwable) { log("${o.model}: wouldn't load: $e"); null }
     }
 
-    /** One take, fed in real time 0.1 s at a time; then 0.4 s of silence and the end of input, decoded to the end. */
+    /** One take, fed in real time 0.1 s at a time, each chunk once its audio would have been heard; then 0.4 s of
+     *  silence and the end of input, decoded to the end. The wait counts from when the last chunk was due, so decoding
+     *  slower than live audio shows in it. */
     private fun feed(recognizer: com.k2fsa.sherpa.onnx.OnlineRecognizer, pcm: FloatArray): Heard {
         val stream = recognizer.createStream("")
         var compute = 0L
         try {
             val start = System.nanoTime()
             var at = 0
-            var n = 0
+            var due = start
             while (at < pcm.size) {
-                val due = start + n * CHUNK_NS
+                val end = minOf(pcm.size, at + CHUNK)
+                due = start + end * NS_PER_SAMPLE  // when the chunk's last sample would have been heard
                 val now = System.nanoTime()
                 if (due > now) Thread.sleep((due - now) / 1_000_000, ((due - now) % 1_000_000).toInt())
-                val end = minOf(pcm.size, at + CHUNK)
                 stream.acceptWaveform(pcm.copyOfRange(at, end), 16000)
                 val t0 = System.nanoTime()
                 while (recognizer.isReady(stream)) recognizer.decode(stream)
                 compute += System.nanoTime() - t0
-                at = end; n++
+                at = end
             }
             val fed = System.nanoTime()
             stream.acceptWaveform(FloatArray(TAIL), 16000)
@@ -186,7 +206,7 @@ object SpeechBench {
             while (recognizer.isReady(stream)) recognizer.decode(stream)
             val done = System.nanoTime()
             compute += done - fed
-            return Heard(recognizer.getResult(stream).text.trim(), (done - fed) / 1_000_000, compute / 1_000_000)
+            return Heard(recognizer.getResult(stream).text.trim(), (done - due) / 1_000_000, compute / 1_000_000)
         } finally { stream.release() }
     }
 
@@ -224,7 +244,8 @@ object SpeechBench {
     } catch (_: Exception) { 0L }
 
     /** The phone's own on-device recognizer (Android 13+), fed the take through EXTRA_AUDIO_SOURCE in real time: the
-     *  session ends when that audio is closed. Driven on the main thread, as SpeechRecognizer must be. */
+     *  session ends when that audio is closed. Driven on the main thread, as SpeechRecognizer must be. Null when the
+     *  take gives no text: an error, no answer in 30 s, or the recognizer no longer taking the audio. */
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.TIRAMISU)
     private class OnDevice(private val context: Context, private val hints: List<String>) {
         private val main = android.os.Handler(android.os.Looper.getMainLooper())
@@ -233,10 +254,13 @@ object SpeechBench {
         fun hear(pcm: FloatArray): Heard? {
             val (read, write) = android.os.ParcelFileDescriptor.createPipe()
             val done = java.util.concurrent.CountDownLatch(1)
-            var text: String? = null
-            var closedAt = 0L
+            var text: String? = null  // both written before done counts down, read after it
             var answeredAt = 0L
             var recognizer: android.speech.SpeechRecognizer? = null
+            // Our copy of the read end, closed once the recognizer has its own (it is ready for speech) or the take
+            // is over: held open, a recognizer that stopped reading would leave the writes waiting for ever
+            val readClosed = java.util.concurrent.atomic.AtomicBoolean(false)
+            fun closeRead() { if (readClosed.compareAndSet(false, true)) try { read.close() } catch (_: Exception) {} }
             main.post {
                 try {
                     recognizer = android.speech.SpeechRecognizer.createOnDeviceSpeechRecognizer(context).apply {
@@ -247,7 +271,8 @@ object SpeechBench {
                                 done.countDown()
                             }
                             override fun onError(error: Int) { log("android: error $error"); done.countDown() }
-                            override fun onReadyForSpeech(params: android.os.Bundle?) {}
+                            // The request (and the pipe in it) is only sent once the service is bound: by now it has it
+                            override fun onReadyForSpeech(params: android.os.Bundle?) { closeRead() }
                             override fun onBeginningOfSpeech() {}
                             override fun onRmsChanged(rmsdB: Float) {}
                             override fun onBufferReceived(buffer: ByteArray?) {}
@@ -266,36 +291,52 @@ object SpeechBench {
                     }
                 } catch (e: Throwable) { log("android: couldn't start: $e"); done.countDown() }
             }
+            var writeFailed = false
+            var due = System.nanoTime()  // a take with no samples: its audio was due at once
             try {
-                android.os.ParcelFileDescriptor.AutoCloseOutputStream(write).use { out ->
-                    val start = System.nanoTime()
-                    var at = 0; var n = 0
-                    while (at < pcm.size && done.count > 0) {
-                        val due = start + n * CHUNK_NS
-                        val now = System.nanoTime()
-                        if (due > now) Thread.sleep((due - now) / 1_000_000)
-                        val end = minOf(pcm.size, at + CHUNK)
-                        val bytes = ByteArray((end - at) * 2)
-                        for (i in at until end) {
-                            val s = (pcm[i] * 32767f).toInt().coerceIn(-32768, 32767)
-                            bytes[2 * (i - at)] = s.toByte(); bytes[2 * (i - at) + 1] = (s shr 8).toByte()
-                        }
-                        out.write(bytes)
-                        at = end; n++
+                // Non-blocking writes: a full pipe nobody reads ends the take instead of hanging the bench
+                android.system.Os.fcntlInt(write.fileDescriptor, android.system.OsConstants.F_SETFL, android.system.OsConstants.O_NONBLOCK)
+                val start = System.nanoTime()
+                var at = 0
+                while (at < pcm.size && done.count > 0) {
+                    val end = minOf(pcm.size, at + CHUNK)
+                    due = start + end * NS_PER_SAMPLE  // when the chunk's last sample would have been heard
+                    val now = System.nanoTime()
+                    if (due > now) Thread.sleep((due - now) / 1_000_000)
+                    val bytes = ByteArray((end - at) * 2)
+                    for (i in at until end) {
+                        val s = (pcm[i] * 32767f).toInt().coerceIn(-32768, 32767)
+                        bytes[2 * (i - at)] = s.toByte(); bytes[2 * (i - at) + 1] = (s shr 8).toByte()
                     }
-                    closedAt = System.nanoTime()
+                    var off = 0
+                    val stuckAt = System.nanoTime() + STUCK_NS
+                    while (off < bytes.size) {
+                        val n = try { android.system.Os.write(write.fileDescriptor, bytes, off, bytes.size - off) }
+                            catch (e: android.system.ErrnoException) { if (e.errno == android.system.OsConstants.EAGAIN) 0 else throw e }
+                        off += n
+                        if (n == 0) {
+                            if (done.count == 0L) break
+                            if (System.nanoTime() > stuckAt) throw java.io.IOException("the recognizer stopped taking the audio")
+                            Thread.sleep(10)
+                        }
+                    }
+                    at = end
                 }
-            } catch (e: Exception) { log("android: feeding failed: $e") }
-            val answered = done.await(30, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (e: Exception) { log("android: feeding failed: $e"); writeFailed = true }
+            try { write.close() } catch (_: Exception) {}  // the end of the audio: the session ends
+            // Still waited on after a failed write: a recognizer that closes its end once it has enough audio (or at
+            // its own silence endpoint) gives its text a moment later. Only no text at all is a failed take.
+            val answered = done.await(if (writeFailed) 5L else 30L, java.util.concurrent.TimeUnit.SECONDS)
             main.post { try { recognizer?.destroy() } catch (_: Throwable) {} }
-            try { read.close() } catch (_: Exception) {}
+            closeRead()
             if (!answered || text == null) return null
-            return Heard(text!!.trim(), (answeredAt - closedAt) / 1_000_000, 0L)
+            return Heard(text!!.trim(), maxOf(0L, answeredAt - due) / 1_000_000, 0L)
         }
     }
 
     private const val CHUNK = 1600  // 0.1 s at 16 kHz
-    private const val CHUNK_NS = 100_000_000L
+    private const val NS_PER_SAMPLE = 62_500L  // 1 s / 16000
+    private const val STUCK_NS = 5_000_000_000L  // a write that can't go on for this long ends the take as failed
     private const val TAIL = 6400  // 0.4 s of silence after the last word, as the laptop's Nemotron gets
     private const val JENNY_TEXT = "Once there was a small robot henchman with one goggle eye, who lived in a laptop by the window."
     private const val JENNY_PH = "wˈʌns ðeəwˌɒz ɐ smˈɔːl ɹˈəʊbɒt hˈɛntʃmən wɪð wˈɒn ɡˈɒɡəl ˈaɪ, hˌuː lˈɪvd ɪn ɐ lˈæptɒp baɪ ðə wˈɪndəʊ."
