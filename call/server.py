@@ -62,7 +62,7 @@ from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CA
                          CALL_PINNED, CALL_RANG_BACK, CALL_SOUND, CALL_TOLD, PHASE,
                          SPAWNED, TEXTS, VOICE_NOTE_STALE, VOICE_NOTES,
                          CALL_PORT, CALL_PUSH, CALL_INTERRUPT, CALL_CUT_IN, CALL_CHECK, CLAUDE_MODE,
-                         CALL_RING, CALL_RINGER, CALL_TLS, HANDSFREE_LOG, HANDSFREE_MODE,
+                         CALL_RING, CALL_RINGER, CALL_RING_NOTE, CALL_TLS, HANDSFREE_LOG, HANDSFREE_MODE,
                          PHONE_MIC, PHONE_SPEAKER, PHONE_SPEAKER_MONITOR, Phase, Playing, SENT, SPEAKERS,
                          SPOOL, Sent, Speaker, in_call, last_speaker, log, phase_now, read_json,
                          recent_speakers, turn_on_handsfree, file_lock, write_json)
@@ -345,6 +345,9 @@ def route_to_ringer(reply: str) -> None:
     if not ringer or ringer.get("reply") != reply or time.time() - ringer.get("at", 0) > RINGER_FRESH:
         return
     CALL_RINGER.unlink(missing_ok=True)
+    if not ringer.get("session"):  # no agent rang (a script's reminder): say why, and who hears the user now
+        answer_reminder(str(ringer.get("why") or ""))
+        return
     speaker = Speaker.load(SPEAKERS / f"{ringer.get('session', '')}.json")
     if speaker and routing.reachable(speaker):
         routing.switch_to(speaker)
@@ -355,6 +358,33 @@ def route_to_ringer(reply: str) -> None:
              else "so pick someone: say switch me to")
     routing.say(f"{name} rang, but I can't type to it yet, {where}.")
     log(HANDSFREE_LOG, f"call: answering {name}'s ring, but it can't be reached yet")
+
+
+def answer_reminder(why: str) -> None:
+    """A ring no agent placed (`handsfree ring` from a script, 2026-11-23: a class reminder, answered into a chat
+    that knew nothing of it): the call says the ring's reason, then whom the user's words go to. That agent gets the
+    reason with the user's first turn. One hands-free can't type to yet is said, and the user can switch; with
+    nobody to go to, the call says so and hangs up."""
+    now = last_speaker()
+    reachable = bool(now) and routing.reachable(now)
+    reason = " ".join(why.split()).rstrip(" .")
+    said = f"Reminder: {reason}." if reason else "This ring came from a reminder, with no reason given."
+    if now:  # whoever the words go to gets the reason with them, even one picked after this
+        write_json(CALL_RING_NOTE, {"why": reason}, private=True)
+    if reachable:
+        said += f" You're through to {now.spoken()}."
+        how = f"so to {now.agent}"
+    elif now:  # no hang-up: the user can still switch
+        said += (f" Your words would go to {now.spoken()}, but I can't type to it yet,"
+                 " so pick someone: say switch me to.")
+        how = f"but {now.agent} can't be reached yet"
+    else:
+        said += " No agent is listening for your words, so I'll hang up."
+        how = "nobody to go to: hanging up"
+    routing.say(said).wait()  # in talkback's queue before any hang-up, which then waits for it to be said
+    if not now:
+        CALL_HANGUP.touch()
+    log(HANDSFREE_LOG, f"call: answering a reminder's ring, {how}")
 
 
 def blank_words() -> None:
@@ -2695,6 +2725,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                 told.unlink(missing_ok=True)
         if not resume:
             snaps.clear()  # photos taken on an earlier call
+            CALL_RING_NOTE.unlink(missing_ok=True)  # and an earlier ring's reason
             phonevoice.call_over()  # a new call: no clip or offer left from an earlier one (a drop keeps them)
         blank_words()  # words a killed server never blanked
         for stale in CALL_MIRROR.glob("*.json"):  # terminal lines from before this call
@@ -2905,6 +2936,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             line_lost = dropped_line(ws.close_code, bool(hung_up_here))
             if not line_lost:  # hung up: no clip is spoken any more. A drop keeps them: the phone may still be
                 phonevoice.call_over()  # speaking one, and says how far it got when it's back
+                CALL_RING_NOTE.unlink(missing_ok=True)  # a ring's reason no turn took is moot now
             liner.cancel()
             CALL_HANGUP.unlink(missing_ok=True)  # the phone went first: the hang-up is moot
             sender.cancel()

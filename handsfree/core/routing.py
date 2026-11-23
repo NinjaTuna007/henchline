@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from enum import Enum
 from pathlib import Path
@@ -21,8 +22,8 @@ from voice import snaps
 from voice.delivery import Delivery, Refusal
 from voice.agents import SPOKEN_TO, identity, process, started
 from voice.desktop import Tab, current as desktop, cursor_bridge, cursor_cdp
-from voice.state import (AWAY, BY_HANDSFREE, file_lock, CALL_CUT_IN, CALL_INTERRUPT, CALL_PINNED, CALL_TOLD, CHAT_KEY, HANDSFREE_LOG, INTRODUCED, LAST, LISTEN, SPEAKERS, STATE, Sent,
-                         Speaker, in_call, last_speaker, log, recent_speakers, renamed)
+from voice.state import (AWAY, BY_HANDSFREE, file_lock, CALL_CUT_IN, CALL_INTERRUPT, CALL_PINNED, CALL_RING_NOTE, CALL_TOLD, CHAT_KEY, HANDSFREE_LOG, INTRODUCED, LAST, LISTEN, SPEAKERS, STATE, Sent,
+                         Speaker, in_call, last_speaker, log, read_json, recent_speakers, renamed)
 
 SAY = Path(__file__).resolve().parents[2] / "talkback/scripts/say.py"
 AFTER_SWITCH = 30.0  # seconds to start talking after "Now talking to …"
@@ -690,17 +691,44 @@ def deliver(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = F
     if not in_call() or heard in PHONE or heard is Heard.SCHEDULED or speaker is None or is_command(text, speaker):
         return deliver_words(text, heard, to, urgent)
     photos = snaps.take(speaker.session)
+    claimed = claim_ring_note()  # this turn's alone: two turns delivered at once can't both carry it
     delivered: Delivery | None = None
     try:
-        delivered = deliver_words(text, heard, to, urgent, snaps.words(photos))
+        delivered = deliver_words(text, heard, to, urgent, snaps.words(photos), before=ring_note(claimed))
     finally:
         if photos and not delivered:
             snaps.put_back(photos)
+        if claimed:  # told once; back for the next turn if this one didn't arrive
+            if delivered:
+                claimed.unlink(missing_ok=True)
+            else:
+                claimed.rename(CALL_RING_NOTE)
     return delivered
 
 
+def claim_ring_note() -> Path | None:
+    """The ring's reason taken for one turn: renamed to this process's own name (atomic, so only one turn gets it).
+    None when there is none, or another turn took it first."""
+    mine = CALL_RING_NOTE.with_name(f"{CALL_RING_NOTE.name}.{os.getpid()}.{threading.get_ident()}")
+    try:
+        CALL_RING_NOTE.rename(mine)
+    except OSError:
+        return None
+    return mine
+
+
+def ring_note(claimed: Path | None) -> str:
+    """Why the phone rang, when no agent rang it (a script's reminder; the call server keeps it as the call is
+    answered): the agent the user talks to learns it with their first turn, before their words."""
+    if claimed is None:
+        return ""
+    why = str(read_json(claimed).get("why") or "")
+    return (f'(This call began as a ring from a reminder: "{why}") ' if why
+            else "(This call began as a ring from a reminder, with no reason given.) ")
+
+
 def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = False,
-                  extra: str = "", sender: str | None = None) -> Delivery:
+                  extra: str = "", sender: str | None = None, before: str = "") -> Delivery:
     """Type the words, tagged with how they were heard, to `to`, or else to the agent that spoke last. When it
     can't, says why out loud and returns the reason, for the phone to show too. urgent: the phone's
     "send now" (held send button): the agent's work is interrupted first, so the words reach it at once instead of
@@ -711,7 +739,7 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
     from voice.desktop import typeable
     # No control characters from anywhere (a shared web page, a child's report, a reminder): an ESC or a carriage
     # return would act in the agent's terminal as keys. Each typing path strips them again on its own.
-    text, extra = (typeable(text) if text else text), typeable(extra)
+    text, extra, before = (typeable(text) if text else text), typeable(extra), typeable(before)
     # A report is typed as itself (it already carries its marker). A failure isn't spoken: nobody in the room asked.
     report = sender is None and bool(text) and str(text).lstrip().startswith(chains.REPORT)
     quiet = heard is Heard.SCHEDULED or report  # a scheduled message is retried later by the call server
@@ -721,7 +749,7 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
     command = report or (sender is None and is_command(text, speaker))
     tag = heard.tag if sender is None else Heard.SCHEDULED.tagged(sender)
     message = text.strip() if command \
-        else f"{tag} {introduce(speaker, heard)}{on_a_call(speaker, heard)}{text}{extra}"
+        else f"{tag} {introduce(speaker, heard)}{on_a_call(speaker, heard)}{before}{text}{extra}"
     if speaker is None:
         log(HANDSFREE_LOG, "nobody to send to")
         return refuse(Refusal.NOBODY, "I heard you, but no agent has spoken yet.", quiet)

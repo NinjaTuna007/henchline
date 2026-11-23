@@ -102,6 +102,7 @@ def _read_float(path: Path) -> float | None:
         return None
 CALL_RING = STATE / "call.ring-endpoint"  # where Henchline can be rung (its UnifiedPush address): private, never logged
 CALL_RINGER = STATE / "call.ringer"  # who rang the user last (session, when): the call server routes the answer there
+CALL_RING_NOTE = STATE / "call.ring-note"  # why a ring no agent placed rang: goes with the call's first turn
 CALL_RANG_BACK = STATE / "call.rang_back"  # a quiet call last rung back then: one per chain
 CALL_SNAPS = STATE / "call.snaps.json"  # photos from the call screen's camera, waiting to go with the next turn
 CALL_HANGUP = STATE / "call.hangup"  # end the phone call once talkback is done: the user said so, or an agent

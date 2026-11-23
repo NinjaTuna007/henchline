@@ -11,6 +11,7 @@ from tests import sandbox  # first: a throwaway HOME
 import routing
 from routing import Meaning
 from voice.desktop import Tab
+from voice.state import write_json
 
 assert sandbox.HOME  # imported for its effect
 
@@ -70,6 +71,96 @@ class OnACall(unittest.TestCase):
             self.assertEqual(routing.on_a_call(speaker, routing.Heard.CALL), "")
         with mock.patch.object(routing, "in_call", return_value=False):
             self.assertEqual(routing.on_a_call(routing.Speaker("claude-5678", "claude", "x"), routing.Heard.CALL), "")
+
+
+class RingNote(unittest.TestCase):
+    """A ring no agent placed: its reason goes before the user's first delivered turn of the call, once."""
+
+    def setUp(self):
+        for left in routing.CALL_RING_NOTE.parent.glob(routing.CALL_RING_NOTE.name + "*"):
+            left.unlink()
+        write_json(routing.CALL_RING_NOTE, {"why": "Class in 30 minutes"})
+
+    def tearDown(self):
+        for left in routing.CALL_RING_NOTE.parent.glob(routing.CALL_RING_NOTE.name + "*"):
+            left.unlink()
+
+    def deliver(self, result, text="what's up?", heard=routing.Heard.CALL, command=False):
+        speaker = routing.Speaker("claude-ring", "claude", "henchline")
+        with mock.patch.object(routing, "in_call", return_value=True), \
+                mock.patch.object(routing, "is_command", return_value=command), \
+                mock.patch.object(routing, "deliver_words", return_value=result) as words:
+            routing.deliver(text, heard, to=speaker)
+        return words.call_args.kwargs.get("before", "")
+
+    def test_the_first_turn_carries_it_then_no_more(self):
+        before = self.deliver(routing.Delivery.done())
+        self.assertEqual(before, '(This call began as a ring from a reminder: "Class in 30 minutes") ')
+        self.assertFalse(routing.CALL_RING_NOTE.exists())
+        self.assertEqual(self.deliver(routing.Delivery.done()), "")
+
+    def test_kept_for_the_next_turn_when_this_one_did_not_arrive(self):
+        self.assertTrue(self.deliver(routing.Delivery.refused(routing.Refusal.NOBODY, "x")))
+        self.assertTrue(routing.CALL_RING_NOTE.exists())
+        self.assertEqual(list(routing.CALL_RING_NOTE.parent.glob(routing.CALL_RING_NOTE.name + ".*")), [])
+
+    def test_two_turns_at_once_only_one_carries_it(self):
+        speaker = routing.Speaker("claude-ring", "claude", "henchline")
+        started, go, befores = threading.Barrier(2), threading.Event(), []
+
+        def words(*args, before="", **kwargs):
+            befores.append(before)
+            started.wait(timeout=5)  # both turns are past the claim before either finishes
+            go.wait(timeout=5)
+            return routing.Delivery.done()
+
+        with mock.patch.object(routing, "in_call", return_value=True), \
+                mock.patch.object(routing, "is_command", return_value=False), \
+                mock.patch.object(routing, "deliver_words", side_effect=words):
+            turns = [threading.Thread(target=routing.deliver, args=(t, routing.Heard.CALL), kwargs={"to": speaker})
+                     for t in ("one", "two")]
+            for turn in turns:
+                turn.start()
+            time.sleep(0.2)
+            go.set()
+            for turn in turns:
+                turn.join(timeout=5)
+        self.assertEqual(sorted(bool(b) for b in befores), [False, True])
+        self.assertFalse(routing.CALL_RING_NOTE.exists())
+
+    def test_a_slash_command_goes_without_it_and_leaves_it(self):
+        self.assertEqual(self.deliver(routing.Delivery.done(), text="/compact", command=True), "")
+        self.assertTrue(routing.CALL_RING_NOTE.exists())
+
+    def test_a_text_or_share_during_a_call_goes_without_it(self):
+        for heard in routing.PHONE:
+            self.assertEqual(self.deliver(routing.Delivery.done(), text="dryer done", heard=heard), "", heard)
+        self.assertTrue(routing.CALL_RING_NOTE.exists())
+
+    def test_not_outside_a_call(self):
+        with mock.patch.object(routing, "in_call", return_value=False), \
+                mock.patch.object(routing, "deliver_words", return_value=routing.Delivery.done()) as words:
+            routing.deliver("hi", routing.Heard.WOKE, to=routing.Speaker("claude-ring", "claude", "x"))
+        self.assertNotIn("before", words.call_args.kwargs)
+        self.assertTrue(routing.CALL_RING_NOTE.exists())
+
+    def test_typed_after_the_call_note_and_before_the_words(self):
+        speaker = routing.Speaker("claude-ringtyped", "claude", "henchline", Tab("tmux", "%1"))
+        terms = mock.Mock()
+        terms.agent_running.return_value = True
+        terms.type_line.return_value = True
+        with mock.patch.object(routing, "in_call", return_value=True), \
+                mock.patch.object(routing, "place", return_value=""), \
+                mock.patch.object(routing, "desktop", return_value=mock.Mock(terminals=terms)), \
+                mock.patch.object(routing, "is_command", return_value=False):
+            self.assertTrue(routing.deliver("what's up?", routing.Heard.CALL, to=speaker))
+        typed = terms.type_line.call_args.args[1]
+        call_note = typed.index(routing.CALL_NOTE)
+        ring = typed.index('(This call began as a ring from a reminder: "Class in 30 minutes") ')
+        self.assertLess(call_note, ring)
+        self.assertEqual(typed[ring:], '(This call began as a ring from a reminder: "Class in 30 minutes") '
+                                       "what's up?")
+        self.assertFalse(routing.CALL_RING_NOTE.exists())
 
 
 class Placing(unittest.TestCase):

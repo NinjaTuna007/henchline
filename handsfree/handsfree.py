@@ -163,6 +163,9 @@ def ring(why: str, now: bool = False, wait: bool = True, done: bool = False, as_
     if speaker:  # whenever the user answers, even after this stops waiting: the call server routes it there
         write_json(CALL_RINGER, {"session": speaker.session, "agent": speaker.agent, "reply": reply,
                                  "at": time.time()}, private=True)  # the reply name is the ring's secret
+    else:  # a script's ring (a reminder): the call says why it rang and who the user's words go to now
+        write_json(CALL_RINGER, {"session": "", "agent": "", "why": why, "reply": reply, "at": time.time()},
+                   private=True)
     log(HANDSFREE_LOG, f"rang the user ({who})")
     print("rang", flush=True)
     if not wait:
