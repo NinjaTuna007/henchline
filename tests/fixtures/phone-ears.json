@@ -1,0 +1,337 @@
+{
+ "about": "The laptop's call-turn rules (handsfree/core/turn.py, talkover.py, voice/speech/nemotron.py tidy) that the phone's own ears port (PhoneEar.kt): constants in ms, and vectors made by the laptop's functions.",
+ "constants": {
+  "call_end_ms": 900,
+  "call_early_end_ms": 600,
+  "no_stop_ms": 300,
+  "over_ms": 600,
+  "voice_gone_ms": 1000,
+  "max_ms": 120000,
+  "end_db": 6,
+  "below_peak_db": 25,
+  "echo_turn_ms": 3000,
+  "mostly_ours": 0.6,
+  "own_words_min": 2,
+  "own_words": 0.6,
+  "own_run": 3,
+  "own_share": 0.3
+ },
+ "trailing": [
+  "a",
+  "an",
+  "and",
+  "are",
+  "because",
+  "but",
+  "er",
+  "erm",
+  "for",
+  "hmm",
+  "if",
+  "in",
+  "is",
+  "like",
+  "my",
+  "of",
+  "on",
+  "or",
+  "so",
+  "that",
+  "the",
+  "then",
+  "to",
+  "uh",
+  "um",
+  "which",
+  "with",
+  "your"
+ ],
+ "hints": [
+  "Codex",
+  "Claude",
+  "Kokoro"
+ ],
+ "own_words": [
+  {
+   "heard": "the tests passed on the second run",
+   "said": "The tests passed on the second run, and the parser now handles 5 recognised formats.",
+   "keys": [
+    "the",
+    "test",
+    "pass",
+    "on",
+    "the",
+    "seco",
+    "run"
+   ],
+   "share": 1.0,
+   "ours": true,
+   "echo_short": true,
+   "echo_long": true
+  },
+  {
+   "heard": "tests passed second run and the",
+   "said": "The tests passed on the second run, and the parser now handles 5 recognised formats.",
+   "keys": [
+    "test",
+    "pass",
+    "seco",
+    "run",
+    "and",
+    "the"
+   ],
+   "share": 1.0,
+   "ours": true,
+   "echo_short": true,
+   "echo_long": true
+  },
+  {
+   "heard": "wait stop that is not what I asked",
+   "said": "The tests passed on the second run, and the parser now handles 5 recognised formats.",
+   "keys": [
+    "wait",
+    "stop",
+    "that",
+    "is",
+    "not",
+    "what",
+    "i",
+    "aske"
+   ],
+   "share": 0.0,
+   "ours": false,
+   "echo_short": false,
+   "echo_long": false
+  },
+  {
+   "heard": "yes",
+   "said": "The tests passed on the second run, and the parser now handles 5 recognised formats.",
+   "keys": [
+    "yes"
+   ],
+   "share": 0.0,
+   "ours": false,
+   "echo_short": false,
+   "echo_long": false
+  },
+  {
+   "heard": "the parser handles five recognized formats",
+   "said": "The tests passed on the second run, and the parser now handles 5 recognised formats.",
+   "keys": [
+    "the",
+    "pars",
+    "hand",
+    "five",
+    "reco",
+    "form"
+   ],
+   "share": 1.0,
+   "ours": true,
+   "echo_short": true,
+   "echo_long": true
+  },
+  {
+   "heard": "okay so the tests passed but what about the build",
+   "said": "The tests passed on the second run, and the parser now handles 5 recognised formats.",
+   "keys": [
+    "okay",
+    "so",
+    "the",
+    "test",
+    "pass",
+    "but",
+    "what",
+    "abou",
+    "the",
+    "buil"
+   ],
+   "share": 0.4,
+   "ours": true,
+   "echo_short": true,
+   "echo_long": false
+  },
+  {
+   "heard": "could you check the logs for the parser please",
+   "said": "The tests passed on the second run, and the parser now handles 5 recognised formats.",
+   "keys": [
+    "coul",
+    "you",
+    "chec",
+    "the",
+    "logs",
+    "for",
+    "the",
+    "pars",
+    "plea"
+   ],
+   "share": 0.333333,
+   "ours": true,
+   "echo_short": true,
+   "echo_long": false
+  },
+  {
+   "heard": "tests",
+   "said": "",
+   "keys": [
+    "test"
+   ],
+   "share": 0.0,
+   "ours": false,
+   "echo_short": false,
+   "echo_long": false
+  },
+  {
+   "heard": "",
+   "said": "The tests passed on the second run, and the parser now handles 5 recognised formats.",
+   "keys": [],
+   "share": 0.0,
+   "ours": false,
+   "echo_short": false,
+   "echo_long": false
+  },
+  {
+   "heard": "That was a pretty good question, the tests passed on the",
+   "said": "The tests passed on the second run, and the parser now handles 5 recognised formats.",
+   "keys": [
+    "that",
+    "was",
+    "a",
+    "pret",
+    "good",
+    "ques",
+    "the",
+    "test",
+    "pass",
+    "on",
+    "the"
+   ],
+   "share": 0.454545,
+   "ours": true,
+   "echo_short": true,
+   "echo_long": false
+  },
+  {
+   "heard": "12 11 3 things",
+   "said": "twelve eleven three things",
+   "keys": [
+    "twel",
+    "elev",
+    "thre",
+    "thin"
+   ],
+   "share": 1.0,
+   "ours": true,
+   "echo_short": true,
+   "echo_long": true
+  }
+ ],
+ "sentence_done": [
+  {
+   "said": "Run the tests.",
+   "done_at_once": true,
+   "done_later": true
+  },
+  {
+   "said": "Is it working?",
+   "done_at_once": true,
+   "done_later": true
+  },
+  {
+   "said": "Run the tests and uh.",
+   "done_at_once": false,
+   "done_later": false
+  },
+  {
+   "said": "Check the logs because.",
+   "done_at_once": false,
+   "done_later": false
+  },
+  {
+   "said": "Run the tests",
+   "done_at_once": false,
+   "done_later": true
+  },
+  {
+   "said": "",
+   "done_at_once": false,
+   "done_later": false
+  },
+  {
+   "said": "That's all, over.",
+   "done_at_once": false,
+   "done_later": false
+  },
+  {
+   "said": "This is a test",
+   "done_at_once": false,
+   "done_later": true
+  },
+  {
+   "said": "This is a test and",
+   "done_at_once": false,
+   "done_later": false
+  },
+  {
+   "said": "Send it to Codex!",
+   "done_at_once": true,
+   "done_later": true
+  },
+  {
+   "said": "um",
+   "done_at_once": false,
+   "done_later": false
+  }
+ ],
+ "over": [
+  {
+   "said": "That's all, over.",
+   "over": true
+  },
+  {
+   "said": "over",
+   "over": true
+  },
+  {
+   "said": "Over!",
+   "over": true
+  },
+  {
+   "said": "it's all over now",
+   "over": false
+  },
+  {
+   "said": "the game is over",
+   "over": true
+  },
+  {
+   "said": "moreover",
+   "over": false
+  },
+  {
+   "said": "pushover",
+   "over": false
+  },
+  {
+   "said": "hand it over, over",
+   "over": true
+  }
+ ],
+ "tidy": [
+  {
+   "text": "Codex Codex, run it",
+   "tidied": "Codex, run it"
+  },
+  {
+   "text": "ask claude claude. claude now",
+   "tidied": "ask claude now"
+  },
+  {
+   "text": "Kokoro is fine ",
+   "tidied": "Kokoro is fine"
+  },
+  {
+   "text": "codexes and Codex",
+   "tidied": "codexes and Codex"
+  }
+ ]
+}

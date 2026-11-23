@@ -23,7 +23,7 @@ LOUD = (np.sin(np.arange(480) / 3) * 8000).astype(np.int16)  # a steady voice-lo
 class RecordGivesWay(unittest.TestCase):
     def setUp(self):
         state.STATE.mkdir(parents=True, exist_ok=True)
-        for path in (state.CALL_GAP, state.CALL_EAR, state.CALL_EAR_SINCE):
+        for path in (state.CALL_GAP, state.CALL_EAR, state.CALL_EAR_SINCE, state.CALL_LAPTOP_HEARD):
             path.unlink(missing_ok=True)
             self.addCleanup(path.unlink, missing_ok=True)
         self.taker = object.__new__(turn.Turn)
@@ -53,13 +53,47 @@ class RecordGivesWay(unittest.TestCase):
             return LOUD if self.reads < 400 else None
         return read
 
+    @staticmethod
+    def take_ears(words_back: float):
+        """The phone takes the ears, with the words from `words_back` s ago."""
+        def take():
+            now = time.monotonic()
+            state.CALL_EAR_SINCE.write_text(f"{now:.6f} {now - words_back:.6f}")
+            state.CALL_EAR.write_text("phone")
+        return take
+
     def test_the_phone_taking_the_ears_drops_the_turn_at_once(self):
-        self.taker.read = self.reader(20, lambda: state.CALL_EAR.write_text("phone"))
+        self.taker.read = self.reader(20, self.take_ears(60))  # it has the words from well before the turn began
         self.assertIsNone(self.taker.record([], -60.0, Heard.CALL))
         self.assertLess(self.reads, 20 + 2 * turn.GAP_CHECK)
         self.live.cancel.assert_called_once_with()
         self.assertIsNone(self.taker.live)
         turn.release_phase.assert_called_with(turn.BY_HANDSFREE)
+
+    def test_the_phone_without_the_turns_start_leaves_it_here(self):
+        """It took the ears midway, its words starting after this turn began: the half heard here is delivered."""
+        self.taker.read = self.reader(20, self.take_ears(0))
+        frames = self.taker.record([], -60.0, Heard.CALL)
+        self.assertIsNotNone(frames)
+        self.assertLess(self.reads, 20 + 2 * turn.GAP_CHECK)  # ended at once: no more audio comes from the phone
+        self.live.cancel.assert_not_called()
+        self.assertIs(self.taker.live, self.live)
+
+    def test_a_kept_turn_marks_where_the_phone_starts_hearing(self):
+        self.taker.read = self.reader(1000, lambda: None)
+        began = time.monotonic()
+        self.assertIsNotNone(self.taker.record([], -60.0, Heard.CALL))
+        self.assertGreaterEqual(state.laptop_heard_until(), began)
+
+    def test_a_dropped_turn_marks_nothing(self):
+        self.taker.read = self.reader(20, self.take_ears(60))
+        self.assertIsNone(self.taker.record([], -60.0, Heard.CALL))
+        self.assertIsNone(state.laptop_heard_until())
+
+    def test_an_older_phone_saying_only_that_it_took_the_ears(self):
+        self.taker.read = self.reader(20, lambda: state.CALL_EAR.write_text("phone"))
+        self.assertIsNotNone(self.taker.record([], -60.0, Heard.CALL))
+        self.live.cancel.assert_not_called()
 
     def test_a_pause_alone_keeps_the_turn(self):
         """The phone's audio paused (an earbud switch), and the phone never said it took over: delivered here."""
@@ -74,10 +108,19 @@ class RecordGivesWay(unittest.TestCase):
     def test_a_pause_then_the_phone_says_it_took_over(self):
         def pause():
             state.CALL_GAP.write_text(f"{time.monotonic():.3f}")
-            state.CALL_EAR_SINCE.write_text(f"{time.monotonic():.3f}")  # took the ears, and maybe handed them back
+            # took the ears with the words from before the turn, and maybe handed them back
+            state.CALL_EAR_SINCE.write_text(f"{time.monotonic():.3f} {time.monotonic() - 60:.3f}")
         self.taker.read = self.reader(20, pause)
         self.assertIsNone(self.taker.record([], -60.0, Heard.CALL))
         self.live.cancel.assert_called_once_with()
+
+    def test_a_pause_then_a_takeover_without_the_turns_start(self):
+        def pause():
+            state.CALL_GAP.write_text(f"{time.monotonic():.3f}")
+            state.CALL_EAR_SINCE.write_text(f"{time.monotonic():.3f} {time.monotonic():.3f}")
+        self.taker.read = self.reader(20, pause)
+        self.assertIsNotNone(self.taker.record([], -60.0, Heard.CALL))
+        self.live.cancel.assert_not_called()
 
     def test_the_phone_says_so_while_the_turn_waits(self):
         self.taker.read = self.reader(20, lambda: state.CALL_GAP.write_text(f"{time.monotonic():.3f}"))
@@ -86,7 +129,7 @@ class RecordGivesWay(unittest.TestCase):
 
     def test_a_takeover_from_before_the_turn_is_not_its_own(self):
         state.CALL_GAP.write_text(f"{time.monotonic() - 60:.3f}")
-        state.CALL_EAR_SINCE.write_text(f"{time.monotonic() - 60:.3f}")
+        state.CALL_EAR_SINCE.write_text(f"{time.monotonic() - 60:.3f} {time.monotonic() - 70:.3f}")
         self.taker.read = self.reader(1000, lambda: None)
         self.assertIsNotNone(self.taker.record([], -60.0, Heard.CALL))  # ran to the end of what was read
 

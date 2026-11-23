@@ -61,6 +61,8 @@ class CallService : Service() {
         // The Voices sheet while it's open: told (on any thread) when the call's voice changes (a switch made,
         // Jenny loaded, the phone falling behind)
         @Volatile var voiceListener: (() -> Unit)? = null
+        // The phone hears the user itself on this call (PhoneHearing): the call bar says "phone ears"
+        @Volatile var phoneEars = false
     }
 
     /** What was said on the latest call with another computer (not its agents' texts, which its chat history keeps),
@@ -204,6 +206,29 @@ class CallService : Service() {
     @Volatile var voicePreparing = false  // a switch to the phone is loading Jenny (about 2.4 s)
         private set
     @Volatile private var voiceFailed = false  // the last switch to the phone couldn't load Jenny
+    @Volatile private var choseLaptopVoice = false  // the user switched talkback to the laptop on this call
+    // The phone's own ears (Settings › Voices › Always phone, with the model here): loaded as the call starts; once
+    // loaded, and the server has answered a ping (so it knows {"ear"}), the phone hears the user itself and the mic
+    // no longer goes out. An older server never answers: the laptop then hears the call as ever
+    @Volatile private var ears: PhoneHearing? = null
+    @Volatile var earsTaken = false
+        private set
+    @Volatile private var earsFrom = 0L  // when the phone has the words from (elapsedRealtime): said again on reconnecting
+    // The ears last said to the server on this call ("phone" or "laptop"), null before the phone ever took them:
+    // said again on every reconnect, so a hand-back lost with the line can't leave nobody hearing the user
+    @Volatile private var earSaid: String? = null
+    // The turns the phone heard on this call, until answered: kept here, so they are still sent if its ears fail
+    @Volatile private var heardTurns: HeardTurns? = null
+    @Volatile private var ponged = false
+    @Volatile private var buttonOnly = false  // "open line off": only the talk button gets in, on either ears
+    private val earsLock = Any()
+    private var pings = 0
+    private var pinging = false
+    private val ownClips = OwnClips()  // talkback playing now, or a moment ago: its words coming back are echo
+    // The phone voice's clips' words, by id: the last few
+    private val clipWords: MutableMap<String, String> = java.util.Collections.synchronizedMap(object : LinkedHashMap<String, String>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > 16
+    })
     /** The phone voice is chosen but the laptop speaks for now: the phone fell behind (or Jenny wouldn't load). */
     val voiceFellBehind get() = voiceFailed || phoneVoice?.fellBehind == true
     /** This call is with another computer: its voices aren't the laptop's, so the phone's own voice can't stand in. */
@@ -299,6 +324,7 @@ class CallService : Service() {
             phoneVoice = newSpeaker()
             Thread { PhoneVoice.load(this) }.start()  // about 2.4 s: ready before the first reply
         }
+        if (PhoneEar.effective(PhoneEar.mode(this), PhoneAsr.ready(this)) == PhoneEar.Mode.PHONE) startEars()
         applySound()
         connect(server)
         if (Build.VERSION.SDK_INT >= 31) {
@@ -320,6 +346,7 @@ class CallService : Service() {
 
     @Volatile var talking = false  // a tap on the earbuds (or the notification's Talk) started a turn
         private set
+    @Volatile private var talkingSince = 0L  // when it did (elapsedRealtime)
     private var buttons: android.media.session.MediaSession? = null
     private val beeper by lazy { try { android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 70) } catch (_: Exception) { null } }
 
@@ -374,7 +401,9 @@ class CallService : Service() {
     fun toggleTalk() {
         if (!up) return  // the laptop isn't there yet: nothing to start or send
         talking = !talking
+        if (talking) talkingSince = android.os.SystemClock.elapsedRealtime()
         socket?.send(org.json.JSONObject().put("push", talking).toString())
+        if (earsTaken) ears?.press(talking)  // the phone's own turn, held until the button is let go
         beep(talking)
         tell(org.json.JSONObject().put("talking", talking).toString())
         goForeground()  // the notification's button says Send while talking
@@ -396,6 +425,16 @@ class CallService : Service() {
         player?.interrupt()
         heard.clear()
         clearSpoken()
+        synchronized(earsLock) {
+            heardTurns?.size()?.takeIf { it > 0 }?.let {
+                android.util.Log.i("Henchline", "call: $it turns the phone heard were never answered: the call ended first")
+            }
+            heardTurns = null
+            ears?.close()  // the speech model's 1.2 GB go with the call
+            ears = null
+            earsTaken = false
+        }
+        Bus.phoneEars = false
         synchronized(audioLock) {  // after any sound switch under way, so it can't set call mode again after this
             focus?.let { audio.abandonAudioFocusRequest(it) }
             if (Build.VERSION.SDK_INT >= 31) audio.clearCommunicationDevice()
@@ -425,7 +464,109 @@ class CallService : Service() {
     }
 
     fun send(json: String) {
+        // The screens' "open line off" is the phone's own ears' too
+        if ("button_only" in json) try {
+            org.json.JSONObject(json).takeIf { it.has("button_only") }?.let { setButtonOnly(it.optBoolean("button_only")) }
+        } catch (_: Exception) {}
         socket?.send(json)
+    }
+
+    private fun setButtonOnly(on: Boolean) {
+        buttonOnly = on
+        ears?.buttonOnly = on
+    }
+
+    // --- the phone's own ears (Always phone) --------------------------------------------------------------------
+
+    private fun startEars() {
+        val turns = HeardTurns("ear-${System.currentTimeMillis()}")
+        heardTurns = turns
+        val hearing = PhoneHearing(this, send = { socket?.send(it) }, ownText = ::ownText, userTalks = { flushSpeaker() },
+            lineDown = { lostAt > 0 }, failed = ::earsFailed, turns = turns)
+        hearing.buttonOnly = buttonOnly
+        ears = hearing
+        Thread({
+            if (hearing.load()) takeEars()
+            else synchronized(earsLock) {
+                if (ears === hearing) {
+                    ears = null
+                    hearing.close()
+                    if (running) tell(org.json.JSONObject().put("note",
+                        "This phone couldn't load its speech model: the laptop hears you on this call.").toString())
+                }
+            }
+        }, "henchline-ears-load").start()
+    }
+
+    /** The phone hears the user from now on, once its ears are loaded and the server has answered a ping: the server
+     *  is told from when the phone has the words, then the mic stops going out. Talkback is the phone's own voice
+     *  while it listens, unless the user chose the laptop's on this call. */
+    private fun takeEars() = synchronized(earsLock) {
+        val hearing = ears ?: return
+        val webSocket = socket ?: return
+        if (earsTaken || !ponged || !hearing.loaded || !running || ended || lostAt > 0) return
+        earsFrom = hearing.take(if (talking) talkingSince else null)
+        webSocket.send(earsMessage())
+        earSaid = "phone"
+        earsTaken = true
+        Bus.phoneEars = true
+        android.util.Log.i("Henchline", "call: the phone hears the user itself now")
+        tell(org.json.JSONObject().put("ears", "phone").toString())
+        voiceWhileListening(webSocket)
+    }
+
+    /** The phone's ears stopped mid-call (an error): the laptop hears the user again, from the mic's next frame. */
+    private fun earsFailed() = synchronized(earsLock) {
+        if (!earsTaken) return
+        ears = null  // its models go as its thread ends; its turns stay in heardTurns until answered
+        earsTaken = false
+        earSaid = "laptop"  // said again on reconnecting, in case the line is down now
+        Bus.phoneEars = false
+        earMessage()?.let { socket?.send(it) }
+        android.util.Log.w("Henchline", "call: the phone's ears stopped: the laptop hears the user again")
+        tell(org.json.JSONObject().put("ears", "laptop").toString())
+        tell(org.json.JSONObject().put("note", "This phone stopped hearing you: the laptop does again.").toString())
+    }
+
+    /** {"ear": "phone", "from_ms", "t"} (both elapsedRealtime: only their difference counts on the server). */
+    private fun earsMessage(): String = org.json.JSONObject().put("ear", "phone").put("from_ms", earsFrom)
+        .put("t", android.os.SystemClock.elapsedRealtime()).toString()
+
+    /** The ears as last said, again (null before the phone ever took them). */
+    private fun earMessage(): String? = when (earSaid) {
+        "phone" -> earsMessage()
+        "laptop" -> org.json.JSONObject().put("ear", "laptop").toString()
+        else -> null
+    }
+
+    /** Talkback in the phone's own voice while it listens (only when Jenny is here): offered to the laptop now. */
+    private fun voiceWhileListening(webSocket: WebSocket) {
+        if (choseLaptopVoice || !PhoneVoice.ready(this)) return
+        synchronized(voiceLock) {
+            if (!running || phoneVoice != null) return  // there already: offered as the call began
+            phoneVoice = newSpeaker()
+        }
+        PhoneVoice.offer(this, required = hostId != null, listening = true)?.let { webSocket.send(it.toString()) }
+        Thread { PhoneVoice.load(this) }.start()
+        android.util.Log.i("Henchline", "call: talkback in the phone's own voice while it listens")
+        voiceChanged()
+    }
+
+    /** The server's own ping, every second while the phone's ears are on: its answer says it knows them, and with
+     *  no audio going out, the pings are the line. */
+    private val pinger = object : Runnable {
+        override fun run() {
+            if (!running || ended) return
+            if (lostAt == 0L) socket?.send(org.json.JSONObject().put("ping", ++pings).put("t", System.currentTimeMillis()).toString())
+            devicesHandler.postDelayed(this, PING_EVERY)
+        }
+    }
+
+    /** Talkback's words playing at `atMs`, or a moment before: the laptop's clip ({"playing"}) and the phone's own. */
+    private fun ownText(atMs: Long): String {
+        val now = android.os.SystemClock.elapsedRealtime()
+        ownClips.set("phone", phoneVoice?.speaking?.let { clipWords[it] }, now)
+        return ownClips.text(atMs)
     }
 
     // --- the agents' voices: the laptop's or the phone's own (the Voices sheet's switch) ----------------------
@@ -446,6 +587,7 @@ class CallService : Service() {
         if (hostId != null || !running) return
         try {
             PhoneVoice.setEnabled(this, phone)
+            choseLaptopVoice = !phone  // also while the phone listens, which otherwise speaks in its own voice
             voiceFailed = false
             if (!phone) {
                 voicePreparing = false
@@ -678,8 +820,17 @@ class CallService : Service() {
                 if (lostAt > 0) {  // back: the audio never stopped, the laptop kept the agent
                     lostAt = 0
                     android.util.Log.i("Henchline", "call: reconnected")
+                    earMessage()?.let { webSocket.send(it) }  // first: who hears the user (the phone listened on meanwhile)
                     webSocket.send(soundNote())
                     offerPhoneVoice(webSocket)  // the laptop forgets the offer when the line drops
+                    // Turns said meanwhile or never answered, then the turn being heard now (after them: their
+                    // answers mustn't end its hold on talkback)
+                    heardTurns?.unanswered()?.let { again ->
+                        again.forEach { webSocket.send(it) }
+                        if (again.isNotEmpty()) android.util.Log.i("Henchline", "call: sent ${again.size} heard turns again")
+                    }
+                    ears?.resendHearing()
+                    if (!earsTaken) takeEars()
                     if (lastDrop.isNotEmpty()) {  // the laptop's log then says why the line went, not only that it did
                         webSocket.send(org.json.JSONObject().put("note", "dropped: $lastDrop").toString())
                         lastDrop = ""
@@ -703,6 +854,10 @@ class CallService : Service() {
                     webSocket.send(org.json.JSONObject().put("ring_endpoint", it).toString())
                 }
                 offerPhoneVoice(webSocket)
+                if (ears != null && !pinging) {  // asks whether the server knows the phone's ears
+                    pinging = true
+                    devicesHandler.post(pinger)
+                }
                 startAudio()
                 tell("""{"opened": true}""")
             }
@@ -710,7 +865,23 @@ class CallService : Service() {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (me != link) return
                 val message = try { org.json.JSONObject(text) } catch (_: Exception) { null }
+                if (message?.has("pong") == true) {  // the server knows the phone's ears: they may take over
+                    if (!ponged) { ponged = true; takeEars() }
+                    return
+                }
+                if (message?.has("playing") == true) {  // the laptop's clip playing now, while the phone listens
+                    ownClips.set("laptop", message.optJSONObject("playing")?.optString("text"), android.os.SystemClock.elapsedRealtime())
+                    return
+                }
+                if (message?.has("ear_cut") == true) {  // where the laptop's last delivered turn ended: not heard again
+                    ears?.cutAt(if (message.isNull("ear_cut")) null else message.optLong("ear_cut"))
+                    return
+                }
+                if (message?.has("button_only") == true) setButtonOnly(message.optBoolean("button_only"))
+                if (message != null) heardTurns?.answered(message)  // a turn the phone heard: delivered, taken or not sent
                 message?.optJSONObject("say")?.let { clip ->  // talkback the phone speaks itself (PhoneVoice)
+                    if (ears != null) clipWords[clip.optString("id")] = clip.optJSONArray("pieces")
+                        ?.let { pieces -> (0 until pieces.length()).joinToString(" ") { pieces.optString(it) } } ?: ""
                     phoneVoice?.say(clip) ?: webSocket.send(org.json.JSONObject().put("tts", "fallback")
                         .put("reason", "not speaking on the phone").put("id", clip.optString("id")).toString())
                     return
@@ -840,8 +1011,10 @@ class CallService : Service() {
                                 micDead()
                             }
                         }
-                        // Not while reconnecting: queued, it all arrived at once and was taken down late as the user's
-                        if (got > 0 && lostAt == 0L) socket?.send(buffer.toByteString(0, got))
+                        if (got > 0) ears?.hear(buffer, got, android.os.SystemClock.elapsedRealtime() - got / 2 * 1000L / MIC_RATE)
+                        // Not while reconnecting: queued, it all arrived at once and was taken down late as the user's.
+                        // Not while the phone hears the user itself: its words go instead
+                        if (got > 0 && lostAt == 0L && !earsTaken) socket?.send(buffer.toByteString(0, got))
                     }
                 } finally {
                     if (mic.recordingState == AudioRecord.RECORDSTATE_RECORDING) mic.stop()
@@ -899,7 +1072,7 @@ class CallService : Service() {
      *  in clear sound, or without a canceller, our voice can reach this mic and talking over is judged with care. */
     private fun offerPhoneVoice(webSocket: WebSocket) {
         val voice = phoneVoice ?: return
-        PhoneVoice.offer(this, required = hostId != null)?.let { webSocket.send(it.toString()) }
+        PhoneVoice.offer(this, required = hostId != null, listening = earsTaken && !choseLaptopVoice)?.let { webSocket.send(it.toString()) }
         voice.report().forEach { webSocket.send(it) }  // after a drop: how far each clip got while the line was down
     }
 
@@ -1094,6 +1267,7 @@ class CallService : Service() {
         const val RECONNECT_FOR = 30_000L  // ms a dropped call keeps trying to come back
         const val DEVICES_SETTLE = 1_500L  // ms after the last headset change before the audio starts again
         const val MIC_DEAD_MS = 3_000L  // ms of exact zeros before the mic is taken as silenced
+        const val PING_EVERY = 1_000L  // ms between pings while the phone's ears are on
         const val TALK = "talk"
         val TALK_KEYS = setOf(android.view.KeyEvent.KEYCODE_HEADSETHOOK, android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
             android.view.KeyEvent.KEYCODE_MEDIA_PLAY, android.view.KeyEvent.KEYCODE_MEDIA_PAUSE)

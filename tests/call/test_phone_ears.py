@@ -35,7 +35,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         state.STATE.mkdir(parents=True, exist_ok=True)
         for path in (state.CALL_EAR, state.CALL_EAR_SINCE, state.CALL_GAP, state.CALL_BUTTON_ONLY,
-                     state.HANDSFREE_LOG):
+                     state.CALL_LAPTOP_HEARD, state.HANDSFREE_LOG):
             path.unlink(missing_ok=True)
         server.HEARD.clear()
         self.sent: list[str] = []
@@ -65,9 +65,12 @@ class Pings(Base):
 class WhichEars(Base):
     async def test_the_phone_takes_the_ears_and_gives_them_back(self):
         before = time.monotonic()
-        await self.page({"ear": "phone"})
+        ms = time.time() * 1000
+        await self.page({"ear": "phone", "from_ms": ms - 8000, "t": ms})  # it has the last 8 s
         self.assertEqual(state.CALL_EAR.read_text(), Ears.PHONE.value)
-        self.assertGreaterEqual(float(state.CALL_EAR_SINCE.read_text()), before)
+        took, words = state.ears_taken()
+        self.assertGreaterEqual(took, before)
+        self.assertAlmostEqual(words, took - 8 + server.EAR_FROM_SLACK, delta=0.05)
         self.assertIs(self.listening.ear, Ears.PHONE)
         with mock.patch.object(state, "in_call", return_value=True):
             self.assertTrue(state.phone_listens())
@@ -75,16 +78,68 @@ class WhichEars(Base):
         self.assertEqual(state.CALL_EAR.read_text(), Ears.LAPTOP.value)
         with mock.patch.object(state, "in_call", return_value=True):
             self.assertFalse(state.phone_listens())
-            self.assertTrue(state.phone_took_ears_since(before))  # it has the words said since it took them
-            self.assertFalse(state.phone_took_ears_since(time.monotonic() + 1))
+            self.assertTrue(state.phone_took_ears_since(before - 5))  # a turn begun 5 s before: it has its words
+            self.assertFalse(state.phone_took_ears_since(before - 9))  # 9 s before: not from its start
+            self.assertFalse(state.phone_took_ears_since(time.monotonic() + 1))  # one begun after it handed back
 
     async def test_a_takeover_stamp_from_past_now_is_ignored(self):
         """A stamp left from before a reboot (the monotonic clock started again) is not a takeover of this turn."""
-        state.CALL_EAR_SINCE.write_text(f"{time.monotonic() + 3600:.3f}")
+        state.CALL_EAR_SINCE.write_text(f"{time.monotonic() + 3600:.3f} {time.monotonic() - 60:.3f}")
         with mock.patch.object(state, "in_call", return_value=True):
             self.assertFalse(state.phone_took_ears_since(time.monotonic() - 5))
-            state.CALL_EAR_SINCE.write_text(f"{time.monotonic():.3f}")
+            state.CALL_EAR_SINCE.write_text(f"{time.monotonic():.3f} {time.monotonic() - 60:.3f}")
             self.assertTrue(state.phone_took_ears_since(time.monotonic() - 5))
+
+
+class WordsFrom(Base):
+    """A takeover never makes the laptop drop a turn the phone doesn't have from its start."""
+
+    async def test_without_a_start_a_turn_already_begun_stays_the_laptops(self):
+        begun = time.monotonic() - 2
+        await self.page({"ear": "phone"})  # an older phone: it doesn't say from when it has the words
+        took, words = state.ears_taken()
+        self.assertEqual(took, words)
+        with mock.patch.object(state, "in_call", return_value=True):
+            self.assertTrue(state.phone_listens())
+            self.assertFalse(state.phone_took_ears_since(begun))
+            self.assertTrue(state.phone_took_ears_since(took))
+
+    async def test_its_words_starting_after_the_turn_leave_the_turn_here(self):
+        begun = time.monotonic() - 3
+        ms = time.time() * 1000
+        await self.page({"ear": "phone", "from_ms": ms - 1000, "t": ms})  # 1 s back: after the turn began
+        with mock.patch.object(state, "in_call", return_value=True):
+            self.assertFalse(state.phone_took_ears_since(begun))
+            self.assertTrue(state.phone_took_ears_since(time.monotonic() - 0.5))
+
+    async def test_its_clock_need_not_agree_with_ours(self):
+        """The phone's clock an hour off: "from_ms" and "t" are both its own, so only their difference counts."""
+        begun = time.monotonic() - 3
+        ms = time.time() * 1000 - 3_600_000
+        await self.page({"ear": "phone", "from_ms": ms - 5000, "t": ms})
+        with mock.patch.object(state, "in_call", return_value=True):
+            self.assertTrue(state.phone_took_ears_since(begun))
+            self.assertFalse(state.phone_took_ears_since(begun - 3))
+
+    async def test_its_trip_here_only_makes_the_start_later(self):
+        now = time.monotonic()
+        self.assertGreaterEqual(server.words_from(10_000, 12_000, now), now - 2)
+        self.assertEqual(server.words_from(10_000, 12_000, now), now - 2 + server.EAR_FROM_SLACK)
+
+    async def test_nonsense_starts(self):
+        now = time.monotonic()
+        for bad in (None, "soon", True, float("nan"), -5, 0):
+            self.assertEqual(server.words_from(bad, 12_000, now), now)
+        self.assertEqual(server.words_from(20_000, 12_000, now), now + server.EAR_FROM_SLACK)  # "from" ahead of "t"
+        self.assertEqual(server.words_from(1, 10_000_000, now), now - server.EAR_FROM_MOST + server.EAR_FROM_SLACK)
+        with mock.patch.object(server.time, "time", return_value=100.0):  # no "t": our clock, trusted
+            self.assertEqual(server.words_from(96_000, None, now), now - 4 + server.EAR_FROM_SLACK)
+
+    async def test_a_garbled_stamp_covers_nothing(self):
+        for text in ("", "soon", "1 2 3"):
+            state.CALL_EAR_SINCE.write_text(text)
+            self.assertIsNone(state.ears_taken())
+            self.assertFalse(state.phone_took_ears_since(time.monotonic()))
 
     async def test_ears_there_are_none_of_are_ignored(self):
         await self.page({"ear": "elbow"})
@@ -216,6 +271,53 @@ class HeardTurns(Base):
             self.assertEqual(json.loads(await self.page(self.heard())), {"delivered": "t1"})
             self.assertEqual(json.loads(await self.page(self.heard(tid="t2", text="um"))), {"taken": "t2"})
         deliver.assert_called_once_with(WORDS, server.Heard.CALL, to=None, urgent=False, ear=Ears.PHONE)
+
+
+class Cut(Base):
+    """A turn the laptop delivered before the phone took the ears isn't heard again from the phone's kept audio."""
+
+    async def test_the_phone_is_told_where_the_laptops_last_turn_ended_on_its_own_clock(self):
+        state.note_laptop_heard(time.monotonic() - 2)
+        answer = json.loads(await self.page({"ear": "phone", "from_ms": 40_000, "t": 50_000}))
+        self.assertAlmostEqual(answer["ear_cut"], 50_000 - 2000 - server.CUT_SLACK * 1000, delta=50)
+
+    async def test_no_cut_without_a_laptop_turn_or_its_clock(self):
+        self.assertEqual(json.loads(await self.page({"ear": "phone", "from_ms": 40_000, "t": 50_000})), {"ear_cut": None})
+        state.note_laptop_heard(time.monotonic() - 2)
+        self.assertEqual(json.loads(await self.page({"ear": "phone"})), {"ear_cut": None})
+        self.assertEqual(await self.page({"ear": "laptop"}), "")
+
+    async def test_a_turn_older_than_what_the_phone_keeps_or_from_before_a_reboot(self):
+        now = time.monotonic()
+        self.assertIsNone(server.ear_cut(50_000, now, now - server.EAR_FROM_MOST - 1))
+        state.CALL_LAPTOP_HEARD.write_text(f"{now + 3600:.3f}")
+        self.assertIsNone(state.laptop_heard_until())
+
+    async def test_always_a_little_early(self):
+        now = time.monotonic()
+        self.assertEqual(server.ear_cut(50_000, now, now), 50_000 - server.CUT_SLACK * 1000)
+
+    async def test_forgotten_when_the_call_ends(self):
+        state.note_laptop_heard(time.monotonic())
+        self.listening.over(line_lost=True)
+        self.assertTrue(state.CALL_LAPTOP_HEARD.exists())
+        self.listening.over(line_lost=False)
+        self.assertFalse(state.CALL_LAPTOP_HEARD.exists())
+
+
+class SentAgain(Base):
+    async def test_a_turn_sent_again_leaves_the_turn_heard_now_held(self):
+        """After a reconnect the phone sends its unanswered turns again: a cached answer acts on nothing and must
+        not end the hold of the turn it is hearing now."""
+        await self.page({"ear": "phone"})
+        await self.page({"hearing": True})
+        with mock.patch.object(server.routing, "act_on_turn", return_value=0.0) as acting:
+            await self.page(self.heard(tid="a"))
+            await self.page({"hearing": True})  # the next turn opens
+            await self.page(self.heard(tid="a"))  # and the first comes again
+        acting.assert_called_once()
+        self.assertTrue(self.listening.hearing)
+        self.assertEqual(state.phase_now(), (Phase.RECORDING, state.BY_PHONE_EAR))
 
 
 class NewerTurnKeepsItsHold(Base):

@@ -24,7 +24,7 @@ from talkover import TalkOver, our_own_words, own_share, word_keys
 from voicegate import START_DB
 from voice.speech import nemotron, whisper
 from voice.state import (BY_HANDSFREE, CALL_PUSH, HANDSFREE_LOG, HANDSFREE_WAV, Phase, gap_since, in_call, log,
-                         phone_listens, phone_took_ears_since, ptt_busy, release_phase, set_phase, set_target)
+                         note_laptop_heard, phone_listens, phone_took_ears_since, ptt_busy, release_phase, set_phase, set_target)
 
 BUDS_LEAVING = 1.0  # seconds: buds that disconnect this soon before a tap turn starts, or during it, drop it
 WAIT_FOR_WORDS = 5.0  # after the wake word, seconds to start talking before it gives up
@@ -163,6 +163,7 @@ class Turn:
         held = heard is Heard.PUSHED  # the button decides when it ends, not a pause
         self.buds_left = False
         released = False
+        handed = False  # the phone took the ears midway, without the start of this turn
         while (quiet < end or held) and time.monotonic() - since < MAX_SECONDS:
             if held and not CALL_PUSH.exists():
                 released = True
@@ -187,7 +188,10 @@ class Turn:
                 release_phase(BY_HANDSFREE)  # take() releases only a turn it transcribes; talkback must not hold on
                 return None
             if calling and len(frames) % GAP_CHECK == 0 and phone_listens(calling):
-                return self.phone_took_over()
+                if phone_took_ears_since(began, calling):
+                    return self.phone_took_over()
+                handed = True  # its words start after this turn did: what was heard here is delivered here
+                break
             frame = samples.astype(np.float32) / 32768
             frames.append(frame)
             if self.live:
@@ -215,13 +219,19 @@ class Turn:
                 elif time.monotonic() - voice_at > (VOICE_GONE if spoke else WAIT_FOR_WORDS):
                     voiceless = True  # their words ended a second ago, or none came at all
                     break
-        # The pause that ended it may be the phone taking over: it says so in a moment, or the words are delivered here
-        if calling and (phone_listens(calling) or gap_since(began) and self.phone_takes_it(began, calling)):
+        # The pause that ended it may be the phone taking over: it says so in a moment, or the words are delivered here.
+        # Only a phone that has this turn's words from its start drops it here (CALL_EAR_SINCE)
+        if calling and (phone_took_ears_since(began, calling)
+                        or not handed and not phone_listens(calling) and gap_since(began)
+                        and self.phone_takes_it(began, calling)):
             return self.phone_took_over()
-        reason = ("the button" if released else "limit" if time.monotonic() - since >= MAX_SECONDS
+        reason = ("the phone took the ears after it began" if handed or phone_listens(calling) and calling
+                  else "the button" if released else "limit" if time.monotonic() - since >= MAX_SECONDS
                   else "no voice for a second (steady sound on the line)" if voiceless
                   else "a finished sentence" if finished else "over" if quiet == OVER_FRAMES else "pause")
         log(HANDSFREE_LOG, f"recorded {time.monotonic() - since:.1f}s, ended by {reason} (floor {floor:.0f} dB)")
+        if calling:  # kept here: a phone taking the ears later starts hearing after it, not again
+            note_laptop_heard(time.monotonic())
         return frames
 
     @staticmethod

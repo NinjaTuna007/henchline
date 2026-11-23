@@ -309,8 +309,10 @@ object PhoneVoice {
      *  `chosen`: the user switched to the phone mid-call (the laptop then says so in this voice). */
     /** required: a call with another computer, which always speaks through the phone (it makes no speech of its
      *  own, 2026-11-22): offered whatever the laptop-call setting, marked so the computer never answers with audio. */
-    fun offer(context: Context, chosen: Boolean = false, required: Boolean = false): JSONObject? =
-        if ((required || enabled(context)) && ready(context)) JSONObject().put("tts", JSONObject().put("engine", ENGINE).put("model", MODEL)
+    /** listening: the phone hears the user itself on this call (PhoneHearing): talkback is spoken here too, so it
+     *  isn't streamed over the line either (the user's decision, 2026-11-23), whatever the setting. */
+    fun offer(context: Context, chosen: Boolean = false, required: Boolean = false, listening: Boolean = false): JSONObject? =
+        if ((required || listening || enabled(context)) && ready(context)) JSONObject().put("tts", JSONObject().put("engine", ENGINE).put("model", MODEL)
             .apply { if (rtf > 0f) put("rtf", rtf.toDouble()) }
             .apply { if (required) put("required", true) })
             .apply { if (chosen || required) put("chosen", true) }
@@ -440,6 +442,9 @@ object PhoneVoice {
 
         /** How far each recent clip got, for the laptop after a reconnect. */
         fun report(): List<String> = synchronized(acks) { acks.values.map { JSONObject().put("said", it).toString() } }
+
+        /** The id of the clip being spoken now; "" for none. */
+        val speaking get() = current
 
         fun say(clip: JSONObject) { if (!fellBack) clips.offer(clip) else fallback(clip.optString("id"), "fell back earlier") }
         fun stop(id: String) { stopped.add(id) }

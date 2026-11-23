@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -60,7 +61,7 @@ from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
 from voice.delivery import Refusal  # noqa: E402
 from voice.desktop import current as desktop, cursor_bridge, tmux  # noqa: E402
 from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CALL_SILENT, CALL_STAY_ON, CALL_HANGUP, CALL_MIRROR, CALL_ORIGIN,  # noqa: E402
-                         CALL_DROPPED, REJOIN, CALL_EAR, CALL_EAR_SINCE, CALL_GAP, LINE_DOWN_HOLD, BY_PHONE_EAR, Ears,
+                         CALL_DROPPED, REJOIN, CALL_EAR, CALL_EAR_SINCE, CALL_GAP, CALL_LAPTOP_HEARD, laptop_heard_until, LINE_DOWN_HOLD, BY_PHONE_EAR, Ears,
                          release_phase, set_phase,
                          CALL_PINNED, CALL_RANG_BACK, CALL_SOUND, CALL_TOLD, PHASE,
                          SPAWNED, TEXTS, VOICE_NOTE_STALE, VOICE_NOTES,
@@ -536,8 +537,8 @@ async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None,
     if listening is not None and heard_turn(message):
         return json.dumps(await listening.heard(message["heard"]))
     if listening is not None and "ear" in message:
-        listening.switch_ears(message["ear"])
-        return ""
+        cut = listening.switch_ears(message["ear"], message.get("from_ms"), message.get("t"))
+        return json.dumps({"ear_cut": cut}) if listening.ear is Ears.PHONE else ""
     if listening is not None and "ear_ready" in message:  # its recognizer loaded: a pause in its audio is a takeover
         listening.ready = bool(message["ear_ready"])
         log(HANDSFREE_LOG, f"call: the phone {'can' if listening.ready else 'can no longer'} take turns over")
@@ -1088,6 +1089,38 @@ def late_words(turn: PhoneTurn) -> dict:
     return {"delivered": turn.id, "to": got} if got else {"note": note, "unsent": turn.id}
 
 
+CUT_SLACK = 0.5  # seconds earlier than the laptop's last kept turn ended that the phone is told to hear from: the
+# laptop's audio runs behind the phone's by more than the message's trip, so a word after that turn is never skipped
+EAR_FROM_SLACK = 0.25  # seconds later than the phone says it has the words from: the laptop's audio runs behind
+EAR_FROM_MOST = 15.0  # seconds back the phone's words can start (it keeps 10 s of audio): older is held to this
+
+
+def is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def ear_cut(sent_ms: object, now: float, until: float | None) -> int | None:
+    """Where the phone starts hearing, on its own clock ("t" in its {"ear": "phone"}, sent at about `now`): just
+    before the laptop's last kept turn finished recording at `until` (both time.monotonic()), so that turn, delivered
+    by the laptop, isn't heard again from the phone's kept audio. None: no such turn in what the phone keeps, or no
+    clock to say it in. Always a little early (CUT_SLACK): at worst a word is heard twice, never skipped."""
+    if until is None or not is_number(sent_ms) or now - until > EAR_FROM_MOST:
+        return None
+    return round(sent_ms + (until - now - CUT_SLACK) * 1000)
+
+
+def words_from(from_ms: object, sent_ms: object, now: float) -> float:
+    """From when (time.monotonic(), as `now`) the phone has the words, as its {"ear": "phone"} says: "from_ms", its
+    clock (epoch ms) at the earliest audio it decodes, and "t", its clock as it sent the message. Their difference
+    needs no clocks to agree, and the message's own trip only makes the start later, never earlier: a laptop turn is
+    dropped only when the phone surely has it. Without "t", the two clocks are trusted to agree; without "from_ms",
+    the words start now (a turn already begun stays the laptop's)."""
+    if not is_number(from_ms) or from_ms <= 0:
+        return now
+    age = ((sent_ms if is_number(sent_ms) else time.time() * 1000) - from_ms) / 1000
+    return now - min(max(age, 0.0), EAR_FROM_MOST) + EAR_FROM_SLACK
+
+
 class PhoneListening:
     """The phone's own ears on this call (its speech-to-text, when the line is bad): which ears hear the user, whether
     the phone can take a turn over, whether it hears them now, and the turns it heard.
@@ -1114,23 +1147,30 @@ class PhoneListening:
         self.clip_told: str | None = None  # the clip last sent as {"playing"} ("": none), None: not told yet
         self.last: tuple[str, Heard] | None = None  # its last message delivered, for "send that to …"
 
-    def switch_ears(self, said: object) -> None:
-        """{"ear": "phone"|"laptop"}: which ears hear the user from now on (and once more on reconnecting)."""
+    def switch_ears(self, said: object, from_ms: object = None, sent_ms: object = None) -> int | None:
+        """{"ear": "phone"|"laptop", "from_ms", "t"}: which ears hear the user from now on (and once more on
+        reconnecting). Taking them, the phone says from when it has the words (words_from): a laptop turn begun
+        before then stays the laptop's, one begun after is the phone's, even if it hands back soon. Returns, for the
+        phone, where to start hearing on its clock (ear_cut): after the laptop's last kept turn."""
         try:
             ear = Ears(said)
         except ValueError:
             log(HANDSFREE_LOG, "call: the phone named ears there are none of: ignored")
-            return
+            return None
         CALL_EAR.parent.mkdir(parents=True, exist_ok=True)
+        cut = None
+        if ear is Ears.PHONE:  # written first: hands-free reads it once CALL_EAR says phone
+            now = time.monotonic()
+            CALL_EAR_SINCE.write_text(f"{now:.6f} {words_from(from_ms, sent_ms, now):.6f}")
+            cut = ear_cut(sent_ms, now, laptop_heard_until())
         CALL_EAR.write_text(ear.value)
-        if ear is Ears.PHONE:  # a laptop turn the phone took over midway is the phone's, even if it hands back soon
-            CALL_EAR_SINCE.write_text(f"{time.monotonic():.6f}")
         if ear is not self.ear:
             log(HANDSFREE_LOG, "call: the phone hears the user itself now" if ear is Ears.PHONE
                 else "call: the laptop hears the user again")
         self.ear = ear
         if ear is Ears.LAPTOP:
             self.hears(False)
+        return cut
 
     def hears(self, on: bool) -> None:
         """{"hearing": true|false}: the phone's turn opened or closed. The phase says so, as hands-free's own does (in
@@ -1168,7 +1208,10 @@ class PhoneListening:
         # Another turn opened after this one came (it waited behind a slow message): that one is still being heard,
         # and must keep its hold. A late turn, said long ago, leaves the turn of now alone too
         newer = self.opened > self.arrivals.pop(turn.id, self.opened)
-        if not turn.late and not newer:  # its turn is over: act_on_turn puts the phase back first
+        # Sent again (a dropped line came back): answered as before, acting on nothing, so the turn being heard now
+        # keeps its hold on talkback
+        again = turn.id in HEARD
+        if not turn.late and not newer and not again:  # its turn is over: act_on_turn puts the phase back first
             self.hearing = 0.0
         log(HANDSFREE_LOG, f"call: the phone heard a turn ({turn.logged()})")
         return await once(turn.id, (lambda: late_words(turn)) if turn.late else (lambda: self.act(turn, not newer)))
@@ -1238,6 +1281,7 @@ class PhoneListening:
         if not line_lost:
             CALL_EAR.unlink(missing_ok=True)
             CALL_EAR_SINCE.unlink(missing_ok=True)
+            CALL_LAPTOP_HEARD.unlink(missing_ok=True)
 
 
 async def heard_late(request: web.Request) -> web.Response:
@@ -3074,6 +3118,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             phonevoice.call_over()  # a new call: no clip or offer left from an earlier one (a drop keeps them)
             CALL_EAR.unlink(missing_ok=True)  # the laptop hears a new call until the phone says otherwise
             CALL_EAR_SINCE.unlink(missing_ok=True)  # an earlier call's (or boot's: its clock starts again)
+            CALL_LAPTOP_HEARD.unlink(missing_ok=True)
         CALL_GAP.unlink(missing_ok=True)
         blank_words()  # words a killed server never blanked
         for stale in CALL_MIRROR.glob("*.json"):  # terminal lines from before this call

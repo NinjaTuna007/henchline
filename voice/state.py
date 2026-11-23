@@ -76,7 +76,12 @@ REJOIN = 35.0  # seconds a dropped call may come back: the phone retries for 30 
 # server writes it from the phone's {"ear"}, only for a phone that can listen itself. Hands-free opens no turns while
 # it says Ears.PHONE
 CALL_EAR = STATE / "call.ear"
-CALL_EAR_SINCE = STATE / "call.ear.since"  # when the phone last took the ears (time.monotonic(): one clock here)
+# When the phone last took the ears, and from when it has the words (the earliest audio it decodes): "<took> <from>",
+# both time.monotonic() (one clock here). One number alone is both: the phone has nothing from before it took them
+CALL_EAR_SINCE = STATE / "call.ear.since"
+# When the laptop's last call turn that it keeps (delivers) finished recording (time.monotonic()): a phone taking the
+# ears is told to start hearing after it, so that turn isn't delivered twice
+CALL_LAPTOP_HEARD = STATE / "call.laptop-heard"
 # When the phone's audio paused (time.monotonic()) while the phone was ready to take the turn over: a laptop turn
 # that saw it waits a moment before it is delivered, and is dropped if the phone takes the ears meanwhile
 CALL_GAP = STATE / "call.gap"
@@ -99,13 +104,45 @@ def gap_since(started: float) -> bool:
     return found is not None and found >= started
 
 
+def ears_taken() -> tuple[float, float] | None:
+    """(when the phone last took the ears, from when it has the words), time.monotonic(); None if it never did."""
+    try:
+        numbers = [float(part) for part in CALL_EAR_SINCE.read_text().split()]
+    except (OSError, ValueError):
+        return None
+    if not numbers or len(numbers) > 2:
+        return None
+    return numbers[0], numbers[-1]  # one number alone: the words from when it took them
+
+
+def note_laptop_heard(until: float) -> None:
+    """A call turn the laptop keeps finished recording at `until` (time.monotonic())."""
+    try:
+        CALL_LAPTOP_HEARD.write_text(f"{until:.6f}")
+    except OSError:  # the phone may then hear that turn again: a duplicate, never words lost
+        pass
+
+
+def laptop_heard_until() -> float | None:
+    """When the laptop's last kept call turn finished recording (time.monotonic()); None if none, or from before a
+    reboot."""
+    found = _read_float(CALL_LAPTOP_HEARD)
+    return found if found is not None and found <= time.monotonic() + 0.01 else None
+
+
 def phone_took_ears_since(started: float, calling: bool | None = None) -> bool:
-    """The phone hears the user now, or took the ears at or after `started` (time.monotonic()) and has handed them
-    back since: either way it has the words said from then on."""
-    found = _read_float(CALL_EAR_SINCE)
+    """The phone has the words of a turn that began at `started` (time.monotonic()): it took the ears at or after
+    then (and may have handed them back since), or hears the user now, AND it has the audio from at or before then.
+    A takeover whose words start after the turn did leaves the turn to the laptop: a duplicate beats words lost."""
+    found = ears_taken()
+    if found is None:
+        return False
+    took, words_from = found
     # Not past now (give or take its last written decimal): one from before a reboot (the clock started again)
     # says nothing about this turn
-    return phone_listens(calling) or (found is not None and started <= found <= time.monotonic() + 0.01)
+    if took > time.monotonic() + 0.01:
+        return False
+    return words_from <= started and (started <= took or phone_listens(calling))
 
 
 def line_dropped(now: float | None = None) -> dict | None:

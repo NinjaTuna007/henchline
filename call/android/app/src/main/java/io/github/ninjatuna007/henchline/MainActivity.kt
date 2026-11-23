@@ -741,7 +741,7 @@ class MainActivity : Activity() {
                     CallService.Bus.service?.send(JSONObject().put("button_only", true).toString())
                 if (!status.getBoolean("reconnecting") && stayOn)
                     CallService.Bus.service?.send(JSONObject().put("stay_on", true).toString())
-                findViewById<TextView>(R.id.callStatus).text = if (callWords.isNotEmpty()) " · $callWords" else ""
+                showCallStatus()
                 if (onCall() && callWords.isNotEmpty()) state.text = subtitle("Reconnecting…")
             }
             status.has("closed") -> {
@@ -789,6 +789,7 @@ class MainActivity : Activity() {
                 }
             }
             status.has("agents") -> showAgents(status)
+            status.has("ears") -> showCallStatus()  // the phone hears the user itself now
             status.has("delivered") -> tick(status.getString("delivered"), "delivered")  // in place: no jump
             status.has("reload") -> { showHistory(); if (listScreen.visibility == View.VISIBLE) showCrew() }  // a share or a file kept in a chat
             status.has("talking") ->  // the earbuds or the notification started or ended a turn
@@ -805,7 +806,7 @@ class MainActivity : Activity() {
             status.has("mode") -> {
                 if (onCall()) state.text = subtitle(status.optString("state"))
                 callWords = status.optString("state").substringBefore(" · ").lowercase()
-                findViewById<TextView>(R.id.callStatus).text = if (callWords.isNotEmpty()) " · $callWords" else ""
+                showCallStatus()
                 showChipIn(status.optJSONObject("speaker"))
                 showMode(status.getString("mode"))
             }
@@ -1398,6 +1399,13 @@ class MainActivity : Activity() {
     }
 
     private var callWords = ""  // what is happening on the call ("speaking", "listening"), for the bar's second line
+
+    /** The bar's second line after the timer: "phone ears" while the phone hears the user itself, then what is
+     *  happening on the call. */
+    private fun showCallStatus() {
+        val parts = listOfNotNull(PHONE_EARS.takeIf { CallService.Bus.phoneEars }, callWords.ifEmpty { null })
+        findViewById<TextView>(R.id.callStatus).text = parts.joinToString("") { " · $it" }
+    }
     private var pulse: android.animation.Animator? = null  // the live ring's beat: only while the bar shows and the app is seen
 
     private fun pulseLive(on: Boolean) {
@@ -1441,7 +1449,7 @@ class MainActivity : Activity() {
             timer.base = android.os.SystemClock.elapsedRealtime() - (System.currentTimeMillis() - started)
             timer.start()
         }
-        findViewById<TextView>(R.id.callStatus).text = if (callWords.isNotEmpty()) " · $callWords" else ""
+        showCallStatus()
         bar.contentDescription = "On a call with $name. Tap to return; hold to switch who it's with."
         showSpeaker(CallService.Bus.service?.speaker ?: prefs().getBoolean("speaker", true))
     }
@@ -5135,6 +5143,7 @@ class MainActivity : Activity() {
 
     companion object {
         private const val LAPTOP = "laptop"  // the laptop's key among computers (its heading's fold, New chat's pick)
+        private const val PHONE_EARS = "phone ears"  // the call bar's sign: the phone hears you itself
         private const val NEW_CHAT_ON = "new_chat_on"  // the computer whose chat was opened last: New chat starts there
         const val HOLD_MS = 300L  // longer than this is a hold; shorter is a tap
         const val ANSWER = "io.github.ninjatuna007.henchline.ANSWER"  // from IncomingActivity's Answer
