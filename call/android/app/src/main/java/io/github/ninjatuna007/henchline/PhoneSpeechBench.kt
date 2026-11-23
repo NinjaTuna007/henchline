@@ -25,7 +25,8 @@ import java.io.RandomAccessFile
  * From the laptop:
  *   adb shell am broadcast -n io.github.ninjatuna007.henchline/.PhoneSpeechBench --es model nemotron \
  *     [--ei threads 2] [--ez hint true] [--ef score 2.0] [--ez jenny true] [--ez boost true] [--ei loops 1] [--es set asr-set]
- *   (--es model android: the phone's own on-device recognizer, Android 13+, if it has one)
+ *   (--es model android: the phone's own on-device recognizer, Android 13+, if it has one; --es lang en-US picks its
+ *   language, asking the phone to download it first if it can)
  *   adb logcat -s Henchline | grep "speech bench"
  * Each take is fed in real time, each 0.1 s chunk once its audio would have been heard; "wait" is from when the
  * last chunk was due (the end of the take in real time, not when decoding let it be fed) to the final text (after 0.4 s
@@ -46,7 +47,10 @@ class PhoneSpeechBench : BroadcastReceiver() {
             jenny = intent.getBooleanExtra("jenny", false),
             boost = intent.getBooleanExtra("boost", false),
             loops = intent.getIntExtra("loops", 1).coerceIn(1, 50),
-            set = intent.getStringExtra("set")?.takeIf { Regex("[A-Za-z0-9._-]{1,64}").matches(it) } ?: "asr-set")
+            set = intent.getStringExtra("set")?.takeIf { Regex("[A-Za-z0-9._-]{1,64}").matches(it) } ?: "asr-set",
+            lang = benchLanguage(intent.getStringExtra("lang")))
+        // A language it can't take is said, not quietly run as English
+        intent.getStringExtra("lang")?.let { if (benchLanguage(it).isEmpty()) log("lang \"${it.take(40)}\" rejected (want e.g. en-US): English instead") }
         val app = context.applicationContext
         // Minutes, not seconds: past a receiver's time, on its own thread (the app kept open, or a call up)
         Thread({ try { SpeechBench.run(app, options) } catch (e: Throwable) { log("failed: $e") } }, "henchline-speech-bench").start()
@@ -55,9 +59,12 @@ class PhoneSpeechBench : BroadcastReceiver() {
 
 private fun log(line: String) { try { android.util.Log.i("Henchline", "speech bench: $line") } catch (_: RuntimeException) {} }
 
+/** --es lang as given when it looks like a language tag ("en", "en-US"); "" (the default English) when absent or not. */
+fun benchLanguage(raw: String?): String = raw?.takeIf { Regex("[a-z]{2,3}(-[A-Z]{2})?").matches(it) } ?: ""
+
 object SpeechBench {
     data class Options(val model: String, val threads: Int, val hint: Boolean, val score: Float, val jenny: Boolean,
-                       val boost: Boolean, val loops: Int, val set: String)
+                       val boost: Boolean, val loops: Int, val set: String, val lang: String = "")
 
     private class Take(val name: String, val ref: String, val pcm: FloatArray)
 
@@ -87,7 +94,7 @@ object SpeechBench {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
             if (o.model == "android") {
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return log("android: needs Android 13")
-                val asr = OnDevice(context, if (o.hint) names else emptyList())
+                val asr = OnDevice(context, if (o.hint) names else emptyList(), o.lang)
                 if (!asr.available) return log("android: no on-device recognizer on this phone")
                 if (!asr.ready()) return  // its English model isn't on the phone yet: asked for, try again once it is
                 repeat(o.loops) {
@@ -248,7 +255,7 @@ object SpeechBench {
      *  session ends when that audio is closed. Driven on the main thread, as SpeechRecognizer must be. Null when the
      *  take gives no text: an error, no answer in 30 s, or the recognizer no longer taking the audio. */
     @androidx.annotation.RequiresApi(Build.VERSION_CODES.TIRAMISU)
-    private class OnDevice(private val context: Context, private val hints: List<String>) {
+    private class OnDevice(private val context: Context, private val hints: List<String>, private val asked: String = "") {
         private var language = "en-US"  // the installed English one, once ready() has looked
         private val main = android.os.Handler(android.os.Looper.getMainLooper())
         val available = android.speech.SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
@@ -269,20 +276,24 @@ object SpeechBench {
                         override fun onSupportResult(support: android.speech.RecognitionSupport) {
                             val have = support.installedOnDeviceLanguages
                             // en-US when it is there, so runs on one phone stay comparable; else any English
-                            val english = have.firstOrNull { it == "en-US" } ?: have.firstOrNull { it.startsWith("en") }
-                            val gettable = support.supportedOnDeviceLanguages.filter { it.startsWith("en") }
+                            // --es lang: that one only (downloaded if it can be); else en-US when it is there, so runs on one
+                            // phone stay comparable, else any English
+                            val english = if (asked.isNotEmpty()) have.firstOrNull { it == asked }
+                                else have.firstOrNull { it == "en-US" } ?: have.firstOrNull { it.startsWith("en") }
+                            val gettable = support.supportedOnDeviceLanguages.filter {
+                                if (asked.isNotEmpty()) it == asked else it.startsWith("en") }
                             installed = english != null
                             if (english != null) language = english
                             log("android: installed=$have pending=${support.pendingOnDeviceLanguages} downloadable=$gettable")
                             when {
                                 english != null -> { log("android: using $english"); release() }
-                                gettable.isEmpty() -> { log("android: no English model on this phone, none to download"); release() }
+                                gettable.isEmpty() -> { log("android: no ${asked.ifEmpty { "English" }} model on this phone, none to download"); release() }
                                 else -> {
-                                    val wanted = gettable.firstOrNull { it == "en-US" } ?: gettable.first()
+                                    val wanted = gettable.firstOrNull { it == asked.ifEmpty { "en-US" } } ?: gettable.first()
                                     try {
                                         r.triggerModelDownload(Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                                             .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, wanted))
-                                        log("android: no English model yet; asked for $wanted, run again once it is in")
+                                        log("android: ${asked.ifEmpty { "no English model" }} not installed yet; asked for $wanted, run again once it is in")
                                     } catch (e: Throwable) { log("android: download of $wanted not started: $e") }
                                     main.postDelayed({ release() }, 2000)
                                 }
