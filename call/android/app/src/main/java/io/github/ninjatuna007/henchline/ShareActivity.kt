@@ -14,6 +14,13 @@ import android.widget.LinearLayout
  * and that agent is told where it landed.
  */
 class ShareActivity : Activity() {
+    private var sheet: Sheet? = null
+
+    @Deprecated("the platform Activity's back handling, kept for Android 10-12")
+    override fun onBackPressed() {
+        // The sheet slides away first, then the screen goes
+        if (sheet?.isOpen == true) sheet?.close() else @Suppress("DEPRECATION") super.onBackPressed()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -38,8 +45,8 @@ class ShareActivity : Activity() {
                 .setPositiveButton("OK", null).setOnDismissListener { finish() }.show()
             return
         }
-        Sheet(this, uris, names, text, crew, current().first.takeIf { s -> crew.any { it.first == s } } ?: crew[0].first)
-            .show()
+        sheet = Sheet(this, uris, names, text, crew, current().first.takeIf { s -> crew.any { it.first == s } } ?: crew[0].first)
+            .also { it.show() }
     }
 
     /** The crew to pick from: on a call, as the laptop lists it now; otherwise as it was on the last call. */

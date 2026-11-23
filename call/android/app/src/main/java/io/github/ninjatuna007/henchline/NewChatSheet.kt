@@ -10,7 +10,6 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.Button
 import android.widget.EditText
@@ -35,16 +34,20 @@ fun hideKeyboard(activity: Activity) {
 }
 
 /**
- * A sheet that a downward drag pulls down, and past a quarter of its height (or flung) closes: what its grey handle
- * promises (the user's catch, 2026-11-17: the handle did nothing). A drag inside a list that can still scroll up
- * scrolls the list instead; taps, holds and sideways drags stay with what's in the sheet.
+ * A sheet that a downward drag pulls down, and let go past a quarter of its height (or flung down) closes: what its
+ * grey handle promises (the user's catch, 2026-11-17: the handle did nothing); let go short of that, it springs back
+ * from the speed it was let go at. A drag inside a list that can still scroll up scrolls the list instead; taps,
+ * holds and sideways drags stay with what's in the sheet. Its [SheetFrame] moves it.
  */
 class DragSheet(context: android.content.Context, private val onDismiss: () -> Unit) : LinearLayout(context) {
     private val slop = android.view.ViewConfiguration.get(context).scaledTouchSlop
+    private val fling = SHEET_FLING_DP * context.resources.displayMetrics.density
     private var startX = 0f
     private var startY = 0f
+    private var base = 0f  // where the sheet was when the drag took hold
     private var dragging = false
     private var velocity: android.view.VelocityTracker? = null
+    private val frame get() = parent as? SheetFrame
 
     /** Whether something scrollable under that point could still scroll up: then the drag is the list's. */
     private fun listCanScrollUp(group: android.view.ViewGroup, x: Float, y: Float): Boolean {
@@ -58,16 +61,22 @@ class DragSheet(context: android.content.Context, private val onDismiss: () -> U
         return false
     }
 
+    /** The drag takes hold here: from where the sheet is now (caught mid-move, it stays under the finger). */
+    private fun takeHold(event: android.view.MotionEvent) {
+        dragging = true
+        base = frame?.grab() ?: translationY
+        startY = event.rawY
+        velocity?.recycle()
+        velocity = android.view.VelocityTracker.obtain()
+    }
+
     override fun onInterceptTouchEvent(event: android.view.MotionEvent): Boolean {
         when (event.actionMasked) {
             android.view.MotionEvent.ACTION_DOWN -> { startX = event.rawX; startY = event.rawY; dragging = false }
             android.view.MotionEvent.ACTION_MOVE -> {
                 val dy = event.rawY - startY
                 if (!dragging && dy > slop && dy > 2 * kotlin.math.abs(event.rawX - startX) &&
-                    !listCanScrollUp(this, startX, startY)) {
-                    dragging = true
-                    velocity = android.view.VelocityTracker.obtain()
-                }
+                    !listCanScrollUp(this, startX, startY)) takeHold(event)
             }
         }
         return dragging
@@ -80,23 +89,23 @@ class DragSheet(context: android.content.Context, private val onDismiss: () -> U
             android.view.MotionEvent.ACTION_DOWN -> { startX = event.rawX; startY = event.rawY; dragging = false }
             android.view.MotionEvent.ACTION_MOVE -> if (!dragging) {
                 val dy = event.rawY - startY
-                if (dy > slop && dy > 2 * kotlin.math.abs(event.rawX - startX)) {
-                    dragging = true
-                    velocity = android.view.VelocityTracker.obtain()
-                }
+                if (dy > slop && dy > 2 * kotlin.math.abs(event.rawX - startX)) takeHold(event)
             }
         }
         if (!dragging) return super.onTouchEvent(event)
-        velocity?.addMovement(event)
+        // On the screen, not the sheet: the sheet follows the finger, so in its own place the finger hardly moves
+        android.view.MotionEvent.obtain(event).also { it.setLocation(event.rawX, event.rawY); velocity?.addMovement(it); it.recycle() }
+        val offset = (base + event.rawY - startY).coerceAtLeast(0f)
         when (event.actionMasked) {
-            android.view.MotionEvent.ACTION_MOVE -> translationY = (event.rawY - startY).coerceAtLeast(0f)
+            android.view.MotionEvent.ACTION_MOVE -> frame?.drag(offset) ?: run { translationY = offset }
             android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
                 velocity?.computeCurrentVelocity(1000)
-                val flung = (velocity?.yVelocity ?: 0f) > 1500 * resources.displayMetrics.density
+                val speed = velocity?.yVelocity ?: 0f
                 velocity?.recycle(); velocity = null
                 dragging = false
-                if (event.actionMasked == android.view.MotionEvent.ACTION_UP && (translationY > height / 4f || flung)) onDismiss()
-                else animate().translationY(0f).setDuration(180).start()
+                val f = frame
+                if (event.actionMasked == android.view.MotionEvent.ACTION_CANCEL) f?.settle(offset) ?: run { translationY = 0f }
+                else if (f?.release(offset, speed, fling) ?: sheetCloses(offset, height.toFloat(), speed, fling).also { if (!it) translationY = 0f }) onDismiss()
             }
         }
         return true
@@ -109,6 +118,13 @@ open class BottomPanel(protected val activity: Activity) {
 
         /** The sheet on top, or null when none is open. */
         fun top(): BottomPanel? = shown.lastOrNull { it.isOpen }
+
+        /** Each open sheet's scrim from where it is in the stack (see [stackDims]): live, so the top one darkens to
+         *  full as the one under it closes. */
+        private fun restack() {
+            val open = shown.filter { it.isOpen }
+            stackDims(open.size).forEachIndexed { i, d -> open[i].root?.dimTo(d) }
+        }
 
         /** Every open sheet, the top one first: leaving a screen must not leave one drawn over the next. */
         fun closeAll() {
@@ -124,16 +140,19 @@ open class BottomPanel(protected val activity: Activity) {
         if (stroke > 0) setStroke(px(stroke), strokeColour)
     }
 
-    private var root: FrameLayout? = null
+    private var root: SheetFrame? = null
     private var sheet: LinearLayout? = null
     protected var subtitleView: TextView? = null  // the line under the title, for sheets that update it
     val isOpen get() = root?.parent != null
 
-    /** A fresh panel with its handle, title and a line under it; what goes in it is added to the returned layout. */
+    /** A fresh panel with its handle, title and a line under it; what goes in it is added to the returned layout.
+     *  It springs up over a darkening scrim; drawn again while open (show() once more), it is just there. */
     protected fun open(title: String, subtitle: String): LinearLayout {
+        val again = isOpen
         close(animate = false)
         hideKeyboard(activity)  // every sheet above it, not behind it (the model picker was, 2026-11-16)
-        val root = FrameLayout(activity).apply { setBackgroundColor(Color.parseColor("#99000000")); alpha = 0f }
+        // Over another sheet: a lighter scrim, so the one below dims a little (and is whole again once this goes)
+        val root = SheetFrame(activity, if (shown.any { it.isOpen }) STACKED_SCRIM else SCRIM)
         val sheet = DragSheet(activity) { close() }.apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
@@ -153,6 +172,7 @@ open class BottomPanel(protected val activity: Activity) {
             text = subtitle; setTextColor(colour(R.color.muted)); textSize = 14f; setPadding(0, px(4), 0, 0)
         }.also { sheet.addView(it) } else null
         root.addView(sheet, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+        root.hold(sheet)
         root.setOnClickListener { close() }
         // Above the keyboard when one is up (the user's catch, 2026-11-17: typing a new name, the keyboard hid it):
         // the window's own insets are read on every layout, since the app's root view takes them for itself
@@ -173,30 +193,38 @@ open class BottomPanel(protected val activity: Activity) {
         decor.viewTreeObserver.addOnGlobalLayoutListener(lift)
         root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(v: View) {}
-            override fun onViewDetachedFromWindow(v: View) { decor.viewTreeObserver.removeOnGlobalLayoutListener(lift) }
+            override fun onViewDetachedFromWindow(v: View) {
+                decor.viewTreeObserver.removeOnGlobalLayoutListener(lift)
+                // Taken off the screen while still this panel's (the activity gone): closed, so the list of open
+                // sheets and what the panel listens to don't keep the activity
+                if (this@BottomPanel.root === root) {
+                    shown.remove(this@BottomPanel); restack()
+                    this@BottomPanel.root = null; this@BottomPanel.sheet = null
+                    try { onClosed() } catch (_: Throwable) {}
+                }
+            }
         })
-        activity.addContentView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        shown.addLast(this)  // above any sheet already open: back closes this one first
-        root.animate().alpha(1f).setDuration(180).start()
-        // Once what the sheet holds is in (its show() goes on after this returns): what is tapped ripples
-        sheet.post { Motion.rippleAll(sheet) }
-        sheet.translationY = 800 * dp
-        sheet.animate().translationY(0f).setDuration(300).setInterpolator(DecelerateInterpolator(1.6f)).start()
         this.root = root
         this.sheet = sheet
+        activity.addContentView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        shown.addLast(this)  // above any sheet already open: back closes this one first
+        restack()
+        // Once what the sheet holds is in (its show() goes on after this returns): what is tapped ripples
+        sheet.post { Motion.rippleAll(sheet) }
+        root.enter(instant = again)
         return sheet
     }
 
+    /** Closed: at once no longer open (back goes to the sheet or screen under it), then down and away, then
+     *  removed; touches are swallowed meanwhile, so nothing in it acts twice.
+     *  Once only: again, while it goes, does nothing. */
     fun close(animate: Boolean = true) {
-        shown.remove(this)
+        if (shown.remove(this)) restack()
         val r = root ?: return
-        val s = sheet
         root = null; sheet = null
         try { onClosed() } catch (_: Throwable) {}
-        val done = { (r.parent as? ViewGroup)?.removeView(r) }
-        if (!animate || s == null) return done().let {}
-        r.animate().alpha(0f).setDuration(200).start()
-        s.animate().translationY(s.height.toFloat()).setDuration(200).withEndAction { done() }.start()
+        val done = { (r.parent as? ViewGroup)?.removeView(r); Unit }
+        if (!animate) done() else r.leave(done)
     }
 
     /** The sheet was closed, however (Close, a drag, a tap outside, back): what it listened to is let go. */

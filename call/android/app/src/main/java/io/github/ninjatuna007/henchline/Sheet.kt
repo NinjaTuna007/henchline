@@ -11,7 +11,6 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
-import android.view.animation.DecelerateInterpolator
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
@@ -48,8 +47,8 @@ class Sheet(
 
     fun show() {
         hideKeyboard(activity)  // above the keyboard, not behind it
-        val root = FrameLayout(activity).apply { setBackgroundColor(Color.parseColor("#99000000")) }
-        val sheet = LinearLayout(activity).apply {
+        val root = SheetFrame(activity)
+        val sheet = DragSheet(activity) { close() }.apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
                 setColor(colour(R.color.surface))
@@ -142,14 +141,13 @@ class Sheet(
         draw()
         Motion.rippleAll(sheet)  // Cancel and the preview: a ripple when tapped
         root.addView(sheet, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+        root.hold(sheet)
         root.setOnClickListener { close() }
         if (over) activity.addContentView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT)) else activity.setContentView(root)
         liftAboveKeyboard(root)
         this.root = root
-        sheet.translationY = 800 * dp
-        sheet.animate().translationY(0f).setDuration(280).setInterpolator(DecelerateInterpolator()).start()
-        this.sheet = sheet
+        root.enter()
     }
 
     /** Keep the caption and its Send button above the IME, including edge-to-edge Android versions where the
@@ -174,16 +172,18 @@ class Sheet(
         })
     }
 
-    private var sheet: View? = null
+    private var root: SheetFrame? = null
 
-    private var root: View? = null
+    /** Open until close() starts: back then goes to what is under it while it slides away (its touches are
+     *  swallowed meanwhile, so nothing in it acts twice). */
+    val isOpen get() = root?.let { it.parent != null && !it.leaving } == true
 
-    val isOpen get() = root?.parent != null
-
+    /** Down and away, then removed (or, as its own screen, the screen finished): once, however often asked. */
     fun close() {
-        val done: () -> Unit = { if (over) { (root?.parent as? ViewGroup)?.removeView(root); onClosed() } else activity.finish() }
-        val s = sheet ?: return done()
-        s.animate().translationY(s.height.toFloat()).setDuration(200).withEndAction { done() }.start()
+        val r = root ?: return
+        r.leave {
+            if (over) { (r.parent as? ViewGroup)?.removeView(r); onClosed() } else activity.finish()
+        }
     }
 
     /** What is being shared: a picture's thumbnail, else the names (or the text). */
