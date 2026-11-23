@@ -86,6 +86,7 @@ class MainActivity : Activity() {
         listScreen = findViewById(R.id.listScreen)
         chatScreen = findViewById(R.id.chatScreen)
         settingsScreen = findViewById(R.id.settingsScreen)
+        chatMorph = ChatContainer(findViewById(R.id.screens), chatScreen, getColor(R.color.navy))
         followBack()
         refresh = findViewById(R.id.refresh)
         quoteBar = findViewById(R.id.quote)
@@ -171,7 +172,7 @@ class MainActivity : Activity() {
         others = Strays.load(prefs().getString("others", "[]"))
         showCrew()
 
-        findViewById<ImageButton>(R.id.menu).setOnClickListener { show(listScreen) }
+        findViewById<ImageButton>(R.id.menu).setOnClickListener { closeChat() }
         findViewById<View>(R.id.compose).setOnClickListener { newChat() }
         findViewById<Switch>(R.id.danceSwitch).apply {
             isChecked = prefs().getBoolean("dance", true)
@@ -433,7 +434,7 @@ class MainActivity : Activity() {
                     when {
                         sheet?.isOpen == true -> sheet?.close()
                         BottomPanel.top() != null -> BottomPanel.top()?.close()
-                        else -> show(listScreen)
+                        else -> closeChat()
                     }
                     return true
                 }
@@ -460,6 +461,7 @@ class MainActivity : Activity() {
     }
 
     private var predictiveBack: PredictiveBack? = null  // Android 14 and later only
+    private var screenPreview: ScreenBackPreview? = null  // the last screen a back swipe moved: the chat's close reads it
 
     /** Android 14 and later: back as a swipe that shows where it goes. Registered only while back has something to
      *  do in the app (on the list with nothing open, the system's own back goes home). A sheet narrows as the swipe
@@ -473,7 +475,11 @@ class MainActivity : Activity() {
             begin = { fromLeft ->
                 when (val step = backStep()) {
                     BackStep.SHEET, BackStep.PANEL -> (backSurface(step) as? SheetFrame)?.backPreview()
-                    BackStep.SCREEN -> shownScreen()?.let { ScreenBackPreview(it, screens, fromLeft) }
+                    // The chat's shrink is where its close (into its row) takes over; a grow under way ends first
+                    BackStep.SCREEN -> shownScreen()?.let { shown ->
+                        chatMorph.stop()
+                        ScreenBackPreview(shown, screens, fromLeft, keepsOnCommit = shown === chatScreen).also { screenPreview = it }
+                    }
                     BackStep.SELECTION, null -> null
                 }
             },
@@ -487,7 +493,7 @@ class MainActivity : Activity() {
             BackStep.SHEET -> sheet?.close()
             BackStep.PANEL -> BottomPanel.top()?.close()
             BackStep.SELECTION -> stopSelecting()
-            BackStep.SCREEN -> show(listScreen)
+            BackStep.SCREEN -> closeChat()
             null -> @Suppress("DEPRECATION") super.onBackPressed()
         }
     }
@@ -624,6 +630,7 @@ class MainActivity : Activity() {
         tabAxis.stop(); planAxis.stop(); tabPill.cancel(); planPill.cancel()
         statusTurn++; statusFade?.cancel(); statusFade = null
         barSlide.stop()
+        chatMorph.stop()  // nor a chat growing or shrinking, its picture or its clip
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) predictiveBack?.release()  // nor a back swipe's look, nor its callback
         predictiveBack = null
         super.onDestroy()
@@ -2702,9 +2709,10 @@ class MainActivity : Activity() {
             background = getDrawable(if (remote == null && session == current) R.drawable.row_current else android.R.color.transparent)
             setOnClickListener {
                 prefs().edit().putString(NEW_CHAT_ON, remote?.host?.hostId ?: LAPTOP).apply()  // New chat starts there next
-                if (remote == null) open(session)
+                if (remote == null) openFrom(session, this)
                 else RemoteChatMotion.open(this@MainActivity, HostChatActivity.open(this@MainActivity, ChatKey(remote.host.hostId, session)), this)
             }
+            if (remote == null) setTag(R.id.rowOf, session)  // the row the chat shrinks back into ([rowOf])
             setOnLongClickListener { if (remote == null) chatMenu(session, project, agent) else hostChatMenu(remote.host, session, project, this); true }
         }
         row.addView(ImageView(this).apply {
@@ -3028,6 +3036,7 @@ class MainActivity : Activity() {
 
     /** One screen at a time: the chat list, a chat, or settings. */
     private fun show(screen: View) {
+        chatMorph.stop()  // a chat growing or shrinking belongs to the screen change it began with
         BottomPanel.closeAll()  // a menu belongs to the screen it opened on, including one opened on top of another
         if (screen !== chatScreen) stopSelecting()  // and a selection to the chat it was made in
         (shownUndo?.parent as? android.view.ViewGroup)?.removeView(shownUndo)
@@ -3060,6 +3069,40 @@ class MainActivity : Activity() {
         text.setSelection(text.text?.length ?: 0)
         prefs().edit().putString("current", current).putString("current_name", names[current] ?: "").apply()
         showHistory()
+    }
+
+    private lateinit var chatMorph: ChatContainer  // the laptop's chat growing out of its row and back
+
+    /** A laptop chat opened from its row on the list: it grows out of the row (when there is one on screen and
+     *  animations are on; else it just appears, as from a notification or the call bar). */
+    private fun openFrom(session: String, row: View) {
+        val from = chatMorph.capture(row, listScreen, crew.parent as? View)
+        open(session)
+        if (from != null && chatScreen.visibility == View.VISIBLE) chatMorph.grow(from)
+    }
+
+    /** Back to the list (the chat's arrow, back, the edge swipe): from a chat, it shrinks into its row on the list,
+     *  from where a back swipe left it; from settings the list just appears. */
+    private fun closeChat() {
+        val preview = screenPreview
+        screenPreview = null
+        val closing = if (chatScreen.visibility == View.VISIBLE)
+            chatMorph.captureClose(preview?.takeIf { it.surface === chatScreen }?.look()) else null
+        preview?.reset()  // whole again: the picture taken carries its look on
+        val session = current
+        show(listScreen)
+        if (closing != null) chatMorph.shrink(closing, { rowOf(session) }, crew.parent as? View)
+    }
+
+    /** The chat's row on the list as drawn now (the first shown, a pinned chat being in two places), or null. */
+    private fun rowOf(session: String): View? {
+        if (session.isEmpty()) return null
+        fun find(v: View): View? {
+            if (v.getTag(R.id.rowOf) == session && v.isShown) return v
+            if (v is android.view.ViewGroup) for (i in 0 until v.childCount) find(v.getChildAt(i))?.let { return it }
+            return null
+        }
+        return find(crew)
     }
 
     private fun open(session: String) {

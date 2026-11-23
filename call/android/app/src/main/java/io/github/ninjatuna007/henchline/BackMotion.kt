@@ -177,12 +177,12 @@ class PredictiveBack(
 /**
  * A full screen (a chat, settings) following a back swipe: it shrinks toward [BACK_SCREEN_SCALE], moves a little
  * toward the swipe's side and rounds its corners, while the space behind it (backdrop, an opaque colour) darkens.
- * Back going ahead puts it whole at once (the list then replaces it); let go short, it eases back. With animations
- * off it never moves. Whatever it changed is put back as it was: scale, offset, outline, clip and backdrop.
+ * Back going ahead puts it whole at once (the list then replaces it), unless keepsOnCommit: then the close takes
+ * over from its [look] and resets it itself; let go short, it eases back. With animations off it never moves. Whatever it changed is put back as it was: scale, offset, outline, clip and backdrop.
  */
-class ScreenBackPreview(private val screen: View, private val backdrop: View, private val fromLeft: Boolean) : BackPreview {
+class ScreenBackPreview(private val screen: View, private val backdrop: View, private val fromLeft: Boolean,
+                        override val keepsOnCommit: Boolean = false) : BackPreview {
     override val surface: Any get() = screen
-    override val keepsOnCommit = false
     private val live = Motion.on()
     private val density = screen.resources.displayMetrics.density
     private val scaleX0 = screen.scaleX
@@ -231,6 +231,16 @@ class ScreenBackPreview(private val screen: View, private val backdrop: View, pr
         run = Motion.run(Motion.SHORT, Motion.standard, { t -> at = from * (1 - t); apply(at) },
             { if (run != null) { run = null; reset() } })
         if (run == null) reset()  // instant: animations went off meanwhile
+    }
+
+    /** How the swipe has left the screen (its place in its parent, corner and the darkness behind it), for a close
+     *  that takes over from it; null when it hasn't moved it. Read before [reset]. */
+    fun look(): SwipeLook? {
+        if (!touched || at <= 0f) return null
+        val box = ChatMorph.scaledBox(screen.left.toFloat(), screen.top.toFloat(), screen.width.toFloat(),
+            screen.height.toFloat(), screen.scaleX, screen.scaleY, screen.pivotX, screen.pivotY,
+            screen.translationX, screen.translationY)
+        return SwipeLook(box, corner, if (groundColour != null) BACK_BACKDROP * at else 0f)
     }
 
     override fun reset() {

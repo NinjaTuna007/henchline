@@ -4,4 +4,6 @@
     <item name="ats" type="id" />
     <!-- A view given its touch ripple (Motion.ripple or press): not wrapped again -->
     <item name="rippled" type="id" />
+    <!-- On a laptop chat's row in the list: its session, for the chat to shrink back into on close -->
+    <item name="rowOf" type="id" />
 </resources>
