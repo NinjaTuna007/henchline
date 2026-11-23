@@ -86,6 +86,7 @@ class MainActivity : Activity() {
         listScreen = findViewById(R.id.listScreen)
         chatScreen = findViewById(R.id.chatScreen)
         settingsScreen = findViewById(R.id.settingsScreen)
+        followBack()
         refresh = findViewById(R.id.refresh)
         quoteBar = findViewById(R.id.quote)
         search = findViewById(R.id.search)
@@ -442,14 +443,52 @@ class MainActivity : Activity() {
         return super.dispatchTouchEvent(event)
     }
 
-    @Deprecated("the platform Activity's back handling, kept for Android 10-12")
+    /** What back does now ([mainBackStep]): the top menu, then the one under it, the selection, then a chat or
+     *  settings; null on the list, where back leaves the app. */
+    private fun backStep() = mainBackStep(sheet?.isOpen == true, BottomPanel.top() != null, selected != null,
+        listScreen.visibility == View.VISIBLE)
+
+    /** The screen showing now, when it isn't the list. */
+    private fun shownScreen(): View? = listOf(chatScreen, settingsScreen).firstOrNull { it.visibility == View.VISIBLE }
+
+    /** What a back swipe moves for that step: a sheet, or the screen; nothing for a selection. */
+    private fun backSurface(step: BackStep?): Any? = when (step) {
+        BackStep.SHEET -> sheet?.backFrame
+        BackStep.PANEL -> BottomPanel.top()?.backFrame
+        BackStep.SCREEN -> shownScreen()
+        BackStep.SELECTION, null -> null
+    }
+
+    private var predictiveBack: PredictiveBack? = null  // Android 14 and later only
+
+    /** Android 14 and later: back as a swipe that shows where it goes. Registered only while back has something to
+     *  do in the app (on the list with nothing open, the system's own back goes home). A sheet narrows as the swipe
+     *  goes, a chat or settings shrinks over the darkening space behind it; back going ahead is onBackPressed, as
+     *  on older Android. */
+    private fun followBack() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return
+        val screens = findViewById<View>(R.id.screens)
+        PredictiveBack(onBackInvokedDispatcher,
+            wanted = { backStep() != null && !keyboardUp(window.decorView) },
+            begin = { fromLeft ->
+                when (val step = backStep()) {
+                    BackStep.SHEET, BackStep.PANEL -> (backSurface(step) as? SheetFrame)?.backPreview()
+                    BackStep.SCREEN -> shownScreen()?.let { ScreenBackPreview(it, screens, fromLeft) }
+                    BackStep.SELECTION, null -> null
+                }
+            },
+            surfaceNow = { backSurface(backStep()) },
+            invoke = { @Suppress("DEPRECATION") onBackPressed() }).also { it.watch(window.decorView); predictiveBack = it }
+    }
+
+    @Deprecated("the platform Activity's back handling, kept for Android 10-13; on 14 and later PredictiveBack calls it")
     override fun onBackPressed() {
-        when {  // the top menu, then the one under it, then a chat or settings; only the list leaves the app
-            sheet?.isOpen == true -> sheet?.close()
-            BottomPanel.top() != null -> BottomPanel.top()?.close()
-            selected != null -> stopSelecting()
-            listScreen.visibility != View.VISIBLE -> show(listScreen)
-            else -> super.onBackPressed()
+        when (backStep()) {
+            BackStep.SHEET -> sheet?.close()
+            BackStep.PANEL -> BottomPanel.top()?.close()
+            BackStep.SELECTION -> stopSelecting()
+            BackStep.SCREEN -> show(listScreen)
+            null -> @Suppress("DEPRECATION") super.onBackPressed()
         }
     }
 
@@ -585,6 +624,8 @@ class MainActivity : Activity() {
         tabAxis.stop(); planAxis.stop(); tabPill.cancel(); planPill.cancel()
         statusTurn++; statusFade?.cancel(); statusFade = null
         barSlide.stop()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) predictiveBack?.release()  // nor a back swipe's look, nor its callback
+        predictiveBack = null
         super.onDestroy()
     }
 
@@ -4812,12 +4853,22 @@ class MainActivity : Activity() {
                 leaving = PictureMotion.close(pager.current(), dark, bar, box, pager) { dialog.dismiss() }
             }
         }
-        dialog.setOnDismissListener { opening?.cancel(); leaving?.cancel() }  // nothing runs on after it
+        // Android 14 and later: a back swipe shrinks the pictures over a lightening dark, then closes as back does
+        val pictureBack = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+            PredictiveBack(dialog.onBackInvokedDispatcher, wanted = { true },
+                begin = { if (shut) null else { opening?.cancel(); PictureBackPreview(pager, dark) } },
+                surfaceNow = { if (shut) null else pager }, invoke = { close() })
+            else null
+        dialog.setOnDismissListener {  // nothing runs on after it
+            opening?.cancel(); leaving?.cancel()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) pictureBack?.release()
+        }
         dialog.closing = close
         back.setOnClickListener { close() }
         pager.onClose = close
         dialog.setContentView(screen)
         dialog.show()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) pictureBack?.sync()
         pager.show(start)
         // In: from the tapped picture to the whole screen, the dark coming up behind it
         val corner = (from?.background as? GradientDrawable)?.cornerRadius ?: 0f  // the thumbnail's rounded corners

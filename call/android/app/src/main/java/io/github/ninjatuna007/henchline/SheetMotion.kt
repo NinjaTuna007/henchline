@@ -59,6 +59,8 @@ class SheetFrame(context: Context, private var dim: Float = SCRIM) : FrameLayout
     private var entering: (() -> Unit)? = null  // takes back the wait for the first frame, while it waits
     private var dimming: ValueAnimator? = null  // the scrim's darkness changing as sheets over or under it come and go
     private var touching = false  // a touch is down in it (a row may be held, a drag going)
+    private var backRun: ValueAnimator? = null  // easing back to whole after a back swipe let go short
+    private var backAt = 0f  // how far a back swipe has narrowed it (0: whole)
 
     /** Going away: touches are no longer the sheet's. */
     var leaving = false
@@ -98,11 +100,54 @@ class SheetFrame(context: Context, private var dim: Float = SCRIM) : FrameLayout
 
     private fun stopEntering() { entering?.invoke(); entering = null }
 
+    /** The sheet narrowed as a back swipe at progress has it ([backShrink]: 48 dp across, 24 dp down, about its
+     *  bottom edge). Whole at 0. */
+    private fun backTo(progress: Float) {
+        val s = sheet ?: return
+        backAt = backFraction(progress)
+        s.pivotX = s.width / 2f
+        s.pivotY = s.height.toFloat()
+        val density = resources.displayMetrics.density
+        s.scaleX = backShrink(backAt, s.width.toFloat(), BACK_SHEET_X_DP * density)
+        s.scaleY = backShrink(backAt, s.height.toFloat(), BACK_SHEET_Y_DP * density)
+    }
+
+    private fun stopBack() { val r = backRun; backRun = null; r?.cancel() }
+
+    /** Whole again at once, whatever a back swipe left. */
+    private fun backWhole() { stopBack(); if (backAt != 0f || sheet?.scaleX != 1f) backTo(0f) }
+
+    /** How the sheet follows a back swipe (Android 14 and later): it narrows; back going ahead closes it from
+     *  there ([leave] keeps the look as it slides away), let go short it eases back to whole. Nothing moves while it
+     *  leaves, or with animations off. */
+    fun backPreview(): BackPreview = object : BackPreview {
+        override val surface: Any get() = this@SheetFrame
+        override val keepsOnCommit = true
+        private val live = Motion.on()
+
+        override fun progress(progress: Float) {
+            if (!live || leaving) return
+            stopBack()
+            backTo(progress)
+        }
+
+        override fun cancel() {
+            if (!live || leaving) return backWhole()
+            stopBack()
+            val from = backAt
+            backRun = Motion.run(Motion.SHORT, Motion.standard, { t -> backTo(from * (1 - t)) },
+                { if (backRun != null) { backRun = null; backTo(0f) } })
+            if (backRun == null) backTo(0f)
+        }
+
+        override fun reset() = backWhole()
+    }
+
     /** Up from below its resting place on the spatial spring, the scrim darkening with it; at rest at once when
      *  instant (the same sheet drawn again) or animations are off. Starts at the first frame after layout, when
      *  the sheet's height is known (and the first frame's own work can't eat the start of the move). */
     fun enter(instant: Boolean = false) {
-        stopEntering(); stop()
+        stopEntering(); stop(); backWhole()
         if (instant || !Motion.on()) { place(0f); return }
         scrim.alpha = 0
         sheet?.translationY = 100_000f  // out of sight until it is measured
@@ -130,7 +175,7 @@ class SheetFrame(context: Context, private var dim: Float = SCRIM) : FrameLayout
     }
 
     /** A drag takes hold: whatever was moving stops where it is. Where the sheet is now. */
-    fun grab(): Float { stopEntering(); stop(); return sheet?.translationY ?: 0f }
+    fun grab(): Float { stopEntering(); stop(); backWhole(); return sheet?.translationY ?: 0f }
 
     /** Dragged to offset px below its rest. */
     fun drag(offset: Float) { if (!leaving) place(offset.coerceAtLeast(0f)) }
@@ -159,6 +204,7 @@ class SheetFrame(context: Context, private var dim: Float = SCRIM) : FrameLayout
             MotionEvent.obtain(now, now, MotionEvent.ACTION_CANCEL, 0f, 0f, 0).also { super.dispatchTouchEvent(it); it.recycle() }
         }
         stopEntering(); stop()
+        val r = backRun; backRun = null; r?.cancel()  // narrowed by a back swipe: it slides away as it is
         var called = false
         val finish = { if (!called) { called = true; done() } }
         val s = sheet
@@ -184,6 +230,7 @@ class SheetFrame(context: Context, private var dim: Float = SCRIM) : FrameLayout
         // The activity gone, or the sheet removed: no frame callback keeps it (and the activity) alive
         stopEntering(); stop()
         dimming?.cancel(); dimming = null
+        stopBack()
         super.onDetachedFromWindow()
     }
 }

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />  <!-- the outbox waits for a network -->
@@ -22,8 +23,12 @@
         android:label="Henchline"
         android:theme="@style/Henchline">
 
+        <!-- Back as a swipe that shows where it goes (PredictiveBack), per screen: the attribute is read from Android 14,
+             so Android 10-13 keep the screens' onBackPressed -->
         <activity
             android:name=".MainActivity"
+            android:enableOnBackInvokedCallback="true"
+            tools:targetApi="34"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:exported="true"
             android:launchMode="singleTask"
@@ -47,6 +52,8 @@
              screen flushes on open); it never sends anything new. Closes at once when the preview is off. -->
         <activity
             android:name=".HostChatActivity"
+            android:enableOnBackInvokedCallback="true"
+            tools:targetApi="34"
             android:exported="true"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
@@ -77,6 +84,8 @@
         <!-- In the phone's Share menu: any file or text, for the agent you're talking to -->
         <activity
             android:name=".ShareActivity"
+            android:enableOnBackInvokedCallback="true"
+            tools:targetApi="34"
             android:excludeFromRecents="true"
             android:exported="true"
             android:label="Henchline"

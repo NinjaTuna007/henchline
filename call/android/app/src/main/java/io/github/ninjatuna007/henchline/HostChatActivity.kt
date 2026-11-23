@@ -90,6 +90,7 @@ class HostChatActivity : Activity() {
         ticker.post(tick)
         CallService.Bus.hostListener = callWatcher
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) screen?.showCall()
+        RemoteChatMotion.prepareClose(this, screen != null)  // a back swipe shows the close as it goes
     }
 
     /** This chat is open on screen: what it holds is read, for the home list's unread (HostLists). */

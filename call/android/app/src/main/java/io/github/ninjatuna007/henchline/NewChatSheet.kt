@@ -145,6 +145,9 @@ open class BottomPanel(protected val activity: Activity) {
     protected var subtitleView: TextView? = null  // the line under the title, for sheets that update it
     val isOpen get() = root?.parent != null
 
+    /** What moves it, while open: for a back swipe to follow ([SheetFrame.backPreview]). */
+    val backFrame: SheetFrame? get() = root?.takeIf { isOpen }
+
     /** A fresh panel with its handle, title and a line under it; what goes in it is added to the returned layout.
      *  It springs up over a darkening scrim; drawn again while open (show() once more), it is just there. */
     protected fun open(title: String, subtitle: String): LinearLayout {

@@ -178,6 +178,9 @@ class Sheet(
      *  swallowed meanwhile, so nothing in it acts twice). */
     val isOpen get() = root?.let { it.parent != null && !it.leaving } == true
 
+    /** What moves it, while open: for a back swipe to follow ([SheetFrame.backPreview]). */
+    val backFrame: SheetFrame? get() = root?.takeIf { isOpen }
+
     /** Down and away, then removed (or, as its own screen, the screen finished): once, however often asked. */
     fun close() {
         val r = root ?: return

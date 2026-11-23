@@ -32,11 +32,18 @@ object RemoteChatMotion {
         else activity.startActivity(intent, ActivityOptions.makeClipRevealAnimation(row, r[0], r[1], r[2], r[3]).toBundle())
     }
 
-    /** Before the chat's finish(): asks for the close animation (34 and later). The list underneath doesn't move. */
-    fun beforeFinish(activity: Activity, shown: Boolean) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && closeAnimated(Motion.on(), shown))
-            activity.overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, R.anim.chat_close)
+    /** Asked for ahead (34 and later, from onResume), not only at finish(): a back swipe, which the system plays
+     *  before finish() is called, then closes it with this animation too. Taken back when it no longer applies
+     *  (animations turned off meanwhile), so the system's own close plays instead. */
+    fun prepareClose(activity: Activity, shown: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return
+        if (closeAnimated(Motion.on(), shown)) activity.overrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE, 0, R.anim.chat_close)
+        else activity.clearOverrideActivityTransition(Activity.OVERRIDE_TRANSITION_CLOSE)
     }
+
+    /** Before the chat's finish(): asks for the close animation (34 and later), or takes back one asked for earlier if
+     *  animations are off now. The list underneath doesn't move. */
+    fun beforeFinish(activity: Activity, shown: Boolean) = prepareClose(activity, shown)  // set, or cleared when off now
 
     /** After the chat's finish(): asks for the close animation (before 34, where it is asked for afterwards). */
     fun afterFinish(activity: Activity, shown: Boolean) {
