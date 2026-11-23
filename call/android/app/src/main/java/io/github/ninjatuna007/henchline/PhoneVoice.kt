@@ -10,7 +10,6 @@ import android.os.PowerManager
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.security.MessageDigest
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -83,7 +82,6 @@ object PhoneVoice {
 
     private fun root(context: Context) = File(context.filesDir, "phone-voice")
     fun dir(context: Context) = File(root(context), MODEL)
-    private fun marker(context: Context) = File(dir(context), ".verified")
 
     /** Folders of models this app no longer speaks with (Kokoro's, about 360 MB). */
     fun stale(context: Context): List<File> = stale(root(context))
@@ -97,17 +95,9 @@ object PhoneVoice {
         else -> "The laptop offers another voice model: update the app."
     }
 
-    /** Downloaded and every file checked: the manifest it was checked against is kept as the marker. */
-    fun ready(context: Context): Boolean {
-        val kept = try { JSONObject(marker(context).readText()) } catch (_: Exception) { return false }
-        val files = kept.optJSONArray("files") ?: return false
-        val names = (0 until files.length()).map { files.getJSONObject(it).optString("name") }.toSet()
-        if (!names.containsAll(REQUIRED)) return false  // an older download, from before the espeak data
-        return (0 until files.length()).all { i ->
-            val f = files.getJSONObject(i)
-            File(dir(context), f.getString("name")).length() == f.getLong("size")
-        }
-    }
+    /** Downloaded and every file checked: the manifest it was checked against is kept as the marker (an older
+     *  download, from before the espeak data, lacks some of REQUIRED). */
+    fun ready(context: Context): Boolean = ModelDownload.ready(dir(context), REQUIRED)
 
     fun sizeOnPhone(context: Context): Long = dir(context).walkTopDown().filter { it.isFile }.sumOf { it.length() }
 
@@ -126,77 +116,12 @@ object PhoneVoice {
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
     }
 
-    class Download(private val context: Context, private val progress: (done: Long, total: Long, name: String) -> Unit) {
-        private val cancelled = AtomicBoolean(false)
-        fun cancel() = cancelled.set(true)
-
-        /** null when done; otherwise why not. Files already here and whole are kept (a cut download carries on). */
-        fun run(): String? {
-            val origin = Files.origin(context) ?: return "Set the laptop's address in Settings first."
-            val manifest = try {
-                Files.client.newCall(okhttp3.Request.Builder().url("$origin/phone-voice/manifest")
-                    .header("Origin", origin).build()).execute().use {
-                    if (!it.isSuccessful) return "The laptop hasn't prepared the voice yet (python -m voice.phonevoice prepare)."
-                    JSONObject(it.body!!.string())
-                }
-            } catch (e: Exception) { return "Couldn't reach the laptop (is Tailscale on?)" }
-            offered(manifest)?.let { return it }
-            val files = manifest.getJSONArray("files")
-            val total = (0 until files.length()).sumOf { files.getJSONObject(it).getLong("size") }
-            val folder = dir(context).apply { mkdirs() }
-            marker(context).delete()
-            var done = 0L
-            for (i in 0 until files.length()) {
-                val f = files.getJSONObject(i)
-                val name = f.getString("name")
-                if (!safeName(name)) return "The laptop named an odd file: stopped."
-                val target = File(folder, name)
-                target.parentFile?.mkdirs()
-                val size = f.getLong("size")
-                if (target.length() == size && sha256(target) == f.getString("sha256")) { done += size; continue }
-                val part = File(folder, "$name.part")
-                val have = part.length().coerceAtMost(size)
-                try {
-                    val request = okhttp3.Request.Builder().url("$origin/phone-voice/file/$name").header("Origin", origin)
-                    if (have > 0) request.header("Range", "bytes=$have-")
-                    Files.client.newCall(request.build()).execute().use { answer ->
-                        if (!answer.isSuccessful) return "The laptop couldn't send $name."
-                        val append = have > 0 && answer.code == 206
-                        java.io.FileOutputStream(part, append).use { out ->
-                            var got = if (append) have else 0L
-                            val input = answer.body!!.byteStream()
-                            val buffer = ByteArray(1 shl 16)
-                            while (true) {
-                                if (cancelled.get()) return "Cancelled."
-                                val n = input.read(buffer)
-                                if (n < 0) break
-                                out.write(buffer, 0, n)
-                                got += n
-                                progress(done + got, total, name)
-                            }
-                        }
-                    }
-                } catch (e: Exception) { return "The download broke off: try again to carry on." }
-                if (sha256(part) != f.getString("sha256")) { part.delete(); return "$name didn't match the laptop's copy: try again." }
-                part.renameTo(target)
-                done += size
-            }
-            marker(context).writeText(manifest.toString())
-            // The earlier voice's files go once this one is whole: not before, so a cut download leaves the phone
-            // no worse off than it was (though that voice no longer speaks, the laptop's audio takes its place)
-            stale(context).forEach { it.deleteRecursively() }
-            return null
-        }
-    }
-
-    private fun sha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(1 shl 16)
-            while (true) { val n = input.read(buffer); if (n < 0) break; digest.update(buffer, 0, n) }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
+    /** Jenny's download from the laptop (ModelDownload): her files, checked against the laptop's hashes; the
+     *  earlier voice's folder goes once she's whole, not before, so a cut download leaves the phone no worse off. */
+    fun spec(context: Context) = ModelDownload.Spec(
+        route = "/phone-voice", dir = dir(context), required = REQUIRED, safeName = ::safeName, offered = ::offered,
+        notPrepared = "The laptop hasn't prepared the voice yet (python -m voice.phonevoice prepare).",
+        whole = { stale(context).forEach { it.deleteRecursively() } })
 
     // --- the engine -----------------------------------------------------------------------------------------
 

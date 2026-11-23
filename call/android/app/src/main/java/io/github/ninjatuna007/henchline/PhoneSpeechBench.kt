@@ -105,7 +105,11 @@ object SpeechBench {
                     }
                 }
             } else {
-                val dir = File(base, "asr/${o.model}")
+                // Nemotron's files may have been taken over by the app's own speech model (PhoneAsr moves them
+                // where it can't link them): the bench then reads them there, whole download or not
+                val dir = File(base, "asr/${o.model}").takeIf { d -> d.listFiles()?.any { it.name.startsWith("encoder") } == true }
+                    ?: PhoneAsr.dir(context).takeIf { o.model == "nemotron" && File(it, "encoder.int8.onnx").isFile }
+                    ?: File(base, "asr/${o.model}")
                 val before = PhoneVoice.tasks()
                 val recognizer = transducer(dir, o, names, base) ?: return
                 val workers = PhoneVoice.spawned(before)

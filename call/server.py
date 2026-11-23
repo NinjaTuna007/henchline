@@ -53,7 +53,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent), str(HERE.parent / "handsfree/core")]  # voice/, and hands-free's routing
 import routing  # noqa: E402
 from routing import Heard  # noqa: E402
-from voice import phonevoice
+from voice import phoneasr, phonevoice
 from call.auth import SIGNED  # noqa: E402  (a name only: the signed API itself loads with --api-v1)
 from voice import chains, commands, cursor_cli, files, minions, pickup, plans, reminders, snaps, spool, screenshot, subagents, usage, voices, workflows  # noqa: E402
 from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
@@ -1678,6 +1678,26 @@ async def phone_voice_file(request: web.Request) -> web.StreamResponse:
     """One of those files, by its exact listed name only (espeak data: fixed relative paths); ranges resume."""
     trusted(request)
     path = phonevoice.model_file(request.match_info["name"])
+    if path is None:
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Cache-Control": "no-store"})
+
+
+async def phone_asr_manifest(request: web.Request) -> web.Response:
+    """The speech-to-text files the phone downloads to hear a call itself when the line is bad (voice/phoneasr.py):
+    names, sizes, SHA-256, and the hint words as they stand now."""
+    trusted(request)
+    found = await asyncio.get_running_loop().run_in_executor(None, phoneasr.manifest)
+    if found is None:
+        why = "not prepared, or a file isn't the pinned one: python -m voice.phoneasr prepare"
+        return web.json_response({"error": why}, status=404)
+    return web.json_response(found)
+
+
+async def phone_asr_file(request: web.Request) -> web.StreamResponse:
+    """One of those files, by its exact listed name only; ranges resume."""
+    trusted(request)
+    path = phoneasr.model_file(request.match_info["name"])
     if path is None:
         raise web.HTTPNotFound()
     return web.FileResponse(path, headers={"Cache-Control": "no-store"})
@@ -3687,6 +3707,8 @@ def main() -> int:
     app.router.add_get("/chat/minions", chat_minions)
     app.router.add_get("/phone-voice/manifest", phone_voice_manifest)
     app.router.add_get("/phone-voice/file/{name:.+}", phone_voice_file)
+    app.router.add_get("/phone-asr/manifest", phone_asr_manifest)
+    app.router.add_get("/phone-asr/file/{name}", phone_asr_file)
     app.router.add_post("/chat/minions/view", chat_minion_view)
     app.router.add_post("/chat/minions/decide", chat_minion_decide)
     app.router.add_post("/away", away)

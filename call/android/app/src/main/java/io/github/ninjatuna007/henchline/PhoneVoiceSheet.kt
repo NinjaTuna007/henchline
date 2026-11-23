@@ -8,48 +8,32 @@ import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.Switch
 import android.widget.TextView
-import java.util.concurrent.CopyOnWriteArraySet
 
 /** The phone voice's download, one at a time for the whole app: the Voices sheet and this sheet both show it, and it
  *  goes on if the sheet that started it is closed. */
 object JennyDownload {
-    @Volatile var job: PhoneVoice.Download? = null
-        private set
-    @Volatile var percent = 0
-        private set
-    @Volatile var note: String? = null  // why the last one stopped, until the next starts
-        private set
-    private val listeners = CopyOnWriteArraySet<() -> Unit>()
+    private val runner = ModelJob("henchline-jenny-download")
+    val job: ModelDownload? get() = runner.job
+    val percent: Int get() = runner.percent
+    val note: String? get() = runner.note  // why the last one stopped, until the next starts
 
-    fun listen(listener: () -> Unit) { listeners.add(listener) }
-    fun forget(listener: () -> Unit) { listeners.remove(listener) }
-    private fun tell() = listeners.forEach { try { it() } catch (_: Throwable) {} }
+    fun listen(listener: () -> Unit) = runner.listen(listener)
+    fun forget(listener: () -> Unit) = runner.forget(listener)
 
-    /** Fetch Jenny from the laptop. thenUse: once she's here, the agents' voices come from the phone (and a call
-     *  that's up switches to her). */
-    fun start(context: Context, thenUse: Boolean) {
-        if (job != null) return
+    /** Fetch Jenny from the laptop. mobileOk: "over mobile data too" is ticked; without it the download waits for
+     *  Wi-Fi, also when Wi-Fi drops midway. thenUse: once she's here, the agents' voices come from the phone (and a
+     *  call that's up switches to her). */
+    fun start(context: Context, thenUse: Boolean, mobileOk: Boolean) {
         val app = context.applicationContext
-        note = null; percent = 0
-        val download = PhoneVoice.Download(app) { done, total, _ ->
-            val now = if (total > 0) (done * 100 / total).toInt() else 0
-            if (now != percent) { percent = now; tell() }
-        }
-        job = download
-        tell()
-        Thread {
-            val why = try { download.run() } catch (e: Throwable) { "The download broke off: try again to carry on." }
-            job = null
-            note = why?.takeIf { it != "Cancelled." }
-            if (why == null && thenUse) {
+        runner.start(app, PhoneVoice.spec(app), mobileOk) {
+            if (thenUse) {
                 val service = CallService.Bus.service
                 if (service != null && !service.otherHost) service.useVoice(true) else PhoneVoice.setEnabled(app, true)
             }
-            tell()
-        }.apply { name = "henchline-jenny-download"; start() }
+        }
     }
 
-    fun cancel() { job?.cancel() }
+    fun cancel() = runner.cancel()
 }
 
 /** A sheet that shows the phone voice: the download card and the preview, the same in the Voices sheet and in
@@ -105,7 +89,7 @@ open class VoicePanel(activity: Activity) : BottomPanel(activity) {
                 if (JennyDownload.job != null) JennyDownload.cancel()
                 else if (!mobile.isChecked && !PhoneVoice.unmetered(activity))
                     status.text = "On Wi-Fi only: connect to Wi-Fi, or tick \"over mobile data too\"."
-                else JennyDownload.start(activity, thenUse)
+                else JennyDownload.start(activity, thenUse, mobileOk = mobile.isChecked)
             }
         }, wide(10, px(52)))
     }

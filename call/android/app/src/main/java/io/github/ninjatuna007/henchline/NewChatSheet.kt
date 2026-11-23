@@ -1613,6 +1613,16 @@ class VoicesSheet(
     private val onVoice: () -> Unit = {
         activity.runOnUiThread { body?.let { if (isOpen) draw(it) } }
     }
+    private var earsStatus: TextView? = null  // the speech model's progress line, updated without a redraw
+    private var earsDrawnRunning = false
+    private val onEars: () -> Unit = {
+        activity.runOnUiThread {
+            if (!isOpen) return@runOnUiThread
+            val status = earsStatus
+            if (PhoneAsr.download.job != null && earsDrawnRunning && status != null) status.text = earsDownloading()
+            else body?.let { draw(it) }
+        }
+    }
 
     fun show() {
         val sheet = open("Voices", "How the agents sound")
@@ -1620,6 +1630,7 @@ class VoicesSheet(
         this.body = body
         CallService.Bus.voiceListener = onVoice
         followDownload { draw(body) }
+        PhoneAsr.download.listen(onEars)
         draw(body)
         sheet.addView(ScrollView(activity).apply { isVerticalScrollBarEnabled = false; addView(body) }, flexible(8))
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -1628,7 +1639,109 @@ class VoicesSheet(
 
     override fun onClosed() {
         super.onClosed()
+        PhoneAsr.download.forget(onEars)
         if (CallService.Bus.voiceListener === onVoice) CallService.Bus.voiceListener = null
+    }
+
+    private fun earsDownloading() = "Downloading… ${PhoneAsr.download.percent}%"
+
+    /** "LISTENING ON THE PHONE": who hears the user on a call (PhoneEar), and the speech model it needs: its size,
+     *  Download (Cancel while it runs; on mobile data the user is asked first, with the size), or Delete. */
+    private fun drawEars(body: LinearLayout) {
+        val ready = PhoneAsr.ready(activity)
+        val chosen = PhoneEar.mode(activity)
+        val shown = PhoneEar.effective(chosen, ready)
+        body.addView(label("LISTENING ON THE PHONE"), wide(24))
+        val track = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = rounded(colour(R.color.navy), 20f); setPadding(px(3), px(3), px(3), px(3))
+        }
+        for (mode in PhoneEar.Mode.entries) {
+            val on = mode == shown
+            track.addView(TextView(activity).apply {
+                text = mode.label; gravity = Gravity.CENTER; textSize = 12.5f
+                setTextColor(colour(if (on) R.color.text else R.color.muted))
+                if (on) {
+                    background = rounded(colour(R.color.surface_high), 17f)
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                }
+                if (mode == PhoneEar.Mode.PHONE && !ready) contentDescription = "Always phone (download the speech model first)"
+                setOnClickListener {
+                    if (mode == PhoneEar.Mode.PHONE && !ready) {  // not before the model is here: its download, asked first
+                        if (PhoneAsr.download.job == null) confirmEars(body)
+                        return@setOnClickListener
+                    }
+                    if (mode == chosen) return@setOnClickListener
+                    performHapticFeedback(android.view.HapticFeedbackConstants.CONFIRM)
+                    PhoneEar.setMode(activity, mode)
+                    draw(body)
+                }
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+        }
+        body.addView(track, wide(4, px(40)))
+        body.addView(TextView(activity).apply {
+            text = PhoneEar.line(chosen, ready); textSize = 13f; setTextColor(colour(R.color.muted))
+        }, wide(8))
+        val running = PhoneAsr.download.job != null
+        earsDrawnRunning = running
+        val status = TextView(activity).apply {
+            textSize = 14f; setTextColor(colour(R.color.text))
+            text = when {
+                running -> earsDownloading()
+                ready -> "${PhoneAsr.NAME} · ready · ${PhoneAsr.sizeOnPhone(activity) / 1_000_000} MB on this phone"
+                else -> PhoneAsr.download.note ?: "${PhoneAsr.NAME} · about ${PhoneAsr.ABOUT_MB} MB, from your laptop (Wi-Fi)"
+            }
+        }
+        earsStatus = status
+        body.addView(status, wide(10))
+        if (running) body.addView(quiet("Cancel") { PhoneAsr.download.cancel() },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                gravity = Gravity.START; topMargin = px(4) })
+        else if (!ready) body.addView(primary("Download the speech model").apply {
+            setOnClickListener { startEars(body, mobileOk = false) }
+        }, wide(8, px(52)))
+        else body.addView(quiet("Delete it from this phone") {
+            if (PhoneEar.mode(activity) == PhoneEar.Mode.PHONE) PhoneEar.setMode(activity, PhoneEar.Mode.AUTOMATIC)
+            Thread {
+                val all = PhoneAsr.delete(activity)
+                activity.runOnUiThread {
+                    if (!all) android.widget.Toast.makeText(activity, "Kept part of it: a file couldn't go back to the " +
+                        "speech bench's folder.", android.widget.Toast.LENGTH_LONG).show()
+                    if (isOpen) draw(body)
+                }
+            }.start()
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.START; topMargin = px(4) })
+    }
+
+    /** The speech model's download. Off Wi-Fi without mobileOk it stops before taking or fetching anything and the
+     *  user is asked, with the size still to come (files already on the phone don't count); "Download anyway"
+     *  starts it again with mobileOk. thenPhone: once it's whole, the setting becomes Always phone. */
+    private fun startEars(body: LinearLayout, mobileOk: Boolean, thenPhone: Boolean = false) {
+        PhoneAsr.download.start(activity, PhoneAsr.spec(activity), mobileOk, askMobile = { bytes ->
+            activity.runOnUiThread {
+                if (!isOpen || activity.isFinishing) return@runOnUiThread
+                android.app.AlertDialog.Builder(activity)
+                    .setTitle("Use mobile data?")
+                    .setMessage("The speech model is ${ModelDownload.mb(bytes)} MB. You're not on Wi-Fi: download it " +
+                        "over mobile data, or wait for Wi-Fi.")
+                    .setPositiveButton("Download anyway") { _, _ -> startEars(body, mobileOk = true, thenPhone) }
+                    .setNegativeButton("Wait for Wi-Fi", null)
+                    .show()
+            }
+        }) { if (thenPhone) PhoneEar.setMode(activity, PhoneEar.Mode.PHONE) }
+    }
+
+    /** "Always phone" before the model is here: one question, with the size (and mobile data, when off Wi-Fi). */
+    private fun confirmEars(body: LinearLayout) {
+        val metered = !PhoneVoice.unmetered(activity)
+        android.app.AlertDialog.Builder(activity)
+            .setTitle("Download the speech model?")
+            .setMessage("Always phone needs it: up to ${PhoneAsr.ABOUT_MB} MB from your laptop (less if part of it is " +
+                "already on this phone)." + if (metered) " You're not on Wi-Fi: it would use mobile data." else "")
+            .setPositiveButton("Download") { _, _ -> startEars(body, mobileOk = metered, thenPhone = true) }  // consent only when the dialog said mobile data
+            .setNegativeButton("Not now", null)
+            .show()
     }
 
     private var picking: String? = null  // the agent whose voice list is open
@@ -1724,7 +1837,7 @@ class VoicesSheet(
         val mode = setup.optString("mode", "own")
         PhoneVoice.setLaptopMode(activity, mode)
         changed()
-        if (drawSource(body).phone) { drawJenny(body); return }
+        if (drawSource(body).phone) { drawJenny(body); drawEars(body); return }
         // On the sheet's surface the track needs the darker navy to show (the Chat|Plan switch sits on navy)
         val track = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1787,6 +1900,7 @@ class VoicesSheet(
             })
             if (open) addVoiceList(body, choices!!, voiceId, mode, id)
         }
+        drawEars(body)
     }
 
     /** The voices to choose from, as in the model picker: one row each, the chosen one marked. */

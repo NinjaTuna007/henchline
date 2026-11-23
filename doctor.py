@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))  # voice/state.py: standard library only
 from voice.desktop import kde_session  # noqa: E402
 from voice.phonevoice import FILES as PHONE_VOICE_FILES, MODEL_DIR as PHONE_VOICE  # noqa: E402
+from voice.phoneasr import FILES as PHONE_ASR_FILES, MODEL_DIR as PHONE_ASR  # noqa: E402
 from voice.state import CALL_TLS  # noqa: E402
 from voice.state import EC_CONF as CANCELLER_CONF, EC_SOURCE, KOKORO_MODELS as KOKORO, VENV, WAKE_MODEL  # noqa: E402
 NEMOTRON = WAKE_MODEL.parent / "nemotron"  # voice/speech/nemotron.py
@@ -214,6 +215,7 @@ def call() -> list[Check]:
     ok, err = venv_imports("aiohttp", "cryptography")
     enabled, active = unit_state("call.service")
     phone_voice = all((PHONE_VOICE / name).is_file() for name in PHONE_VOICE_FILES)
+    phone_asr = all((PHONE_ASR / name).is_file() for name in PHONE_ASR_FILES)
     rc, ip = run("tailscale", "ip", "-4")
     _, served = run("tailscale", "serve", "status")
     return [
@@ -227,6 +229,9 @@ def call() -> list[Check]:
         check("call", "the phone's own voice (Piper Jenny, for the phone to download)", phone_voice,
               "" if phone_voice else "missing: the phone can only play the laptop's voice",
               f"{PYTHON} -m voice.phonevoice prepare (in {ROOT})", warn_only=True),
+        check("call", "the phone's own listening (speech-to-text, for the phone to download)", phone_asr,
+              "" if phone_asr else "missing: a bad line can't fall back to the phone's ears",
+              f"{PYTHON} -m voice.phoneasr prepare (in {ROOT})", warn_only=True),
         check("call", "call page running", active == "active", f"{active}, {enabled} at login",
               "./install.sh call", warn_only=True),
     ]
