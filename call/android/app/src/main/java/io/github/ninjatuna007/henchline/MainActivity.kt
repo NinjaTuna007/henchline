@@ -208,6 +208,10 @@ class MainActivity : Activity() {
         findViewById<View>(R.id.tabChats).setOnClickListener { showTab("chats") }
         findViewById<View>(R.id.tabCalls).setOnClickListener { showTab("calls") }
         findViewById<View>(R.id.tabUsage).setOnClickListener { showTab("usage") }
+        // The pill behind the tab showing, on the bar's own surface; read out as tabs, the one showing selected
+        findViewById<View>(R.id.tabBar).background = tabTrack
+        tabPill.to(tabs.indexOf(tab).toFloat(), animate = false)
+        showTabState()
         callButton.setOnClickListener {
             when {
                 onCall() -> hangUp()
@@ -577,6 +581,10 @@ class MainActivity : Activity() {
         main.removeCallbacks(recordClock)
         lockHint?.dismiss(); lockHint = null
         stopFold()  // a card's fold holds the views (and this screen) until it ends
+        // Nor a tab's or Chat/Plan's move, a pill's spring, the status bar's colour or the call bar's slide
+        tabAxis.stop(); planAxis.stop(); tabPill.cancel(); planPill.cancel()
+        statusTurn++; statusFade?.cancel(); statusFade = null
+        barSlide.stop()
         super.onDestroy()
     }
 
@@ -1347,14 +1355,17 @@ class MainActivity : Activity() {
     /** While a call is up, on every screen, the same bar (the user's wish, 2026-11-16: it changed between the list
      *  and the chat): the agent's face with a live ring, its name, the call's time and what is happening, speaker
      *  and hang-up. The status bar turns the bar's green with it. */
-    private fun showCallBar() {
+    private fun showCallBar(animate: Boolean = true) {
         val up = CallService.Bus.connected
         val bar = findViewById<View>(R.id.callBar)
-        if (up != (bar.visibility == View.VISIBLE)) {
-            bar.visibility = if (up) View.VISIBLE else View.GONE
-            window.statusBarColor = getColor(if (up) R.color.call_bar else R.color.navy)
-            // Newer Android draws the app under the status bar and ignores its colour: our own strip shows there
-            findViewById<View>(R.id.statusSpace).setBackgroundColor(getColor(if (up) R.color.call_bar else R.color.navy))
+        if (up != barSlide.showing(bar)) {
+            // Over 400 ms, on screen: the bar's height opens (or closes) as it fades, the screen below making room
+            // with its bottom (tabs, the chat's box) staying put, and the status bar's colour changes with it.
+            // Not before the screen is first drawn
+            val moving = animate && lifecycleSeen && Motion.on()
+            barSlide.change(bar, up, moving)
+            paintStatus(getColor(if (up) R.color.call_bar else R.color.navy), moving && findViewById<View>(R.id.root).isLaidOut)
+            if (lifecycleSeen) @Suppress("DEPRECATION") bar.announceForAccessibility(if (up) "Call connected" else "Call ended")
         }
         pulseLive(up && !isFinishing && lifecycleSeen)
         val timer = findViewById<android.widget.Chronometer>(R.id.callTimer)
@@ -1370,6 +1381,26 @@ class MainActivity : Activity() {
         findViewById<TextView>(R.id.callStatus).text = if (callWords.isNotEmpty()) " · $callWords" else ""
         bar.contentDescription = "On a call with $name. Tap to return; hold to switch who it's with."
         showSpeaker(CallService.Bus.service?.speaker ?: prefs().getBoolean("speaker", true))
+    }
+
+    private val barSlide = BarSlide()  // the call bar coming or going
+
+    private var statusColour = 0  // the status bar's colour as shown (0: not yet painted: the navy)
+    private var statusFade: android.animation.ValueAnimator? = null
+    private var statusTurn = 0  // a newer change: the older one's frames do nothing
+
+    /** The status bar (and our own strip under it: newer Android draws the app there and ignores the bar's colour)
+     *  turned to colour, over the call bar's 400 ms from where it is when animate, else at once. */
+    private fun paintStatus(colour: Int, animate: Boolean) {
+        val mine = ++statusTurn
+        statusFade?.cancel(); statusFade = null
+        val from = if (statusColour == 0) getColor(R.color.navy) else statusColour
+        val strip = findViewById<View>(R.id.statusSpace)
+        fun set(c: Int) { statusColour = c; window.statusBarColor = c; strip.setBackgroundColor(c) }
+        if (!animate || from == colour) { set(colour); return }
+        statusFade = Motion.run(TabMotion.CALL_BAR_MS, Motion.standard, { t ->
+            if (mine == statusTurn) set(TabMotion.statusAt(from, colour, t))
+        }) { if (mine == statusTurn) { set(colour); statusFade = null } }
     }
 
     /** Cursor cuts in unless the call menu says otherwise; Claude and Codex let a turn wait. */
@@ -2488,7 +2519,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(20), dp(12), dp(20), dp(12))
-                if (session.isNotEmpty()) setOnClickListener { showTab("chats"); open(session) }
+                if (session.isNotEmpty()) setOnClickListener { showTab("chats", animate = false); open(session) }  // the chat shows next: no move
             }
             row.addView(ImageView(this).apply {
                 setImageResource(if (ring) avatarOf(agent) else if (session.isNotEmpty()) avatarOf(session) else R.drawable.avatar_handsfree)
@@ -2520,24 +2551,42 @@ class MainActivity : Activity() {
         Motion.rippleAll(crew)
     }
 
-    /** The bottom bar: Chats, Calls or Usage, the one showing lit. */
-    private fun showTab(which: String) {
-        // Slid in from the side it lies on (Usage left, Calls right), as a pager does (the user's catch, 2026-11-17)
-        val from = tabs.indexOf(tab)
-        val to = tabs.indexOf(which)
-        if (from != to && from >= 0 && to >= 0) refresh.apply {
-            translationX = (if (to > from) 1 else -1) * width / 3f
-            alpha = 0.4f
-            animate().translationX(0f).alpha(1f).setDuration(220)
-                .setInterpolator(android.view.animation.DecelerateInterpolator(1.5f)).start()
+    /** The pill behind the tab showing (on the bottom bar's surface) and its spring. */
+    private val tabTrack by lazy {
+        PillTrack(tabs.size, getColor(R.color.surface), 0x1F00E5FF, padding = 0f, insetX = dp(14).toFloat(),
+            insetY = dp(10).toFloat(), trackRadius = 0f, pillRadius = dp(20).toFloat())
+    }
+    private val tabPill by lazy { PillSpring(tabTrack) }
+    private val tabAxis = AxisSwitch()  // the list's content moving between tabs
+
+    /** The bottom bar: Chats, Calls or Usage, the one showing lit, a pill behind it. */
+    private fun showTab(which: String, animate: Boolean = true) {
+        // Along a shared axis, from the side it lies on (Usage left, Calls right), as a pager does (the user's
+        // catch, 2026-11-17): the old list slides 30 dp away and fades, the new one comes in after it; the pill
+        // springs across. The search (chats only), the list and the new-chat button move together, so the search
+        // coming or going is part of the move. animate false: something else shows next (a chat), no move
+        val dir = TabMotion.direction(tabs.indexOf(tab), tabs.indexOf(which))
+        val shown = animate && listScreen.visibility == View.VISIBLE
+        tabPill.to(tabs.indexOf(which).toFloat().coerceAtLeast(0f), animate = shown && dir != 0)
+        tabAxis.switch(findViewById(R.id.listBody), if (shown) dir else 0) {
+            tab = which
+            showTabState()
+            // The search pill (with the sort in it) and the new-chat button belong to the chats
+            for (view in listOf(findViewById<View>(R.id.search).parent as View, findViewById(R.id.compose)))
+                view.visibility = if (which == "chats") View.VISIBLE else View.GONE
+            showCrew()
         }
-        tab = which
+    }
+
+    /** Each tab lit (cyan) or not, and selected or not for a screen reader. */
+    private fun showTabState() {
+        val labels = mapOf("usage" to "Usage", "chats" to "Chats", "calls" to "Calls")
         for ((id, name) in listOf(R.id.tabChats to "chats", R.id.tabCalls to "calls", R.id.tabUsage to "usage"))
-            findViewById<TextView>(id).setTextColor(getColor(if (name == which) R.color.cyan else R.color.muted))
-        // The search pill (with the sort in it) and the new-chat button belong to the chats
-        for (view in listOf(findViewById<View>(R.id.search).parent as View, findViewById(R.id.compose)))
-            view.visibility = if (which == "chats") View.VISIBLE else View.GONE
-        showCrew()
+            findViewById<TextView>(id).apply {
+                setTextColor(getColor(if (name == tab) R.color.cyan else R.color.muted))
+                isSelected = name == tab
+                contentDescription = TabMotion.describeTab(labels.getValue(name), tabs.indexOf(name), tabs.size)
+            }
     }
 
     /** Every AI on the laptop at once (the user's wish, 2026-11-17): a card each, its plan's limits as bars, with
@@ -2941,6 +2990,7 @@ class MainActivity : Activity() {
         if (screen !== chatScreen) stopSelecting()  // and a selection to the chat it was made in
         (shownUndo?.parent as? android.view.ViewGroup)?.removeView(shownUndo)
         for (s in listOf(listScreen, chatScreen, settingsScreen)) s.visibility = if (s === screen) View.VISIBLE else View.GONE
+        tabAxis.stop(); planAxis.stop()  // a switch under way belongs to the screen it began on
         if (screen === listScreen) { showCrew(); refreshCrewQuietly(); refreshAway() }
         showCallBar()
         // A chat opens at its newest message, as a messaging app's does (it opened at the oldest, 2026-11-16)
@@ -3049,6 +3099,7 @@ class MainActivity : Activity() {
     private fun loadPlan(session: String) {
         if (session != current) return
         planKey = ""
+        planAxis.stop()
         findViewById<View>(R.id.planBar).visibility = View.GONE
         showChatTab()
         refreshPlan()
@@ -3086,8 +3137,8 @@ class MainActivity : Activity() {
             bar.visibility = View.VISIBLE
             lastPlan = answer
             if (findViewById<View>(R.id.planRefresh).visibility != View.VISIBLE) showPlanSwitch(answer, onPlan = false)
-            findViewById<View>(R.id.chatTab).setOnClickListener { showChatTab() }
-            findViewById<View>(R.id.planTab).setOnClickListener { showPlanTab(answer) }
+            findViewById<View>(R.id.chatTab).setOnClickListener { switchPlan(onPlan = false) { showChatTab(animate = true) } }
+            findViewById<View>(R.id.planTab).setOnClickListener { switchPlan(onPlan = true) { showPlanTab(answer, animate = true) } }
             val key = answer.optString("name") + " " + answer.optInt("done") + "/" + answer.optInt("total") + " " + todos
             val showing = findViewById<View>(R.id.planRefresh).visibility == View.VISIBLE
             if (showing && (key != planKey || findViewById<SwipeRefreshLayout>(R.id.planRefresh).isRefreshing)) showPlanTab(answer)
@@ -3399,10 +3450,20 @@ class MainActivity : Activity() {
         findViewById<View>(R.id.idle).visibility = if (onCall() || lines || onPlan) View.GONE else View.VISIBLE
     }
 
-    private fun showChatTab() {
+    private fun showChatTab(animate: Boolean = false) {
         findViewById<View>(R.id.planRefresh).visibility = View.GONE
         showChatBody()
-        showPlanSwitch(lastPlan, onPlan = false)
+        showPlanSwitch(lastPlan, onPlan = false, animate = animate)
+    }
+
+    private val planAxis = AxisSwitch()  // the chat's page moving between Chat and Plan
+
+    /** Chat or Plan picked: the page moves along the shared axis (Plan lies right of Chat), as the list's tabs do.
+     *  The one already showing just shows again (Plan's steps refreshed). */
+    private fun switchPlan(onPlan: Boolean, change: () -> Unit) {
+        val now = findViewById<View>(R.id.planRefresh).visibility == View.VISIBLE
+        val holder = findViewById<View>(R.id.planRefresh).parent as View
+        planAxis.switch(holder, TabMotion.direction(if (now) 1 else 0, if (onPlan) 1 else 0), change)
     }
 
     private var planView: PlanView? = null
@@ -3412,10 +3473,10 @@ class MainActivity : Activity() {
     private var buildSentAt = 0L  // and when: after 2 min with no step under way, Build can be sent again
     private var planning = false  // the chip's mode: Build this is only for approving a plan
 
-    private fun showPlanTab(plan: JSONObject) {
+    private fun showPlanTab(plan: JSONObject, animate: Boolean = false) {
         findViewById<View>(R.id.planRefresh).visibility = View.VISIBLE
         showChatBody()
-        showPlanSwitch(plan, onPlan = true)
+        showPlanSwitch(plan, onPlan = true, animate = animate)
         val list = findViewById<LinearLayout>(R.id.planList)
         list.setPadding(0, 0, 0, dp(88))  // room above the sticky button
         (planView ?: PlanView(this).also { planView = it }).fill(list, plan)
@@ -3475,13 +3536,21 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Chat | Plan as a two-part switch (the design review): a surface track, the chosen half on a lighter thumb,
-     *  the plan's progress as a badge on its half. */
-    private fun showPlanSwitch(plan: JSONObject?, onPlan: Boolean) {
+    /** The Chat | Plan switch's track and lighter thumb, and the thumb's spring. */
+    private val planTrack by lazy {
+        PillTrack(2, getColor(R.color.surface), getColor(R.color.surface_high), padding = dp(3).toFloat(), insetX = 0f,
+            insetY = 0f, trackRadius = dp(20).toFloat(), pillRadius = dp(17).toFloat())
+    }
+    private val planPill by lazy { PillSpring(planTrack) }
+
+    /** Chat | Plan as a two-part switch (the design review): a surface track, the chosen half on a lighter thumb
+     *  (springing across when picked: animate), the plan's progress as a badge on its half. */
+    private fun showPlanSwitch(plan: JSONObject?, onPlan: Boolean, animate: Boolean = false) {
         val chat = findViewById<TextView>(R.id.chatTab)
         val tab = findViewById<TextView>(R.id.planTab)
         val bar = findViewById<LinearLayout>(R.id.planBar)
-        bar.background = android.graphics.drawable.GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(getColor(R.color.surface)) }
+        if (bar.background !== planTrack) bar.background = planTrack
+        planPill.to(if (onPlan) 1f else 0f, animate = animate && bar.isShown)
         bar.setPadding(dp(3), dp(3), dp(3), dp(3))
         (bar.layoutParams as? android.view.ViewGroup.MarginLayoutParams)?.let { it.marginStart = dp(16); it.marginEnd = dp(16); it.topMargin = dp(4); it.bottomMargin = dp(8) }
         for ((view, on) in listOf(chat to !onPlan, tab to onPlan)) {
@@ -3489,15 +3558,18 @@ class MainActivity : Activity() {
             view.gravity = Gravity.CENTER
             view.setTextColor(getColor(if (on) R.color.text else R.color.muted))
             view.typeface = if (on) android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL) else android.graphics.Typeface.DEFAULT
-            view.background = android.graphics.drawable.GradientDrawable().apply {  // clear when off: its ripple keeps the shape
-                cornerRadius = dp(17).toFloat(); setColor(if (on) getColor(R.color.surface_high) else android.graphics.Color.TRANSPARENT) }
+            view.background = android.graphics.drawable.GradientDrawable().apply {  // clear: the thumb is the track's; its ripple keeps the shape
+                cornerRadius = dp(17).toFloat(); setColor(android.graphics.Color.TRANSPARENT) }
             Motion.ripple(view)
+            view.isSelected = on  // read out as the one showing
         }
         val total = plan?.optInt("total") ?: 0
         val done = plan?.optInt("done") ?: 0
         tab.text = if (total > 0) android.text.Html.fromHtml("Plan &nbsp;<font color=\"#00E5FF\"><b>" +
             (if (done == total) "✓" else "$done/$total") + "</b></font>", android.text.Html.FROM_HTML_MODE_COMPACT) else "Plan"
-        tab.contentDescription = if (total > 0) "Plan, $done of $total steps done" else "Plan"
+        // Read as the list's tabs are: "Chat, tab 1 of 2", the one showing selected
+        chat.contentDescription = TabMotion.describeTab("Chat", 0, 2)
+        tab.contentDescription = TabMotion.describeTab(if (total > 0) "Plan, $done of $total steps done" else "Plan", 1, 2)
         if (!onPlan) buildBar?.visibility = View.GONE
     }
 

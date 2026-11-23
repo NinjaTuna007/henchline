@@ -213,6 +213,14 @@
             android:textSize="13sp"
             android:visibility="gone" />
 
+        <!-- What a tab shows: the search (chats only) and the list. Moves as one when the tab changes -->
+        <LinearLayout
+            android:id="@+id/listBody"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
         <!-- Search: project and agent names first, then what was said in the chats -->
         <EditText
             android:id="@+id/search"
@@ -266,9 +274,12 @@
                 android:scaleType="fitCenter"
                 android:src="@drawable/ic_launcher_foreground" />
         </FrameLayout>
+        </LinearLayout>
 
-        <!-- Chats, Calls and Usage, as a messaging app's bottom bar (the user's wishes, 2026-11-16 and -17) -->
+        <!-- Chats, Calls and Usage, as a messaging app's bottom bar (the user's wishes, 2026-11-16 and -17); a pill
+             behind the one showing springs across to the next -->
         <LinearLayout
+            android:id="@+id/tabBar"
             android:layout_width="match_parent"
             android:layout_height="60dp"
             android:background="@color/surface"
