@@ -8,13 +8,15 @@ The directory is voice.state.CHAINS, one ``<id>.jsonl`` per job. The first line
 is the chain (boss and knobs). After that the lines are launch, bound,
 correction, report, end_requested, end_kept, ended and replaced, and reserved/unreserved: a slot held while a
 child starts. A launch may only know the pane and its pid; a bound line attaches the session once it exists. No topic, token or folder
-path is written. Corrections and reports are the words themselves.
+path is written. Corrections and reports are the words themselves. A launch (and the slot reserved for it) carries the
+helper's name, unique among its boss's live helpers, so the boss can address it before it has a session.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import time
 from contextlib import contextmanager
@@ -34,6 +36,8 @@ REAP_AFTER = 30.0  # seconds: a launch this young is never taken for gone
 # A deploy that died before its launch or release line no longer holds it after this long
 RESERVE_FOR = 120.0
 _DROP = {"topic", "token", "secret", "password", "folder", "path"}
+_LOOK = object()  # look the panes up here (one tmux call)
+NAME = re.compile(r"[A-Za-z0-9_-]{1,32}")  # a helper's name: short, and never a tmux pane id (%15)
 
 
 @dataclass
@@ -424,7 +428,15 @@ def reserve(chain: str, caller_session: str, depth: int, alive: dict[str, int] |
     (``append(chain, "launch", reservation=...)``) or give it back with release(); one left behind by a deploy that
     died stops counting after RESERVE_FOR.
     """
-    return _allow(chain, caller_session, depth, alive, reserve=True)
+    return _allow(chain, caller_session, depth, alive, reserve=True)[:2]
+
+
+def reserve_named(chain: str, caller_session: str, depth: int, agent: str, name: str = "",
+                  alive: dict[str, int] | None = None) -> tuple[str, str, str]:
+    """reserve(), with the helper's name held by the same slot: ``("", reservation, name)``, else
+    ``(reason, "", "")``. A name a live helper of this boss (or one still starting) has is refused; without one, the
+    first ``<agent>-<n>`` this boss hasn't given in this job. The caller checks the name's form (NAME)."""
+    return _allow(chain, caller_session, depth, alive, reserve=True, name=name, agent=agent or "helper")
 
 
 def release(chain: str, reservation: str) -> None:
@@ -433,29 +445,66 @@ def release(chain: str, reservation: str) -> None:
         append(chain, "unreserved", reservation=reservation)
 
 
-def _allow(chain: str, caller_session: str, depth, alive, reserve: bool) -> tuple[str, str]:
+def _names(found: _Chain, boss: str, now: float) -> tuple[set[str], set[str]]:
+    """(the names of this boss's live helpers and of the slots it holds for ones starting, every name it has given
+    in this job), lower-cased. The caller holds the lock."""
+    bosses = _renamed_as(boss)
+    live: set[str] = set()
+    ever: set[str] = set()
+    held: dict[str, tuple[float, str]] = {}
+    for index, event in enumerate(found.events):
+        kind = event.get("kind")
+        label = str(event.get("name") or "").lower()
+        token = str(event.get("reservation") or "")
+        if kind == "reserved" and token and label and str(event.get("parent") or "") in bosses:
+            held[token] = (float(event.get("at") or 0), label)
+        elif kind in ("launch", "unreserved") and token:
+            held.pop(token, None)
+        if kind == "launch" and label and str(event.get("parent") or found.boss) in bosses:
+            ever.add(label)
+            if _launch_open(found.events, index):
+                live.add(label)
+    for at, label in held.values():
+        if now - at < RESERVE_FOR:
+            live.add(label)
+            ever.add(label)
+    return live, ever
+
+
+def _allow(chain: str, caller_session: str, depth, alive, reserve: bool, name: str = "",
+           agent: str = "") -> tuple[str, str, str]:
     with _locked():
         found = _one(chain)
         if found is None:
-            return "no such chain", ""
+            return "no such chain", "", ""
         _reap(found, alive)
         if found.closed:
-            return "that chain has ended", ""
+            return "that chain has ended", "", ""
         if found.boss not in _renamed_as(caller_session):
-            return "only the boss may deploy", ""
+            return "only the boss may deploy", "", ""
         try:
             here = int(depth)
         except (TypeError, ValueError):
             here = found.max_depth
         if here >= found.max_depth:
-            return "too deep", ""
+            return "too deep", "", ""
         if _active(found.events) >= found.slots:
-            return "no slots left", ""
+            return "no slots left", "", ""
         if not reserve:
-            return "", ""
+            return "", "", ""
+        now = time.time()
+        line = {"at": now, "kind": "reserved", "parent": caller_session}
+        if agent:  # a named slot
+            live, ever = _names(found, caller_session, now)
+            if name and name.lower() in live:
+                return (f'you already have a helper called "{name}": pick another name, or end that one first '
+                        f"(handsfree end {name})"), "", ""
+            if not name:
+                name = next(f"{agent}-{n}" for n in range(1, len(ever) + 2) if f"{agent}-{n}" not in ever)
+            line["name"] = name
         token = secrets.token_hex(8)
-        _write(found.id, {"at": time.time(), "kind": "reserved", "reservation": token, "parent": caller_session})
-        return "", token
+        _write(found.id, {**line, "reservation": token})
+        return "", token, name if agent else ""
 
 
 def parent_of(session: str) -> str:
@@ -543,6 +592,42 @@ def launched_at(pane: str, pid: int) -> tuple[set[str], set[str]]:
     return parents, owners
 
 
+def helper(boss: str, label: str, alive=_LOOK) -> dict:
+    """The boss's own helper called ``label`` (its name, in any case) or launched in that tmux pane (``%15``):
+    ``{"name", "agent", "where", "pane", "pid", "session", "live"}``, where session is its chat once it is bound
+    (``""`` before: it may only be reachable by its pane). A live one wins over an ended one, then the newest. Empty
+    when no helper this boss started matches: a name never reaches outside the boss's own chain."""
+    label = str(label or "").strip()
+    if not boss or not label:
+        return {}
+    panes = _panes(alive)
+    want = label.lower()
+    best = None
+    with _locked():
+        bosses = _renamed_as(boss)
+        for chain in _load_all():
+            if not chain.closed:
+                _reap(chain, panes)
+            for index, event in enumerate(chain.events):
+                if event.get("kind") != "launch" or str(event.get("parent") or chain.boss) not in bosses:
+                    continue
+                if str(event.get("name") or "").lower() != want and str(event.get("pane") or "") != label:
+                    continue
+                key = (not chain.closed and _launch_open(chain.events, index), float(event.get("at") or 0))
+                if best is None or key >= best[0]:
+                    best = (key, chain, index, event)
+        if best is None:
+            return {}
+        (live, _), chain, index, launch = best
+        child = str(launch.get("session") or "")
+        for later in chain.events[index + 1:]:
+            if later.get("kind") == "bound" and _same_launch_line(later, launch):
+                child = str(later.get("session") or child)
+        return {"name": str(launch.get("name") or ""), "agent": str(launch.get("agent") or ""),
+                "where": str(launch.get("where") or ""), "pane": str(launch.get("pane") or ""), "pid": _pid(launch),
+                "session": _canonical(child) if child else "", "live": live}
+
+
 def _launch_open(events: list[dict], index: int) -> bool:
     launch = events[index]
     return not any(_closes(later, launch) for later in events[index + 1:])
@@ -554,9 +639,6 @@ def _same_launch_line(event: dict, launch: dict) -> bool:
     if not pane or str(event.get("pane") or "") != pane:
         return False
     return _same_pid(int(launch.get("pid") or 0), int(event.get("pid") or 0))
-
-
-_LOOK = object()  # look the panes up here (one tmux call)
 
 
 def _panes(alive):

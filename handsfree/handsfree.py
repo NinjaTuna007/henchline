@@ -34,27 +34,31 @@
                                        script) it shows as Reminders, a chat with a bell that takes no
                                        replies. Exit 0 sent (or read, or answered), 1 not
     handsfree text-status ID            sent, delivered (on the phone) or read (opened, or replied to)
-    handsfree remind [--keep-awake] [--to "AGENT [in WORKSPACE]"] TIME WORDS
+    handsfree remind [--keep-awake] [--to "AGENT [in WORKSPACE]" | --to NAME] TIME WORDS
                                        type WORDS into an agent at TIME (08:30, tomorrow 08:30,
                                        2026-11-18 08:30, in 20m), tagged [henchline · scheduled · from
                                        <you>]: yourself by default, or the agent named (from an agent: only
-                                       its boss or its own helpers). Never typed as a slash command. The
-                                       call server delivers it, through the
-                                       same path as a phone message, even to Cursor. --keep-awake: the laptop
+                                       its boss or its own helpers; NAME is a helper's deploy name or tmux
+                                       pane, looked up among your own helpers first). Never typed as a slash
+                                       command. The call server delivers it, through the same path as a
+                                       phone message, even to Cursor. --keep-awake: the laptop
                                        doesn't sleep by itself until it is delivered (a wake-up call); a
                                        closed lid still suspends it. Prints its id
     handsfree remind list | cancel ID   the reminders set, and taking one back
-    handsfree deploy --agent claude|cursor|codex --folder PATH --ask WORDS
+    handsfree deploy --agent claude|cursor|codex --folder PATH [--name LABEL] --ask WORDS
                                        start that agent in a new tmux pane in PATH
                                        (a folder that agent already trusts; never
                                        a resumed chat) and type WORDS. The
                                        caller is the boss. The child reports with
-                                       `handsfree report`
+                                       `handsfree report`. LABEL (letters, digits,
+                                       - and _, up to 32) names it for --to and
+                                       end; without one it is AGENT-N
     handsfree report WORDS             the caller is a child: WORDS go to the boss
                                        that started it, with corrections since the
                                        last report first. Exit 1 when it has no boss
-    handsfree end SESSION              end that one agent: only its boss, or the
-                                       agent itself, may. Siblings are left running
+    handsfree end SESSION|NAME         end that one agent: only its boss, or the
+                                       agent itself, may. Siblings are left running.
+                                       NAME: one of your helpers, by name or pane
     handsfree send FILE [FILE ...] [WORDS]
                                        show the user files on their phone: in the call's chat while a call
                                        is up, else a Henchline notification (an ntfy one if Henchline can't
@@ -612,7 +616,7 @@ def remind(args: list[str]) -> int:
     if "--to" in args:
         at = args.index("--to")
         if at + 1 >= len(args):
-            print('--to needs an agent, e.g. --to "cursor in physical health"')
+            print('--to needs an agent or a helper\'s name, e.g. --to "cursor in physical health" or --to tests')
             return 1
         to, args = args[at + 1], args[:at] + args[at + 2:]
     # The time is the first one or two words ("tomorrow 08:30", "in 20m"), the rest the message
@@ -624,7 +628,8 @@ def remind(args: list[str]) -> int:
         except ValueError:
             continue
     else:
-        print("usage: handsfree remind [--keep-awake] [--to AGENT] TIME WORDS  (TIME: 08:30, tomorrow 08:30, in 20m)")
+        print("usage: handsfree remind [--keep-awake] [--to AGENT|NAME] TIME WORDS  "
+              "(TIME: 08:30, tomorrow 08:30, in 20m)")
         return 1
     if not words:
         print("nothing to say: handsfree remind TIME WORDS")
@@ -636,7 +641,19 @@ def remind(args: list[str]) -> int:
     if run_by_agent() and me is None:
         print("couldn't tell which agent is asking, so no reminder was set")
         return 1
-    if to:
+    # A name (or tmux pane) from the caller's own deploys first: it never reaches outside the caller's chain
+    from voice.minions import helper
+    named = helper(me.session, to) if to and me is not None else {}
+    if named and not named["live"]:
+        print(f"{to} has ended, so no reminder was set")
+        return 1
+    if named and not named["session"]:
+        print(f"{to} (tmux {named['pane']}) hasn't spoken yet, so it has no chat to remind: "
+              "try again once it has reported")
+        return 1
+    if named:
+        session = named["session"]
+    elif to:
         parts = re.split(r"\s+in\s+", to, maxsplit=1)
         target = routing.find(parts[0].strip(), parts[1].strip() if len(parts) > 1 else None)
         if target is None:

@@ -36,8 +36,8 @@ def _routing():
     return routing
 
 
-def _deploy_args(args: list[str]) -> tuple[str, str, str]:
-    agent, folder = "", ""
+def _deploy_args(args: list[str]) -> tuple[str, str, str, str]:
+    agent, folder, name = "", "", ""
     ask: list[str] = []
     index = 0
     while index < len(args):
@@ -47,12 +47,26 @@ def _deploy_args(args: list[str]) -> tuple[str, str, str]:
         elif args[index] == "--folder" and index + 1 < len(args):
             folder = args[index + 1]
             index += 2
+        elif args[index] == "--name" and index + 1 < len(args):
+            name = args[index + 1].strip()
+            index += 2
         elif args[index] == "--ask":
             ask = args[index + 1:]
             break
         else:
             index += 1
-    return agent, folder, " ".join(ask).strip()
+    return agent, folder, " ".join(ask).strip(), name
+
+
+def _name_refused(name: str) -> str:
+    """Why that helper name can't be given, or "". Not an agent's name: `--to claude` must keep meaning Claude."""
+    if not name:
+        return ""
+    if not chains.NAME.fullmatch(name):
+        return "not started: a helper's name is letters, digits, - and _, up to 32 characters"
+    if name.lower() in AGENTS:
+        return f'not started: "{name}" is an agent\'s name; give the helper another one'
+    return ""
 
 
 def _folder(given: str, known: list[Path]):
@@ -116,9 +130,12 @@ def _pane(speaker: Speaker) -> str:
 
 def deploy(args: list[str], caller) -> int:
     """Start a child in a new tmux pane and type the ask. The caller is the boss."""
-    agent, folder, ask = _deploy_args(args)
+    agent, folder, ask, name = _deploy_args(args)
     if agent not in AGENTS or not folder or not ask:
-        print('usage: handsfree deploy --agent claude|cursor|codex --folder PATH --ask "words"')
+        print('usage: handsfree deploy --agent claude|cursor|codex --folder PATH [--name LABEL] --ask "words"')
+        return 1
+    if refused := _name_refused(name):
+        print(refused)
         return 1
     boss = caller() if caller else None
     if boss is None or not boss.session:
@@ -130,20 +147,49 @@ def deploy(args: list[str], caller) -> int:
     from voice.desktop import tmux
     # A child that exited by itself (/exit, a crash) has no ended line: its pane is gone, so its slot is freed here.
     # The slot is held from this check on: the launch line is only written once the ask is typed, seconds later
-    refused, slot = chains.reserve(chain, boss.session, depth, alive=tmux.pane_pids())
+    # The name is held with the slot, so two deploys can't both take it
+    refused, slot, name = chains.reserve_named(chain, boss.session, depth, agent, name, alive=tmux.pane_pids())
     if refused:
         print(refused)
         return 1
     launched = False
     try:
-        launched = _launch(chain, slot, boss, depth, agent, folder, ask) == 0
+        launched = _launch(chain, slot, boss, depth, agent, folder, ask, name) == 0
     finally:
         if not launched:
             chains.release(chain, slot)
     return 0 if launched else 1
 
 
-def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder: str, ask: str) -> int:
+def _reports_reach(boss: Speaker) -> bool:
+    """Whether Henchline can confirm where this boss's helpers' reports would be typed: its record is a Cursor
+    editor chat (reached through its window), or has a terminal tab whose running agent is this very process. An
+    agent in an editor's terminal may inherit another terminal's variables; its reports are then refused rather
+    than typed into whichever agent that tab runs."""
+    record = _boss(boss.session) or boss
+    if record.in_editor:
+        return True
+    if not record.tab:
+        return False
+    from voice.agents import nearest_agent
+    from voice.desktop import current as desktop
+    mine = nearest_agent()
+    if mine is None or mine.agent != record.agent:
+        return False
+    try:
+        running = desktop().terminals.agent_pid(record.tab)
+    except Exception:  # noqa: BLE001 - not confirmed, so the boss is warned
+        return False
+    return bool(running) and running == mine.pid == record.pid  # delivery types only to the record's own process
+
+
+UNREACHABLE = ("warning: Henchline can't confirm which terminal you are in (for example an agent inside an "
+               "editor's terminal), so this helper's reports may not reach you. Run in tmux or Konsole directly "
+               "for them to arrive.")
+
+
+def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder: str, ask: str,
+            name: str = "") -> int:
     """Start the child in its reserved slot; 0 once its launch line (which takes over the slot) is written."""
     from voice.desktop import tmux
     server = _server()
@@ -164,6 +210,8 @@ def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder
         print(f"not started: Cursor's settings run every command without asking, and this agent asks first, so a "
               f"{agent} helper would get more than you have. Deploy claude or codex instead.")
         return 1
+    if not _reports_reach(boss):  # still started: the helper's work stands, only its reports may be refused
+        print(UNREACHABLE)
     tab = tmux.start(agent, match, flags=flags)
     if not tab:
         print(f"{agent} didn't start")
@@ -195,9 +243,14 @@ def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder
     from voice.agents import tree_pane
     boss_pane, boss_pid = tree_pane()
     chains.append(chain, "launch", parent=boss.session, pane=tab.address, pid=pid, depth=depth + 1,
-                  agent=agent, where=match.name, ask=ask, reservation=slot, parent_pane=boss_pane, parent_pid=boss_pid)
+                  agent=agent, where=match.name, ask=ask, reservation=slot, parent_pane=boss_pane, parent_pid=boss_pid,
+                  **({"name": name} if name else {}))
     log(HANDSFREE_LOG, f"deployed {agent} in {match.name} (tmux {tab.address})")
-    print(f"deployed {agent} in {match.name} (tmux {tab.address})")
+    if name:
+        print(f'deployed {agent} in {match.name} (tmux {tab.address}) as "{name}": '
+              f"handsfree remind --to {name} TIME WORDS, handsfree end {name}")
+    else:
+        print(f"deployed {agent} in {match.name} (tmux {tab.address})")
     return 0
 
 
@@ -232,6 +285,27 @@ def _speaker(session: str) -> Speaker | None:
 
 def _boss(session: str) -> Speaker | None:
     return _speaker(session)
+
+
+def helper(boss: str, label: str) -> dict:
+    """chains.helper(), and a live helper that isn't bound yet but already has a record of its own (it spoke, rang
+    or texted from that pane, as that very process) is bound to it first, so it can be reminded by name."""
+    found = chains.helper(boss, label)
+    if not found or not found["live"] or found["session"] or not found["pid"] or not SPEAKERS.is_dir():
+        return found
+    from voice.agents import parent_of
+    from voice.desktop import tmux
+    for record in (Speaker.load(path) for path in SPEAKERS.glob("*.json")):
+        if not record or record.tab != Tab(tmux.OWNER, found["pane"]) or record.agent != found["agent"]:
+            continue
+        try:
+            same = record.pid == found["pid"] or (record.pid and parent_of(record.pid) == found["pid"])
+        except (OSError, ValueError, IndexError):
+            same = False
+        if same:
+            chains.bind(record.session, found["pane"], found["pid"])
+            return chains.helper(boss, label)
+    return found
 
 
 def report(args: list[str], caller) -> int:
@@ -394,16 +468,52 @@ def _bind_child(target: str) -> None:
         chains.bind(known.session, known.tab.address, int(known.pid))
 
 
+def _end_unbound(found: dict, label: str, boss: str) -> int:
+    """End a live helper with no chat bound yet, by the pane and process its launch recorded. Only one nothing was
+    heard from: a record on its pane means it spoke or the user may be talking to it, and that waits for the
+    user's End or Keep on the phone, which needs its chat."""
+    from voice.desktop import tmux
+    tab = Tab(tmux.OWNER, found["pane"])
+    server = _server()
+    if not tab or not server.owns(tab.address, found["pid"]):
+        print("only an agent started from here can be ended, and only that one")
+        return 1
+    if any(speaker.tab == tab for speaker in recent_speakers()):
+        print(f"{label} has a chat Henchline couldn't match to it, so it wasn't ended: end it from the phone")
+        return 1
+    again = chains.helper(boss, found["pane"])  # it may have reported since it was looked up
+    if again.get("session") or not again.get("live"):
+        print(f"{label} changed while ending it; try again")
+        return 1
+    if not tmux.end(tab):
+        print("couldn't end that pane")
+        return 1
+    server.spawned(lambda alive: [e for e in alive if e.get("pane") != tab.address])
+    chains.close_child("", tab.address, found["pid"])
+    log(HANDSFREE_LOG, f"ended a helper not bound yet (tmux {tab.address})")
+    print(f"ended {label}")
+    return 0
+
+
 def end(args: list[str], caller=None) -> int:
-    """Command-line wrapper for ending one delegated session: the caller must be its boss, or the child itself."""
+    """Command-line wrapper for ending one delegated session: the caller must be its boss, or the child itself. The
+    boss may name its helper instead (its deploy name, or its tmux pane)."""
     if len(args) != 1 or not args[0].strip():
-        print("usage: handsfree end SESSION")
+        print("usage: handsfree end SESSION|NAME")
         return 1
     target = args[0].strip()
     me = caller() if caller else None
     if me is None or not me.session:
         print("couldn't tell which agent is ending it")
         return 1
+    named = helper(me.session, target)  # the caller's own helpers only, before any session id
+    if named and not named["live"]:
+        print(f"{target} has already ended")
+        return 1
+    if named and not named["session"]:
+        return _end_unbound(named, target, me.session)
+    if named:
+        target = named["session"]
     _bind_child(target)
     if not may_end(me.session, target):
         print("only the agent that started it, or the agent itself, may end it")

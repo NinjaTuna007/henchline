@@ -132,6 +132,56 @@ class RemindTo(unittest.TestCase):
         self.assertEqual(reminders.listed(), [])
 
 
+class RemindByName(unittest.TestCase):
+    """`remind --to NAME` finds the caller's own helper by its deploy name or pane, and nothing outside its chain."""
+
+    def setUp(self):
+        for path in chains.CHAINS.glob("*.jsonl") if chains.CHAINS.is_dir() else []:
+            path.unlink()
+        reminders.FILE.unlink(missing_ok=True)
+        chain = chains.open(BOSS)
+        chains.append(chain, "launch", parent=BOSS, pane="%15", pid=15, depth=2, agent="claude",
+                      where="kite-designer", name="tests")
+        chains.bind(CHILD, "%15", 15)
+        chains.append(chain, "launch", parent=BOSS, pane="%16", pid=16, depth=2, agent="codex",
+                      where="kite-designer", name="docs")
+        patches = [mock.patch.object(handsfree.subprocess, "run", return_value=mock.Mock(returncode=0)),
+                   mock.patch("voice.agents.run_by_agent", return_value=True),
+                   mock.patch("voice.desktop.tmux.pane_pids", return_value=None)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def remind(self, me, to):
+        import io
+        from contextlib import redirect_stdout
+        out = io.StringIO()
+        with mock.patch.object(handsfree, "vouched_caller", return_value=me), \
+                mock.patch.object(handsfree.routing, "find", return_value=None) as find, redirect_stdout(out):
+            code = handsfree.remind(["--to", to, "in", "20m", "check the build"])
+        return code, out.getvalue(), find
+
+    def test_a_boss_reminds_its_helper_by_name_or_pane(self):
+        boss = Speaker(BOSS, "claude", "boss")
+        for to in ("tests", "%15"):
+            code, _, find = self.remind(boss, to)
+            self.assertEqual(code, 0)
+            find.assert_not_called()
+        self.assertEqual({r["session"] for r in reminders.listed()}, {CHILD})
+
+    def test_a_helper_that_has_not_spoken_yet_is_not_guessed(self):
+        code, said, _ = self.remind(Speaker(BOSS, "claude", "boss"), "docs")
+        self.assertEqual(code, 1)
+        self.assertIn("docs (tmux %16) hasn't spoken yet", said)
+        self.assertEqual(reminders.listed(), [])
+
+    def test_a_name_never_reaches_another_bosss_helper(self):
+        code, said, find = self.remind(Speaker(OTHER, "claude", "elsewhere"), "tests")
+        self.assertEqual(code, 1)
+        find.assert_called_once()  # not one of its own: the usual agent lookup, which finds nobody
+        self.assertEqual(reminders.listed(), [])
+
+
 class AgentsReminder(unittest.TestCase):
     def typed(self, text, sender):
         speaker = Speaker(OTHER, "claude", "job", Tab("tmux", "%1"))

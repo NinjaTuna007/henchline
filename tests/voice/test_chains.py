@@ -7,6 +7,7 @@ from unittest import mock
 
 from tests import sandbox  # first: a throwaway HOME
 from voice import chains
+from voice.agents import Process
 from voice.delivery import Delivery, Refusal
 from voice.desktop import Tab
 from voice.minions import _hand_up, deploy, end, end_session, report
@@ -1002,3 +1003,160 @@ class AskSubmitted(unittest.TestCase):
         with mock.patch.object(tmux, "out", side_effect=lambda *a: next(screens)), \
                 mock.patch.object(tmux.time, "sleep"):
             self.assertTrue(tmux.composer_ready(Tab("tmux", "%7"), wait=5))
+
+
+class HelperNames(unittest.TestCase):
+    """A boss names its helpers, and reaches or ends one by that name (or its pane), only among its own."""
+
+    def setUp(self):
+        Chains.setUp(self)
+        self.folder = Path.home() / "kite-designer"
+        self.folder.mkdir(exist_ok=True)
+
+    def deploy_all(self, *names, agent_pid=3333):
+        panes = iter(f"%{15 + i}" for i in range(20))
+        start = mock.Mock(side_effect=lambda *a, **k: Tab("tmux", next(panes)))
+        terms = mock.Mock()
+        terms.agent_pid.return_value = agent_pid
+        patches = AskSubmitted._deploy_mocks(self, self.folder, start, terms) + [
+            mock.patch("voice.agents.nearest_agent", return_value=Process(3333, ["claude"]))]
+        for p in patches:
+            p.start()
+        boss = Speaker("boss", "claude", "job", Tab("tmux", "%3"), pid=3333)
+        import io
+        from contextlib import redirect_stdout
+        results = []
+        try:
+            for name in names:
+                out = io.StringIO()
+                given = ["--name", name] if name is not None else []
+                with redirect_stdout(out):
+                    code = deploy(["--agent", "claude", "--folder", str(self.folder), *given, "--ask", "go"],
+                                  lambda: boss)
+                results.append((code, out.getvalue()))
+        finally:
+            for p in patches:
+                p.stop()
+        return results, start
+
+    def test_a_deploy_names_its_helper_and_no_live_helper_shares_it(self):
+        (first, again, default), start = self.deploy_all("tests", "TESTS", None)
+        self.assertEqual(first[0], 0)
+        self.assertIn('deployed claude in kite-designer (tmux %15) as "tests": '
+                      "handsfree remind --to tests TIME WORDS, handsfree end tests", first[1])
+        self.assertEqual(again[0], 1)
+        self.assertIn('you already have a helper called "TESTS"', again[1])
+        self.assertEqual(default[0], 0)
+        self.assertIn('as "claude-1"', default[1])
+        self.assertEqual(start.call_count, 2)
+        chain = chains.chain_of("boss")
+        launches = [e for e in chains.history(chain) if e["kind"] == "launch"]
+        self.assertEqual([e["name"] for e in launches], ["tests", "claude-1"])
+        self.assertNotIn("warning", first[1])  # its tab runs this very process
+
+    def test_a_bad_name_is_refused_before_anything_starts(self):
+        results, start = self.deploy_all("has space", "x" * 33, "claude", "%15", "dot.ted")
+        self.assertEqual([code for code, _ in results], [1] * 5)
+        self.assertIn("letters, digits", results[0][1])
+        self.assertIn("an agent's name", results[2][1])
+        start.assert_not_called()
+
+    def test_a_boss_whose_terminal_runs_another_agent_is_warned_and_still_deploys(self):
+        (result,), start = self.deploy_all("docs", agent_pid=4444)
+        self.assertEqual(result[0], 0)
+        self.assertIn("can't confirm which terminal you are in", result[1])
+        self.assertIn("Run in tmux or Konsole directly", result[1])
+        start.assert_called_once()
+
+    def test_an_editor_boss_is_reachable_and_one_with_no_tab_is_not(self):
+        from voice import minions
+        self.assertTrue(minions._reports_reach(Speaker("boss-c", "cursor", "kite-designer")))
+        with mock.patch("voice.agents.nearest_agent", return_value=Process(3333, ["claude"])):
+            self.assertFalse(minions._reports_reach(Speaker("boss", "claude", "kite-designer")))
+
+    def test_a_default_name_is_one_this_boss_has_not_given(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", pane="%1", pid=1, depth=2, agent="claude", name="claude-1")
+        chains.append(chain, "ended", pane="%1", pid=1)
+        chains.append(chain, "launch", parent="boss", pane="%2", pid=2, depth=2, agent="codex", name="docs")
+        self.assertEqual(chains.reserve_named(chain, "boss", 1, "claude")[2], "claude-2")
+        self.assertIn("already have a helper", chains.reserve_named(chain, "boss", 1, "codex", "docs")[0])
+        # One still starting holds its name too; an ended one's name is free again
+        self.assertEqual(chains.reserve_named(chain, "boss", 1, "claude", "claude-2")[1], "")
+        refused, slot, name = chains.reserve_named(chain, "boss", 1, "claude", "claude-1")
+        self.assertEqual((refused, bool(slot), name), ("", True, "claude-1"))
+
+    def test_a_helper_is_found_by_name_or_pane_only_among_the_bosss_own(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", pane="%15", pid=15, depth=2, agent="claude",
+                      where="kite-designer", name="tests")
+        other = chains.open("rival")
+        chains.append(other, "launch", parent="rival", pane="%20", pid=20, depth=2, agent="claude", name="tests")
+        found = chains.helper("boss", "Tests", alive=None)
+        self.assertEqual((found["pane"], found["session"], found["live"]), ("%15", "", True))
+        self.assertEqual(chains.helper("boss", "%15", alive=None)["name"], "tests")
+        self.assertEqual(chains.helper("boss", "%20", alive=None), {})  # the rival's helper, by its pane
+        self.assertEqual(chains.helper("rival", "tests", alive=None)["pane"], "%20")
+        self.assertEqual(chains.helper("stranger", "tests", alive=None), {})
+        chains.bind("kid", "%15", 15)
+        self.assertEqual(chains.helper("boss", "tests", alive=None)["session"], "kid")
+        chains.append(chain, "ended", session="kid", pane="%15", pid=15)
+        self.assertFalse(chains.helper("boss", "tests", alive=None)["live"])
+        chains.append(chain, "launch", parent="boss", pane="%16", pid=16, depth=2, agent="claude", name="tests")
+        self.assertEqual(chains.helper("boss", "tests", alive=None)["pane"], "%16")  # the live one wins
+
+    def test_a_helper_that_spoke_from_its_pane_is_bound_when_named(self):
+        from voice import minions
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", pane="%15", pid=15, depth=2, agent="claude", name="tests")
+        Speaker("kid", "claude", "kite-designer", Tab("tmux", "%15"), pid=99).save(SPEAKERS / "kid.json")
+        with mock.patch("voice.desktop.tmux.pane_pids", return_value=None), \
+                mock.patch("voice.agents.parent_of", return_value=0):  # not the real process tree
+            self.assertEqual(minions.helper("boss", "tests")["session"], "")  # another process in that pane
+            Speaker("kid", "claude", "kite-designer", Tab("tmux", "%15"), pid=15).save(SPEAKERS / "kid.json")
+            self.assertEqual(minions.helper("boss", "tests")["session"], "kid")
+        self.assertEqual(chains.parent_of("kid"), "boss")
+
+    def test_end_takes_a_helpers_name_bound_or_not_and_only_from_its_boss(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", session="kid", pane="%1", pid=1, depth=2, agent="claude",
+                      name="tests")
+        chains.append(chain, "launch", parent="boss", pane="%2", pid=2, depth=2, agent="claude", name="docs")
+        Speaker("kid", "claude", "job", Tab("tmux", "%1"), pid=1).save(SPEAKERS / "kid.json")
+        panes = [{"pane": "%1", "pid": 1}, {"pane": "%2", "pid": 2}]
+
+        def spawned(change=None):
+            nonlocal panes
+            if change is not None:
+                panes = change(list(panes))
+            return [e["pane"] for e in panes]
+
+        server = mock.Mock()
+        server.spawned.side_effect = spawned
+        server.owns.side_effect = lambda pane, pid=0: any(e["pane"] == pane and e["pid"] == pid for e in panes)
+        rival = lambda: Speaker("rival", "claude")  # noqa: E731
+        with mock.patch("voice.desktop.tmux.end", return_value=True) as ended, \
+                mock.patch("voice.desktop.tmux.pane_pids", return_value=None), \
+                mock.patch("voice.minions._server", return_value=server):
+            self.assertEqual(end(["docs"], rival), 1)  # not the rival's helper
+            self.assertEqual(end(["tests"], BOSS), 0)
+            self.assertEqual(end(["docs"], BOSS), 0)  # never bound: ended by its pane
+            self.assertEqual(end(["docs"], BOSS), 1)  # already ended
+        self.assertEqual([call.args[0].address for call in ended.call_args_list], ["%1", "%2"])
+        self.assertEqual(panes, [])
+        self.assertEqual(chains.history(chain)[-1]["kind"], "ended")
+        self.assertEqual(chains.helper("boss", "docs", alive=None)["live"], False)
+
+    def test_an_unbound_helper_with_a_record_on_its_pane_is_not_ended_by_name(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", pane="%2", pid=2, depth=2, agent="claude", name="docs")
+        # A record on its pane that couldn't be bound (another pid): the user may be in that chat
+        Speaker("stray", "claude", "job", Tab("tmux", "%2"), pid=4_000_000).save(SPEAKERS / "stray.json")
+        server = mock.Mock()
+        server.owns.return_value = True
+        with mock.patch("voice.desktop.tmux.end", return_value=True) as ended, \
+                mock.patch("voice.desktop.tmux.pane_pids", return_value=None), \
+                mock.patch("voice.agents.parent_of", return_value=0), \
+                mock.patch("voice.minions._server", return_value=server):
+            self.assertEqual(end(["docs"], BOSS), 1)
+        ended.assert_not_called()
