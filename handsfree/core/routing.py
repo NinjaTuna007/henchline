@@ -445,7 +445,7 @@ def place(speaker: Speaker) -> str:
     from voice.agents import started
     from voice.desktop import tmux
     if (speaker.pid and speaker.tab and Path(f"/proc/{speaker.pid}").exists()
-            and started(speaker.pid) == speaker.born and desktop().terminals.agent_running(speaker.tab)):
+            and started(speaker.pid) == speaker.born and desktop().terminals.agent_pid(speaker.tab) == speaker.pid):
         return ""  # already the process we pinned for this id
     chat = resume.chat_id(speaker.session)
     if speaker.in_editor:
@@ -491,6 +491,7 @@ def place(speaker: Speaker) -> str:
         published = True
         previous = (speaker.tab, speaker.pid, speaker.born)
         speaker.tab = tab  # pin() looks at this tab; put the old one back if the process never appears
+        speaker.pid, speaker.born = 0, 0  # the chat isn't the saved process (it wasn't found): pin() takes the new one
         pinned = False
         until = time.monotonic() + 12
         while time.monotonic() < until:
@@ -782,6 +783,13 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
         log(HANDSFREE_LOG, f"no agent running in {tab.address}")
         return refuse(Refusal.AGENT_GONE, "I heard you, but the agent I was talking to isn't running any more, so I "
                       "didn't type it anywhere.", quiet)
+    if speaker.pid and Path(f"/proc/{speaker.pid}").exists() and started(speaker.pid) == speaker.born \
+            and desktop().terminals.agent_pid(tab) != speaker.pid:
+        # Its own process still runs, but not in this tab: another agent is there (a tab taken from an inherited
+        # environment, 2026-11-23). Typing would hand that agent these words as its own.
+        log(HANDSFREE_LOG, f"{speaker.agent} {speaker.pid} isn't the agent in {tab.address}: not typed")
+        return refuse(Refusal.AGENT_GONE, "I heard you, but another agent is in that terminal now, so I didn't type "
+                      "it anywhere.", quiet)
     # Not twice within 2 s: a second Escape opens the agent's history picker (Claude) or edits the last message
     # (Codex), and the words would land there. Cursor is steered after the words are typed, not stopped.
     if urgent and not (speaker.agent == "cursor" and not speaker.in_editor) and time.time() - _interrupted.get(tab.address, 0.0) > 2 and desktop().terminals.interrupt(tab):

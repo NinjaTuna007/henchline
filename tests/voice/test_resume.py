@@ -38,6 +38,60 @@ class Identity(unittest.TestCase):
         self.assertFalse(resume.resumed(b"--resume=" + chat.encode() + b"-extra", chat))
 
 
+class InheritedTab(unittest.TestCase):
+    """An agent in an editor's terminal carries the Konsole tab the editor was started from (2026-11-23)."""
+
+    def test_a_tab_whose_agent_is_another_process_is_not_this_ones(self):
+        import os
+        from unittest import mock
+        me = os.getpid()
+        terms = mock.Mock()
+        terms.agent_pid.return_value = me + 1  # another Claude is that tab's foreground
+        agent = mock.Mock(agent="claude", is_editor=False)
+        with mock.patch.object(resume, "_is_chat", side_effect=lambda a, c, pid, e, cmd: pid == me), \
+                mock.patch.object(resume, "tab_of", return_value=Tab(":1.83", "/Sessions/1")), \
+                mock.patch.object(resume, "_tmux_pane", return_value=Tab()), \
+                mock.patch("voice.agents.process", return_value=agent), \
+                mock.patch("voice.desktop.current", return_value=mock.Mock(terminals=terms)):
+            self.assertEqual(resume.find_running("claude", "7f867b40-b715-4c23-92d6-66484e6c3381"), [(me, Tab())])
+            terms.agent_pid.return_value = me
+            self.assertEqual(resume.find_running("claude", "7f867b40-b715-4c23-92d6-66484e6c3381"),
+                             [(me, Tab(":1.83", "/Sessions/1"))])
+
+
+class KonsoleTitle(unittest.TestCase):
+    """The tab found by its "<folder> : claude" title must run the calling agent itself."""
+
+    def caller_tab(self, tab_agent: int):
+        import os
+        from pathlib import Path
+        from unittest import mock
+        from voice.desktop import kde_x11
+        me = mock.Mock(pid=4242, is_editor=False, folder=Path("/home/u/henchline/call"))
+
+        def qdbus(*args):
+            if args[-1:] == ("foregroundProcessId",):
+                return "999"  # the tab named in the environment runs something else
+            if args[-2:] == ("title", "1"):
+                return "henchline : claude" if args[1] == "/Sessions/3" else "zsh"
+            if len(args) == 1:
+                return "/Sessions/1\n/Sessions/3"
+            return ""
+        with mock.patch.dict(os.environ, {"KONSOLE_DBUS_SERVICE": ":1.83", "KONSOLE_DBUS_SESSION": "/Sessions/1"}), \
+                mock.patch.object(kde_x11, "nearest_agent", return_value=me), \
+                mock.patch.object(kde_x11, "ancestors", return_value=[me]), \
+                mock.patch.object(kde_x11, "cmdline_has", return_value=False), \
+                mock.patch.object(kde_x11, "qdbus", side_effect=qdbus), \
+                mock.patch.object(kde_x11.Konsole, "agent_pid", return_value=tab_agent):
+            return kde_x11.Konsole.__new__(kde_x11.Konsole).tab_of_caller()
+
+    def test_a_title_match_running_another_claude_is_not_the_callers(self):
+        self.assertEqual(self.caller_tab(tab_agent=15211), Tab())
+
+    def test_a_title_match_running_the_caller_is_its_tab(self):
+        self.assertEqual(self.caller_tab(tab_agent=4242), Tab(":1.83", "/Sessions/3"))
+
+
 class ClaudeRecord(unittest.TestCase):
     """A Claude chat picked with /resume is named only by Claude's own record of the process."""
     CHAT = "13388111-493f-41d1-9791-11259dab5a68"

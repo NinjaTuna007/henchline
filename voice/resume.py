@@ -144,6 +144,7 @@ def find_running(agent: str, chat: str) -> list:
     """Every agent process that is this chat: (pid, terminal). Empty when none. More than one is the caller's
     to refuse. A terminal-less match is included, so a second copy is not started just because the tab is unknown."""
     from voice.agents import process
+    from voice.desktop import Tab
     hits = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -163,10 +164,24 @@ def find_running(agent: str, chat: str) -> list:
         if not running or running.agent != agent or running.is_editor:
             continue
         tab = tab_of(raw)
+        if tab and not runs_in(tab, pid):
+            # The environment is inherited: an agent in an editor's terminal carries the Konsole tab or tmux pane
+            # the editor was started from, where another agent may run (2026-11-23: a helper's reports were typed
+            # into a different Claude that way)
+            tab = Tab()
         if not tab:
             tab = _tmux_pane(pid)
         hits.append((pid, tab))
     return hits
+
+
+def runs_in(tab, pid: int) -> bool:
+    """That tab's agent is this process: words typed there reach it and no other agent."""
+    from voice.desktop import current as desktop
+    try:
+        return desktop().terminals.agent_pid(tab) == pid
+    except Exception:  # noqa: BLE001 - unknown is not the same
+        return False
 
 
 def _tmux_pane(pid: int):

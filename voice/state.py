@@ -383,6 +383,8 @@ class Speaker:
         born = started(pid)
         if (pid, born) == (self.pid, self.born):
             return False
+        if self.pid and self.born and started(self.pid) == self.born:
+            return False  # its own process still runs elsewhere: the agent in this tab is another one
         self.pid, self.born = pid, born
         return True
 

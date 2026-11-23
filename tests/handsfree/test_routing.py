@@ -375,6 +375,35 @@ class Refusals(unittest.TestCase):
             one.join(5), two.join(5)
         self.assertEqual((answers["one"].refusal.name, answers["two"].refusal.name), ("AGENT_GONE", "NOBODY"))
 
+    def test_words_are_not_typed_into_a_tab_another_agent_runs(self):
+        from voice.agents import started
+        from voice.state import Speaker
+        me = os.getpid()
+        boss = Speaker("claude-boss", "claude", "job", Tab(":1.83", "/Sessions/1"), pid=me, born=started(me))
+        terms = mock.Mock()
+        terms.agent_running.return_value = True
+        terms.agent_pid.return_value = me + 1  # another Claude is in that tab
+        with mock.patch.object(routing, "last_speaker", return_value=None), \
+                mock.patch.object(routing, "place", return_value=""), \
+                mock.patch.object(routing, "desktop", return_value=mock.Mock(terminals=terms)), \
+                mock.patch.object(routing, "say"):
+            got = routing.deliver_words("[henchline · report] done", routing.Heard.SCHEDULED, to=boss)
+        self.assertEqual(got.refusal.name, "AGENT_GONE")
+        terms.type_line.assert_not_called()
+
+    def test_pin_does_not_adopt_another_agent_while_its_own_runs(self):
+        from voice.agents import started
+        from voice.state import Speaker
+        me = os.getpid()
+        boss = Speaker("claude-boss", "claude", "job", Tab(":1.83", "/Sessions/1"), pid=me, born=started(me))
+        terms = mock.Mock()
+        terms.agent_pid.return_value = me + 1
+        with mock.patch("voice.desktop.current", return_value=mock.Mock(terminals=terms)), \
+                mock.patch("voice.agents.process", return_value=mock.Mock(agent="claude")), \
+                mock.patch("voice.agents.started", side_effect=lambda pid: 7 if pid == me + 1 else started(pid)):
+            self.assertFalse(boss.pin())
+        self.assertEqual(boss.pid, me)
+
 
 if __name__ == "__main__":
     unittest.main()

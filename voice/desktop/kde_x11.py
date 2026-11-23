@@ -69,7 +69,12 @@ class Konsole(AnyTerminal):
         for folder in (f for start in starts for f in (start, *start.parents)):
             tabs = [s for s, title in titles.items() if title == f"{folder.name} : claude"]
             if len(tabs) == 1:
-                return Tab(service, tabs[0])
+                tab = Tab(service, tabs[0])
+                # Outside a background session, the tab must run this very agent: one in an editor's terminal
+                # inherits the Konsole variables, and a Claude titled for a parent folder would get its words
+                if daemon or (agent and self.agent_pid(tab) == agent.pid):
+                    return tab
+                return Tab()
             if tabs:
                 break  # several Claude tabs in that folder: do not guess
         return Tab()
