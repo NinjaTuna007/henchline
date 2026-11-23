@@ -2,6 +2,8 @@ package io.github.ninjatuna007.henchline
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -65,5 +67,53 @@ class MotionTest {
     @Test fun aFlickRunsBetweenTheEdges() {
         assertEquals(-1000f to 0f, panRange(2000f, 1000f))
         assertEquals(100f to 100f, panRange(800f, 1000f))
+    }
+
+    @Test fun onlyALineSentOrArrivingInTheOpenChatMoves() {
+        // a chat's history, a rebuilt list: no line moves
+        assertNull(entranceOf(live = false, mine = true, note = false, shown = true, animating = true))
+        assertNull(entranceOf(live = false, mine = false, note = false, shown = true, animating = true))
+        // another chat's line (hidden), a note in the middle, the phone's animations off
+        assertNull(entranceOf(live = true, mine = false, note = false, shown = false, animating = true))
+        assertNull(entranceOf(live = true, mine = false, note = true, shown = true, animating = true))
+        assertNull(entranceOf(live = true, mine = true, note = false, shown = true, animating = false))
+    }
+
+    @Test fun yoursGrowsFromBottomRightAndTheirsFromBottomLeft() {
+        val sent = entranceOf(live = true, mine = true, note = false, shown = true, animating = true)!!
+        assertEquals(0.8f, sent.from, 0f); assertEquals(250L, sent.duration); assertTrue(sent.atEnd)
+        val arrived = entranceOf(live = true, mine = false, note = false, shown = true, animating = true)!!
+        assertEquals(0.9f, arrived.from, 0f); assertEquals(300L, arrived.duration); assertFalse(arrived.atEnd)
+    }
+
+    @Test fun aPressedButtonShrinksALittleAndSquaresOffALittle() {
+        assertEquals(0.96f, PRESSED_SCALE, 0f)
+        val pill = 24f
+        assertTrue(pressedCorner(pill) < pill && pressedCorner(pill) > pill / 2)
+        assertEquals(0f, pressedCorner(0f), 0f)
+    }
+
+    @Test fun pressedOnlyWhenEnabled() {
+        val pressed = android.R.attr.state_pressed
+        val enabled = android.R.attr.state_enabled
+        assertTrue(isPressedIn(intArrayOf(enabled, pressed)))
+        assertFalse(isPressedIn(intArrayOf(pressed)))  // a disabled button doesn't give
+        assertFalse(isPressedIn(intArrayOf(enabled)))
+        assertFalse(isPressedIn(intArrayOf()))
+    }
+
+    @Test fun theChatCountsAsAtItsEndWhileGoingThere() {
+        assertTrue(followsEnd(canScrollDown = false, downAsked = false, now = 1000, glideEnds = 0))  // there
+        assertTrue(followsEnd(canScrollDown = true, downAsked = true, now = 1000, glideEnds = 0))  // asked, not yet made
+        assertTrue(followsEnd(canScrollDown = true, downAsked = false, now = 1000, glideEnds = 1200))  // gliding
+        assertFalse(followsEnd(canScrollDown = true, downAsked = false, now = 1300, glideEnds = 1200))  // scrolled up
+    }
+
+    @Test fun aBenchLanguageIsATagOrNothing() {
+        assertEquals("en-US", benchLanguage("en-US"))
+        assertEquals("de", benchLanguage("de"))
+        assertEquals("", benchLanguage(null))
+        assertEquals("", benchLanguage("english"))
+        assertEquals("", benchLanguage("en_us"))
     }
 }

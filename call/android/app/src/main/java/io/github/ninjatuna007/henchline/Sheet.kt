@@ -76,6 +76,7 @@ class Sheet(
             isAllCaps = false; textSize = 16f; setTextColor(colour(R.color.navy))
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             background = rounded(colour(R.color.cyan), 24f); stateListAnimator = null
+            Motion.press(this)
         }
         val chips = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
         fun draw() {
@@ -84,6 +85,7 @@ class Sheet(
                 val on = chip.tag == picked
                 chip.background = rounded(if (on) colour(R.color.surface_high) else Color.TRANSPARENT, 20f, if (on) 2 else 1,
                     if (on) colour(R.color.cyan) else colour(R.color.surface_high))
+                Motion.ripple(chip)
             }
             send.text = "Send to " + (crew.firstOrNull { it.first == picked }?.second?.substringBefore(",") ?: "your crew")
         }
@@ -138,6 +140,7 @@ class Sheet(
         sheet.addView(buttons, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             .apply { topMargin = px(20) })
         draw()
+        Motion.rippleAll(sheet)  // Cancel and the preview: a ripple when tapped
         root.addView(sheet, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         root.setOnClickListener { close() }
         if (over) activity.addContentView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,

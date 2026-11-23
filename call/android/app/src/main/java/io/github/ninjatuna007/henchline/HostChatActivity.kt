@@ -176,6 +176,7 @@ class HostChatActivity : Activity() {
             // A timer's or a script's texts (Reminders) take no replies, as the laptop's: no Call, no message box
             if (sessionId != null && HostChatRules.takesReplies(sessionId)) root.addView(composer())
             activity.setContentView(root)
+            Motion.rippleAll(root)  // its buttons and rows: a ripple; the filled ones press in
             refresh()
         }
 
@@ -273,6 +274,7 @@ class HostChatActivity : Activity() {
                     text = HostChatRules.name(c.sessionId, c.name); textSize = 16f; setTextColor(activity.getColor(R.color.text))
                     setPadding(px(4), px(14), px(4), px(14))
                     setOnClickListener { activity.startActivity(open(activity, ChatKey(host.hostId, c.sessionId))) }
+                    Motion.ripple(this)
                 })
             }
         }

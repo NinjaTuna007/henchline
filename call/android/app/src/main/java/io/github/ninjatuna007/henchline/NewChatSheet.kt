@@ -178,6 +178,8 @@ open class BottomPanel(protected val activity: Activity) {
         activity.addContentView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         shown.addLast(this)  // above any sheet already open: back closes this one first
         root.animate().alpha(1f).setDuration(180).start()
+        // Once what the sheet holds is in (its show() goes on after this returns): what is tapped ripples
+        sheet.post { Motion.rippleAll(sheet) }
         sheet.translationY = 800 * dp
         sheet.animate().translationY(0f).setDuration(300).setInterpolator(DecelerateInterpolator(1.6f)).start()
         this.root = root
@@ -211,7 +213,8 @@ open class BottomPanel(protected val activity: Activity) {
             addView(TextView(activity).apply { text = title; setTextColor(colour(colourId)); textSize = 16f; typeface = Typeface.DEFAULT_BOLD })
             if (detail.isNotEmpty()) addView(TextView(activity).apply { text = detail; setTextColor(colour(R.color.muted)); textSize = 12f })
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        setOnClickListener { pop(this); then() }
+        setOnClickListener { then() }
+        Motion.ripple(this)  // a row ripples; it doesn't scale
     }.also { it.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = px(8) } }
 
     /** Asked again in the same sheet, in red, before deleting: with the files saved from it (Downloads/Henchline)
@@ -240,6 +243,7 @@ open class BottomPanel(protected val activity: Activity) {
         text = words; isAllCaps = false; textSize = 16f; setTextColor(ink)
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         background = rounded(fill, 24f); stateListAnimator = null
+        Motion.press(this)  // it gives a little when pressed, and springs back
     }
 
     /** The system's touch ripple, for rows and small buttons that act when tapped. */
@@ -251,8 +255,9 @@ open class BottomPanel(protected val activity: Activity) {
 
     protected fun quiet(words: String, then: () -> Unit) = Button(activity).apply {
         text = words; isAllCaps = false; textSize = 16f; setTextColor(colour(R.color.cyan))
-        setBackgroundColor(Color.TRANSPARENT); stateListAnimator = null
+        background = rounded(Color.TRANSPARENT, 24f); stateListAnimator = null
         setOnClickListener { then() }
+        Motion.ripple(this)
     }
 
     protected fun wide(topMargin: Int = 0, height: Int = ViewGroup.LayoutParams.WRAP_CONTENT) =
@@ -359,12 +364,14 @@ class NewChatSheet(
                 val on = chip.tag == agent
                 chip.background = rounded(if (on) colour(R.color.surface_high) else Color.TRANSPARENT, 20f, if (on) 2 else 1,
                     if (on) colour(R.color.cyan) else colour(R.color.surface_high))
+                Motion.ripple(chip)
                 chip.alpha = if (on) 1f else 0.7f
             }
             for (i in 0 until cards.childCount) {
                 val card = cards.getChildAt(i)
                 val on = typed.isEmpty() && card.tag == folder?.optString("path") || typed.isNotEmpty() && card.tag == "typed"
                 card.background = rounded(colour(if (on) R.color.surface_high else R.color.navy), 16f, if (on) 2 else 0, colour(R.color.cyan))
+                Motion.ripple(card)
             }
             val where = if (typed.isNotEmpty()) typed.trimEnd('/').substringAfterLast('/') else folder?.optString("name") ?: ""
             go.text = if (where.isEmpty()) "Pick a folder" else "Start ${agent.replaceFirstChar { it.uppercase() }} in ${where.replace("_", " ")}"
@@ -506,7 +513,8 @@ class NewChatSheet(
                 text = detail; setTextColor(colour(R.color.muted)); textSize = 12f; maxLines = 1; ellipsize = TextUtils.TruncateAt.MIDDLE
             })
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        setOnClickListener { pop(this); picked() }
+        setOnClickListener { picked() }
+        Motion.ripple(this)
     }.also { it.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = px(8) } }
 }
 
@@ -615,7 +623,8 @@ class ChatActionsSheet(
             addView(TextView(activity).apply { text = title; setTextColor(colour(colourId)); textSize = 16f; typeface = Typeface.DEFAULT_BOLD })
             addView(TextView(activity).apply { text = detail; setTextColor(colour(R.color.muted)); textSize = 12f })
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        setOnClickListener { pop(this); then() }
+        setOnClickListener { then() }
+        Motion.ripple(this)  // a row ripples; it doesn't scale
     }.also { it.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = px(8) } }
 }
 
@@ -649,7 +658,8 @@ class ModelPicker(
                 setTextColor(colour(R.color.text)); textSize = 16f
                 setPadding(px(16), px(14), px(16), px(14))
                 background = rounded(colour(R.color.navy), 14f)
-                setOnClickListener { pop(this); picked(m.optString("id"), m.optString("name")); close() }
+                setOnClickListener { picked(m.optString("id"), m.optString("name")); close() }
+                Motion.ripple(this)
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = px(6) })
         }
         box.addTextChangedListener(object : TextWatcher {
@@ -779,7 +789,8 @@ class CursorModelMenu(
         addView(TextView(activity).apply { text = name; setTextColor(colour(R.color.text)); textSize = 16f },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         addView(TextView(activity).apply { text = "$value  ›"; setTextColor(colour(R.color.cyan)); textSize = 15f })
-        setOnClickListener { pop(this); then() }
+        setOnClickListener { then() }
+        Motion.ripple(this)  // a row ripples; it doesn't scale
     }.also { it.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = px(6) } }
 }
 

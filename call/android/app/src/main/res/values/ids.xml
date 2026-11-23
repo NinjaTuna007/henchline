@@ -2,4 +2,6 @@
 <resources>
     <!-- On a chat's row: the times of the kept lines it shows (one, or an album's), for selecting several -->
     <item name="ats" type="id" />
+    <!-- A view given its touch ripple (Motion.ripple or press): not wrapped again -->
+    <item name="rippled" type="id" />
 </resources>
