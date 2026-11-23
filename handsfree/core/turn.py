@@ -27,6 +27,7 @@ from voice.state import (BY_HANDSFREE, CALL_HANGUP, CALL_PUSH, HANDSFREE_LOG, HA
                          last_speaker, log, ptt_busy, release_phase, set_phase, set_target)
 
 THINK_WINDOW = 180  # seconds after "give me a minute"
+BUDS_LEAVING = 1.0  # seconds: buds that disconnect this soon before a tap turn starts, or during it, drop it
 WAIT_FOR_WORDS = 5.0  # after the wake word, seconds to start talking before it gives up
 CHIME_GRACE = 1.2  # the listening chime is loud in the mic; it must not count as them starting, then the pause close the turn
 END_DB, END_FRAMES = 6, 50  # 1.5 s at most END_DB over the floor ends the turn
@@ -101,6 +102,8 @@ class Turn:
         self.last_message: tuple[str, Heard] | None = None  # for "send that to …"
         self.live = None  # this turn, heard as it is recorded (Nemotron), when it is installed
         self.whistle = None  # set by the listener: quick checks (the wake word, "over") without Whisper
+        self.tapped = None  # the earbud button, while a turn it started records
+        self.buds_left = False
         self.streamer = None
         if cfg.streaming and nemotron.available():
             try:
@@ -112,7 +115,7 @@ class Turn:
         """One turn, end to end; returns seconds to keep listening (0: the default), None if no words."""
         frames = self.record(frames, floor, heard)
         if frames is None:
-            return 0.0
+            return None if self.buds_left else 0.0
         try:
             text, rich = self.transcribe(frames)
             tone = TONE_NOTE.search(rich)
@@ -156,6 +159,7 @@ class Turn:
         voice_at, spoke = since, False  # when Silero last heard speech in the turn, and whether it ever did (calls)
         voiceless = False
         held = heard is Heard.PUSHED  # the button decides when it ends, not a pause
+        self.buds_left = False
         released = False
         while (quiet < end or held) and time.monotonic() - since < MAX_SECONDS:
             if held and not CALL_PUSH.exists():
@@ -170,6 +174,16 @@ class Turn:
                     self.live.cancel()
                     self.live = None
                 return None  # it delivers these words; ours would arrive twice
+            if self.tapped is not None and self.tapped.gone_at > since - BUDS_LEAVING:
+                # Earbuds send a pause as they come off the ears or go into the case, and disconnect
+                # seconds later (2026-11-23: 4-5 s). A tap whose buds then leave was not a tap.
+                log(HANDSFREE_LOG, "earbuds disconnected right after the tap: dropped the recording")
+                if self.live:
+                    self.live.cancel()
+                    self.live = None
+                self.buds_left = True
+                release_phase(BY_HANDSFREE)  # take() releases only a turn it transcribes; talkback must not hold on
+                return None
             frame = samples.astype(np.float32) / 32768
             frames.append(frame)
             if self.live:

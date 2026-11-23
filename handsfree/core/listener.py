@@ -159,7 +159,11 @@ class Listener:
                     self.button.tap.clear()
                     if not ptt_busy():
                         log(HANDSFREE_LOG, "earbud tap")
-                        self.turn([], Heard.WOKE, floor_of(self.room, level(frame)))
+                        self.turns.tapped = self.button
+                        try:
+                            self.turn([], Heard.WOKE, floor_of(self.room, level(frame)))
+                        finally:
+                            self.turns.tapped = None
                         was_busy = talkback_busy()
                         continue
                 self.watch_xruns()

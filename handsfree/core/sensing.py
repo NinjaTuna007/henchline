@@ -422,16 +422,18 @@ class EarbudButton(threading.Thread):
 
     TAP = {"KEY_PLAYCD", "KEY_PAUSECD", "KEY_PLAYPAUSE"}
     DEBOUNCE = 2.0  # seconds: one press, not its echo
+    SETTLE = 3.0  # seconds after the buds connect: keys then come from the buds, not a finger
 
     def __init__(self, stop: threading.Event) -> None:
         super().__init__(daemon=True)
         self.stop, self.tap = stop, threading.Event()
+        self.gone_at = 0.0  # when buds last disconnected (monotonic)
 
     def run(self) -> None:
         from evdev import InputDevice, ecodes, list_devices
 
         held: dict[str, InputDevice] = {}
-        last = 0.0
+        last = joined = 0.0
         while not self.stop.is_set():
             for path in list_devices():
                 if path in held:
@@ -441,6 +443,7 @@ class EarbudButton(threading.Thread):
                     if device.name.endswith("(AVRCP)"):
                         device.grab()
                         held[path] = device
+                        joined = time.monotonic()
                         log(HANDSFREE_LOG, f"earbud button: {device.name}")
                 except OSError:
                     continue
@@ -454,13 +457,22 @@ class EarbudButton(threading.Thread):
                         if event.type != ecodes.EV_KEY or event.value != 1:
                             continue
                         name = ecodes.KEY.get(event.code, "")
-                        if name in self.TAP and time.monotonic() - last > self.DEBOUNCE:
-                            last = time.monotonic()
+                        name = name[0] if isinstance(name, list) else name  # a code with aliases names a list
+                        now = time.monotonic()
+                        if name in self.TAP and now - last > self.DEBOUNCE and now - joined > self.SETTLE:
+                            last = now
                             self.tap.set()
+                            log(HANDSFREE_LOG, f"earbud {name}")
                         else:
                             log(HANDSFREE_LOG, f"earbud {name} ignored")
                 except OSError:  # disconnected
                     held.pop(device.path, None)
+                    try:
+                        device.close()
+                    except OSError:
+                        pass
+                    self.gone_at = time.monotonic()
+                    self.tap.clear()  # buds taken off or put away send a pause on the way out: not a tap
                     log(HANDSFREE_LOG, "earbud button gone")
 
 
