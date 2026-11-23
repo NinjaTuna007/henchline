@@ -2662,9 +2662,9 @@ class MainActivity : Activity() {
             setOnClickListener {
                 prefs().edit().putString(NEW_CHAT_ON, remote?.host?.hostId ?: LAPTOP).apply()  // New chat starts there next
                 if (remote == null) open(session)
-                else startActivity(HostChatActivity.open(this@MainActivity, ChatKey(remote.host.hostId, session)))
+                else RemoteChatMotion.open(this@MainActivity, HostChatActivity.open(this@MainActivity, ChatKey(remote.host.hostId, session)), this)
             }
-            setOnLongClickListener { if (remote == null) chatMenu(session, project, agent) else hostChatMenu(remote.host, session, project); true }
+            setOnLongClickListener { if (remote == null) chatMenu(session, project, agent) else hostChatMenu(remote.host, session, project, this); true }
         }
         row.addView(ImageView(this).apply {
             setImageResource(avatarOf(session, remote?.team ?: teams[session] ?: ""))
@@ -2975,12 +2975,13 @@ class MainActivity : Activity() {
         }).also { it.show() }
     }
 
-    private fun hostChatMenu(host: Host, session: String, project: String) {
+    /** row: the chat's row in the list, which Open reveals the chat from. */
+    private fun hostChatMenu(host: Host, session: String, project: String, row: View) {
         val key = HostLists.pinKey(host.hostId, session)
         val pinned = key in pins()
         panel = ActionsSheet(this, project.replace("_", " "), "On ${host.label}", listOf(
             Triple("📌", if (pinned) "Unpin" else "Pin") { setPinned(key, !pinned); showCrew() },
-            Triple("💬", "Open") { startActivity(HostChatActivity.open(this@MainActivity, ChatKey(host.hostId, session))) }
+            Triple("💬", "Open") { RemoteChatMotion.open(this@MainActivity, HostChatActivity.open(this@MainActivity, ChatKey(host.hostId, session)), row) }
         )).also { it.show() }
     }
 

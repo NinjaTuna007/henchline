@@ -113,6 +113,14 @@ class HostChatActivity : Activity() {
         else screen?.say("A call needs the microphone: allow it for Henchline in the phone's settings.")
     }
 
+    /** Closing a chat that was drawn fades it and shrinks it over the list (RemoteChatMotion). */
+    override fun finish() {
+        val shown = screen != null
+        RemoteChatMotion.beforeFinish(this, shown)
+        super.finish()
+        RemoteChatMotion.afterFinish(this, shown)
+    }
+
     override fun onDestroy() {
         ticker.removeCallbacks(tick)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) screen?.close()

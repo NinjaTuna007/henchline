@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A computer's chat closing (RemoteChatMotion): it fades and shrinks to 0.94 over the list, on top of it -->
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:duration="200"
+    android:interpolator="@interpolator/emphasized_accelerate"
+    android:shareInterpolator="true"
+    android:zAdjustment="top">
+    <alpha android:fromAlpha="1.0" android:toAlpha="0.0" />
+    <scale android:fromXScale="1.0" android:toXScale="0.94" android:fromYScale="1.0" android:toYScale="0.94"
+        android:pivotX="50%" android:pivotY="50%" />
+</set>
