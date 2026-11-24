@@ -258,6 +258,27 @@ class Chains(unittest.TestCase):
         self.assertEqual(ended.call_args.args[0].address, "%1")
         resume.assert_not_called()
 
+    def test_a_report_names_the_helper_that_sent_it(self):
+        chain = chains.open("boss")
+        chains.append(chain, "launch", parent="boss", pane="%1", pid=3, depth=2, agent="claude", where="job",
+                      name="tests")
+        Speaker("boss", "claude", "job", Tab("tmux", "%9")).save(SPEAKERS / "boss.json")
+        child = Speaker("child", "claude", "job", Tab("tmux", "%1"))
+        seen = {}
+
+        def fake(text, heard, to=None, urgent=False):
+            seen["text"] = text
+            return True
+
+        import routing  # noqa: F401
+        with mock.patch("routing.deliver", side_effect=fake):
+            self.assertEqual(report(["all green"], lambda: child), 0)
+        self.assertEqual(seen["text"], "[henchline · report · from tests] all green")
+        self.assertTrue(chains.is_report(seen["text"]))
+        self.assertFalse(chains.is_report("[henchline · reported] no"))
+        self.assertEqual(chains.report_tag(""), chains.REPORT)
+        self.assertEqual(chains.report_tag("a]b [c"), "[henchline · report · from ab c]")
+
     def test_a_user_message_is_a_correction_and_a_report_is_not(self):
         chains.open("boss")
         chain = chains.chain_of("boss")

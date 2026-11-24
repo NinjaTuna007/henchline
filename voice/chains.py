@@ -29,6 +29,19 @@ KINDS = ("launch", "bound", "correction", "report", "end_requested", "end_chosen
 DEFAULT_DEPTH = 2  # boss is 1, so a child is as deep as a chain allows
 DEFAULT_SLOTS = 8
 REPORT = "[henchline · report]"  # an internal report, not a correction from the user
+_NAMED_REPORT = "[henchline · report · from "
+
+
+def is_report(text: object) -> bool:
+    """Whether the words are a helper's report: the bare tag, or one naming the helper."""
+    words = str(text or "").lstrip()
+    return words.startswith(REPORT) or words.startswith(_NAMED_REPORT)
+
+
+def report_tag(name: str) -> str:
+    """A report's tag, naming the helper when it has a name (brackets taken out, so the tag stays one tag)."""
+    name = " ".join(str(name or "").replace("[", "").replace("]", "").split())[:40]
+    return f"[henchline · report · from {name}]" if name else REPORT
 _LOCK = CHAINS.parent / "chains.lock"
 PHONE_VIEWS = CHAINS.parent / "chain-views.json"
 REAP_AFTER = 30.0  # seconds: a launch this young is never taken for gone
@@ -628,6 +641,25 @@ def helper(boss: str, label: str, alive=_LOOK) -> dict:
                 "session": _canonical(child) if child else "", "live": live}
 
 
+def name_of(session: str) -> str:
+    """The name a helper was deployed under (``tests``), found by its chat; "" when it was never deployed by name."""
+    want = _canonical(session) if session else ""
+    if not want:
+        return ""
+    with _locked():
+        for chain in _load_all():
+            for index, launch in enumerate(chain.events):
+                if launch.get("kind") != "launch":
+                    continue
+                child = str(launch.get("session") or "")
+                for later in chain.events[index + 1:]:
+                    if later.get("kind") == "bound" and _same_launch_line(later, launch):
+                        child = str(later.get("session") or child)
+                if child and _canonical(child) == want:
+                    return str(launch.get("name") or "")
+    return ""
+
+
 def _launch_open(events: list[dict], index: int) -> bool:
     launch = events[index]
     return not any(_closes(later, launch) for later in events[index + 1:])
@@ -1017,7 +1049,7 @@ def delivery_guard(session: str, pane: str = "", pid: int = 0):
 
         def remember(text: str) -> None:
             words = str(text or "").strip()
-            if not words or words.startswith(REPORT):
+            if not words or is_report(words):
                 return
             _write(found.id, {"at": time.time(), "kind": "correction", "session": session, "text": words,
                               "pane": pane, "pid": pid, "correction": secrets.token_hex(8)})
@@ -1034,7 +1066,7 @@ def close_guard(session: str):
 
 def note_correction(session: str, text: str, pane: str = "", pid: int = 0) -> None:
     """Remember the user's words to a child. A line that is itself a report is not one, and nothing is typed on."""
-    if not session or not str(text or "").strip() or str(text).lstrip().startswith(REPORT):
+    if not session or not str(text or "").strip() or is_report(text):
         return
     if not CHAINS.is_dir():  # no job has been opened: nothing to attach, and ordinary delivery stays a directory check
         return

@@ -336,7 +336,8 @@ def report(args: list[str], caller) -> int:
     routing = _routing()
     # SCHEDULED so a failure isn't spoken into the room, and so this isn't the user answering the boss.
     # The text itself starts with the report marker, so it is typed as a report and not kept as a correction.
-    delivery = routing.deliver(f"{chains.REPORT} {body}", routing.Heard.SCHEDULED, to=target)
+    delivery = routing.deliver(f"{chains.report_tag(chains.name_of(child.session))} {body}", routing.Heard.SCHEDULED,
+                               to=target)
     if not delivery:
         print(delivery.why or "couldn't deliver the report")
         return 1
@@ -359,7 +360,8 @@ def _hand_up(session: str) -> bool:
             return False
         body = "Corrections since the last report:\n" + "\n".join(item["text"] for item in prior)
         routing = _routing()
-        if not routing.deliver(f"{chains.REPORT} {body}", routing.Heard.SCHEDULED, to=target):
+        if not routing.deliver(f"{chains.report_tag(chains.name_of(session))} {body}", routing.Heard.SCHEDULED,
+                               to=target):
             return False
         chains.mark_reported(session, prior)
     return not chains.pending_corrections(session)

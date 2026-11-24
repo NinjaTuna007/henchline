@@ -690,7 +690,7 @@ def deliver(text: str, heard: Heard, to: Speaker | None = None, urgent: bool = F
     through a dropped line was said (both said in their tag)."""
     from voice import chains
     # A child's report is not the user's turn: no call photos, and it does not move the pinned call.
-    if text.lstrip().startswith(chains.REPORT) or sender is not None:
+    if chains.is_report(text) or sender is not None:
         return deliver_words(text, heard, to, urgent, sender=sender)
     speaker = to or last_speaker()
     # A late turn (said_at) was said long before this call's photos and ring note: they wait for a turn of now
@@ -761,7 +761,7 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
     # return would act in the agent's terminal as keys. Each typing path strips them again on its own.
     text, extra, before = (typeable(text) if text else text), typeable(extra), typeable(before)
     # A report is typed as itself (it already carries its marker). A failure isn't spoken: nobody in the room asked.
-    report = sender is None and bool(text) and str(text).lstrip().startswith(chains.REPORT)
+    report = sender is None and bool(text) and chains.is_report(text)
     quiet = heard is Heard.SCHEDULED or report  # a scheduled message is retried later by the call server
     speaker = to or last_speaker()
     # A slash command ("/compact", "/rename …") is typed exactly as it is: an agent runs a line as a command only
