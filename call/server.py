@@ -3483,7 +3483,8 @@ def deliver_reminder(rid: str) -> None:
 
 async def deliver_reminders(app: web.Application) -> None:
     """Due reminders typed into their agents, as a message from the phone is (paste, a pause, then Enter): tried
-    until delivered, for an hour; meanwhile the laptop kept awake for those that asked."""
+    until delivered, for an hour; meanwhile the laptop kept from sleeping for those that asked (only sleep: an idle inhibitor would also stop
+    the screen from locking itself)."""
     loop = asyncio.get_running_loop()
     awake: list = [None]  # the sleep inhibitor, while one is wanted
     while True:
@@ -3493,7 +3494,7 @@ async def deliver_reminders(app: web.Application) -> None:
             until = reminders.keep_awake_until()
             if until > time.time() and awake[0] is None:
                 awake[0] = await asyncio.create_subprocess_exec(
-                    "systemd-inhibit", "--what=sleep:idle", "--who=Henchline", "--why=A scheduled message is due",
+                    "systemd-inhibit", "--what=sleep", "--who=Henchline", "--why=A scheduled message is due",
                     "--mode=block", "sleep", "infinity", stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                 log(HANDSFREE_LOG, "keeping the laptop awake for a scheduled message")
             elif until <= time.time() and awake[0] is not None:
