@@ -248,6 +248,10 @@ PYEOF
       vsix="$(mktemp --suffix=.vsix)"
       python3 "$root/cursor-bridge/pack.py" "$vsix" && cursor --install-extension "$vsix" >/dev/null 2>&1 \
         && say "Cursor: Henchline bridge extension installed (each chat its own on the phone)"
+      # Its reload helper: a first install starts in open windows without a reload, so Henchline can reload a
+      # window still running an older bridge (only while nothing in it is working) instead of asking you to
+      python3 "$root/cursor-bridge/pack.py" "$vsix" reload && cursor --install-extension "$vsix" >/dev/null 2>&1 \
+        && say "Cursor: Henchline reload helper installed (loads a newer bridge when a window is idle)"
       rm -f "$vsix"
       # Cursor's debugging port (localhost): Henchline types into an IDE chat by its id and sends it with a real
       # Enter there, with no keys on the desktop, even with the screen locked. Cursor's own launcher, with the

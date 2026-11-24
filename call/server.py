@@ -595,12 +595,13 @@ async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None,
         session = message.get("session", "")
         sent, note = await asyncio.get_running_loop().run_in_executor(
             None, typed, words, session, bool(message.get("urgent")))
-        if note:
+        if note and not sent:
             return json.dumps({"note": note, "unsent": message.get("id", "")})
+        told = {"note": note} if note else {}  # typed, with something to know about it: shown under it
         if sent and watch_pickup(message.get("id", ""), session, words):  # one tick until the agent takes it in
-            return json.dumps({"queued": message.get("id", ""), "session": session})
+            return json.dumps({"queued": message.get("id", ""), "session": session, **told})
         if sent:  # typed into the agent: the phone's two ticks, in the chat it was typed in
-            return json.dumps({"delivered": message.get("id", ""), "session": session})
+            return json.dumps({"delivered": message.get("id", ""), "session": session, **told})
         return ""
     return ""
 
@@ -778,12 +779,13 @@ def typed(words: str, session: str, urgent: bool = False) -> tuple[bool, str]:
         routing.route(words, None)
         return False, ""
     got, note = to_agent(words, session, Heard.TYPED, urgent=urgent)
-    return bool(got), note
+    return bool(got), note  # typed with a note: it may not have arrived whole (to_agent)
 
 
 def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent: bool = False,
              sender: str | None = None, ear: Ears = Ears.LAPTOP, said_at: float | None = None) -> tuple[str, str]:
-    """Words for the agent whose chat the phone shows: (who got them, "") or ("", a note why nobody did).
+    """Words for the agent whose chat the phone shows: (who got them, "") or ("", a note why nobody did). Typed,
+    but with something the user should still know (a Cursor terminal's bridge that never confirmed): (who, that note).
 
     Another agent may have spoken since the phone last heard who is current: the chat shown wins, so the words
     go to exactly that session (typed to it by name, never to whoever is last by then), or nowhere, with a note.
@@ -807,7 +809,7 @@ def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent
     if not delivery:
         return "", "Not sent: " + (delivery.why or f"{own_name()} couldn't type it into the agent.")
     got = target or last_speaker()
-    return (got.spoken() if got else "your agent"), ""
+    return (got.spoken() if got else "your agent"), getattr(delivery, "why", "")
 
 
 SIGNED_ORIGIN = ""   # with --api-v1: this host's own address (host.json), for requests a paired phone signed
@@ -1007,7 +1009,8 @@ async def texted(request: web.Request) -> web.Response:
             answer.set_exception(done.exception())
             return
         got, why = done.result()
-        answer.set_result({"to": got, "queued": watch_pickup(mid, session, words)} if got else {"note": why})
+        answer.set_result({"to": got, "queued": watch_pickup(mid, session, words), **({"note": why} if why else {})}
+                          if got else {"note": why})
 
     typing.add_done_callback(typed)
     return web.json_response(await asyncio.shield(answer))
@@ -1093,7 +1096,8 @@ def late_words(turn: PhoneTurn) -> dict:
     if not words:
         return {"taken": turn.id}
     got, note = to_agent(words, turn.session, turn.heard, switch=False, ear=Ears.PHONE, said_at=turn.said_at)
-    return {"delivered": turn.id, "to": got} if got else {"note": note, "unsent": turn.id}
+    return {"delivered": turn.id, "to": got, **({"note": note} if note else {})} if got else \
+        {"note": note, "unsent": turn.id}
 
 
 # Seconds earlier than the laptop's last kept turn ended (as counted in the phone's audio) that the phone is told to

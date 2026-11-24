@@ -64,6 +64,12 @@ class Routes(AioHTTPTestCase):
             self.assertEqual(await answer.json(), {"to": "Claude", "queued": False})
             to_agent.assert_called_once_with("hi there", "claude-1", server.Heard.TEXTED, False, False)
 
+    async def test_a_text_typed_but_unconfirmed_carries_its_note(self):
+        note = "I may have typed that: Cursor's window “ws” got the words but didn't say. Check before sending it again."
+        with mock.patch.object(server, "to_agent", return_value=("Claude", note)):
+            answer = await self.client.post("/text", json={"text": "hi", "session": "claude-1"}, headers=self.origin())
+            self.assertEqual(await answer.json(), {"to": "Claude", "queued": False, "note": note})
+
     async def test_a_share_off_a_call_without_an_agent_is_refused(self):
         with mock.patch.object(server, "in_call", return_value=False), mock.patch.object(server, "to_agent") as to_agent:
             answer = await self.client.post("/share/tell", json={"text": "a link", "session": ""}, headers=self.origin())

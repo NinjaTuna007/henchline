@@ -302,7 +302,7 @@ class HostChatActivity : Activity() {
                     }
                     EventLook.MINE -> {
                         val text = e.optJSONObject("content")?.optString("text") ?: ""
-                        events.addView(bubble(text, if (e.optString("state") == "delivered") "✓ delivered" else "not delivered: ${e.optString("note")}"), at)
+                        events.addView(bubble(text, ChatEvents.mineStatus(e)), at)
                         onHost += e.optString("client_message_id")
                     }
                     // What was said on a call, as the computer kept it: drawn as the live lines are, in its place; the

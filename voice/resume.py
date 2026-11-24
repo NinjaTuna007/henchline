@@ -102,7 +102,8 @@ def folder_of(agent: str, chat: str) -> Path | None:
 
 
 def tab_of(environ: bytes):
-    """The terminal that process is in, from its own environment. Empty when it names neither tmux nor Konsole."""
+    """The terminal that process is in, from its own environment. Empty when it names neither tmux nor Konsole.
+    (A Cursor terminal isn't named by the environment: find_running finds it from the process tree.)"""
     from voice.desktop import Tab
     env = marked(environ)
     pane = env.get("TMUX_PANE", "")
@@ -171,6 +172,8 @@ def find_running(agent: str, chat: str) -> list:
             tab = Tab()
         if not tab:
             tab = _tmux_pane(pid)
+        if not tab:
+            tab = _cursor_terminal(pid)
         hits.append((pid, tab))
     return hits
 
@@ -182,6 +185,16 @@ def runs_in(tab, pid: int) -> bool:
         return desktop().terminals.agent_pid(tab) == pid
     except Exception:  # noqa: BLE001 - unknown is not the same
         return False
+
+
+def _cursor_terminal(pid: int):
+    """The Cursor terminal whose agent in front is `pid` (voice/desktop/cursor_term.py); empty when it isn't in one."""
+    from voice.desktop import Tab
+    from voice.desktop.cursor_term import tab_for
+    try:
+        return tab_for(pid)
+    except Exception:  # noqa: BLE001 - unknown is not a terminal
+        return Tab()
 
 
 def _tmux_pane(pid: int):

@@ -1,0 +1,12 @@
+{
+  "name": "henchline-cursor-reload",
+  "displayName": "Henchline reload helper",
+  "description": "Lets Henchline see which Cursor window holds a terminal and reload that window to load a newer Henchline bridge, only when nothing in it is working.",
+  "version": "0.1.0",
+  "publisher": "henchline",
+  "license": "MIT",
+  "engines": { "vscode": "^1.80.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {}
+}

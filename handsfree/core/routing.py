@@ -2,8 +2,8 @@
 
 Replies go to the agent that spoke last (talkback records it). Fixed phrases
 switch to another agent; there is no language model in the loop, by choice.
-Delivery types into the agent's Konsole tab, or into the Cursor editor's
-chat for an agent that lives there.
+Delivery types into the agent's tmux pane, Konsole tab or Cursor terminal, or
+into the Cursor editor's chat for an agent that lives there.
 """
 
 from __future__ import annotations
@@ -849,7 +849,9 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
     again = urgent and speaker.agent == "cursor" and not speaker.in_editor  # Cut in: Enter again. Let it wait: one Enter, so it queues
     if speaker.agent == "cursor" and not speaker.in_editor:
         from voice import cursor_cli
-        cursor_cli.clear_picker(tab.address)  # a leftover `/model` would swallow this message into its filter
+        from voice.desktop import tmux
+        if tab.owner == tmux.OWNER:  # its screen is read only there
+            cursor_cli.clear_picker(tab.address)  # a leftover `/model` would swallow this message into its filter
         if not command:
             message = cursor_cli.disarm(message)
     taken = None
@@ -868,12 +870,17 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
     # A child's successful type and its correction journal line share the close lock. Ending either sees and
     # reports these words, or closes first and makes type_line fail: there is no accepted-but-unreported gap.
     with chains.delivery_guard(speaker.session, tab.address, speaker.pid) as remember:
-        # Only tmux's typing takes "again" (other terminals' type_line has just the words)
+        # tmux, Konsole and a Cursor terminal steer with "again"; a plain X11 terminal types just the words
         typed = terminals.type_line(tab, message, again=again, taken=taken) if again else terminals.type_line(tab, message)
         if typed and remember:
             remember(text)
+    from voice.desktop import cursor_term
     if not typed:
         log(HANDSFREE_LOG, f"typing into {tab.address} failed")
+        if tab.owner == cursor_term.OWNER and (why := cursor_term.why_not(tab)):
+            # Its bridge said why (an older bridge in a window that is working, another program in front, …)
+            log(HANDSFREE_LOG, f"Cursor terminal {tab.address}: {why}")
+            return refuse(Refusal.BRIDGE_SAID, f"I didn't type that into the Cursor terminal: {why}.", quiet)
         return refuse(Refusal.TERMINAL_GONE, "I heard you, but that terminal is gone.", quiet)
     log(HANDSFREE_LOG, f"sent to {speaker.agent} {tab.address}" + (" (enter until the queue is clear)" if again else ""))
     if not report:
@@ -881,6 +888,13 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
     if not command:
         introduced(speaker, heard)
         told_on_call(speaker, heard)
+    if tab.owner == cursor_term.OWNER and (unsure := cursor_term.why_not(tab)):
+        # The bridge got the words but never answered: they may be in, so not sent again, and the user told so
+        log(HANDSFREE_LOG, f"Cursor terminal {tab.address}: {unsure}")
+        note = f"I may have typed that: {unsure}. Check before sending it again."
+        if not quiet and not (AWAY.exists() and not in_call()):
+            say(note)
+        return Delivery.done(note)
     return Delivery.done()
 
 

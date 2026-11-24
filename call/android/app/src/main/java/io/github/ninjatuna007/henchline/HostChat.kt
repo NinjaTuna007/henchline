@@ -62,6 +62,12 @@ object ChatEvents {
 
     const val CLOCK_GRACE = 120_000L
 
+    /** The line under one of your messages: delivered (with what the computer still says about it, when it may
+     *  not have arrived whole), or why not. */
+    fun mineStatus(e: JSONObject): String =
+        if (e.optString("state") == "delivered") "✓ delivered" + e.optString("note").let { if (it.isEmpty()) "" else " · $it" }
+        else "not delivered: ${e.optString("note")}"
+
     /** A call line's identity among the ones told live (CallService.HostLines): the same words from the same speaker,
      *  so the kept copy replaces the live one rather than showing twice. */
     fun callKey(from: String, text: String) = from.lowercase() + "\u0000" + text

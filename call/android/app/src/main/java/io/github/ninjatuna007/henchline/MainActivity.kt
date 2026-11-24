@@ -794,7 +794,11 @@ class MainActivity : Activity() {
                 showCallState()
                 showMode(lastMode)
             }
-            status.has("delivered") -> tick(status.getString("delivered"), "delivered")  // in place: no jump
+            status.has("delivered") -> {
+                tick(status.getString("delivered"), "delivered")  // in place: no jump
+                // Typed, with something still to know (it may not have arrived whole): under it, as a note
+                status.optString("note").takeIf { it.isNotEmpty() }?.let { say("", it, note = true) }
+            }
             status.has("reload") -> { showHistory(); if (listScreen.visibility == View.VISIBLE) showCrew() }  // a share or a file kept in a chat
             status.has("talking") ->  // the earbuds or the notification started or ended a turn
                 android.widget.Toast.makeText(this, if (status.getBoolean("talking")) "Talking: tap again to send" else "Sent",
@@ -1381,6 +1385,8 @@ class MainActivity : Activity() {
                     val now = Chats.setStatus(this, to, id, "delivered")
                     main.post { tick(id, now) }  // in place: no redraw under you
                 }
+                // Typed, but with something to know about it (it may not have arrived whole): a note under it
+                if (note.isEmpty() && sent.told.isNotEmpty()) main.post { say("", sent.told, note = true) }
                 if (note.isNotEmpty()) main.post {
                     bubble.alpha = 0.5f
                     bubble.paintFlags = bubble.paintFlags or Paint.STRIKE_THRU_TEXT_FLAG

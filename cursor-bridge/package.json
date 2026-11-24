@@ -1,8 +1,8 @@
 {
   "name": "henchline-cursor-bridge",
   "displayName": "Henchline bridge",
-  "description": "Lets Henchline open a Cursor chat by its id before typing into it, so a phone message reaches the right chat.",
-  "version": "0.1.15",
+  "description": "Lets Henchline open a Cursor chat by its id before typing into it, and type into an agent running in a Cursor terminal, so a phone message reaches the right agent.",
+  "version": "0.2.0",
   "publisher": "henchline",
   "license": "MIT",
   "engines": { "vscode": "^1.80.0" },

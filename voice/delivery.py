@@ -57,8 +57,9 @@ class Delivery:
         return self.ok
 
     @classmethod
-    def done(cls) -> Delivery:
-        return cls(True)
+    def done(cls, note: str = "") -> Delivery:
+        """Typed. note: something the user should still hear about it (it may not have arrived whole)."""
+        return cls(True, note)
 
     @classmethod
     def refused(cls, refusal: Refusal, why: str = "") -> Delivery:

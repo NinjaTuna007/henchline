@@ -462,7 +462,7 @@ async def send_message(request: web.Request, api: Api, signed_request: SignedReq
     now = time.time()
     event = {"client_message_id": client_message_id, "state": "delivered" if got else "failed",
              "content": {"type": "text", "text": text}, "created_at": rfc3339(now),
-             **({"delivered_to": got} if got else {"note": why})}
+             **({"delivered_to": got, **({"note": why} if why else {})} if got else {"note": why})}
     event_id = await asyncio.get_running_loop().run_in_executor(
         None, lambda: api.store.append_event(session_id, "message", json.dumps(event).encode(), now=now))
     return ok(signed_request, {"host_id": api.config.host_id, "session_id": session_id, "event_id": event_id,

@@ -2,7 +2,8 @@
 
 Every window, key, clipboard and terminal call goes through a Desktop. There
 are two: any X11 desktop (voice/desktop/generic_x11.py) and KDE on X11, which adds
-Klipper and Konsole (voice/desktop/kde_x11.py); current() picks one by kde_session().
+Klipper and Konsole (voice/desktop/kde_x11.py); current() picks one by kde_session(). Agents in tmux
+(voice/desktop/tmux.py) and in Cursor's terminal panel (voice/desktop/cursor_term.py) work on either.
 Another desktop, or Wayland, is one new module that fills in these methods.
 """
 
@@ -177,6 +178,7 @@ def current() -> Desktop:
     """KDE when it is running (Klipper, Konsole), any other X11 desktop otherwise."""
     if os.environ.get("XDG_SESSION_TYPE") == "wayland":
         raise NotImplementedError("Wayland is not supported yet: log in to the X11 session (see the README)")
+    from voice.desktop.cursor_term import CursorTerminals
     from voice.desktop.tmux import WithTmux
 
     if kde_session():
@@ -187,5 +189,7 @@ def current() -> Desktop:
         from voice.desktop.generic_x11 import GenericX11
 
         found = GenericX11()
-    found.terminals = WithTmux(found.terminals)  # tmux panes on any desktop (voice/desktop/tmux.py)
+    # tmux panes on any desktop (voice/desktop/tmux.py), even inside a Cursor terminal; then Cursor's terminal panel
+    # (voice/desktop/cursor_term.py), asked before the desktop's own: its inherited Konsole variables never win
+    found.terminals = WithTmux(CursorTerminals(found.terminals))
     return found

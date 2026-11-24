@@ -1,4 +1,5 @@
-"""Packs the bridge as a .vsix (a zip with a manifest) without needing Node's vsce: `python3 pack.py OUT.vsix`."""
+"""Packs the bridge as a .vsix (a zip with a manifest) without needing Node's vsce: `python3 pack.py OUT.vsix`.
+`python3 pack.py OUT.vsix reload` packs the reload helper (cursor-bridge/reload/) instead."""
 
 import json
 import sys
@@ -6,6 +7,8 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if len(sys.argv) > 2:
+    HERE = HERE / sys.argv[2]
 meta = json.loads((HERE / "package.json").read_text())
 manifest = f"""<?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
@@ -34,4 +37,5 @@ with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as vsix:
     vsix.writestr("[Content_Types].xml", types)
     vsix.writestr("extension.vsixmanifest", manifest)
     for name in ("package.json", "extension.js", "README.md"):
-        vsix.write(HERE / name, f"extension/{name}")
+        if (HERE / name).exists():
+            vsix.write(HERE / name, f"extension/{name}")

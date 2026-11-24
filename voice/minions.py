@@ -183,9 +183,24 @@ def _reports_reach(boss: Speaker) -> bool:
     return bool(running) and running == mine.pid == record.pid  # delivery types only to the record's own process
 
 
-UNREACHABLE = ("warning: Henchline can't confirm which terminal you are in (for example an agent inside an "
-               "editor's terminal), so this helper's reports may not reach you. Run in tmux or Konsole directly "
-               "for them to arrive.")
+def _old_bridge(boss: Speaker) -> bool:
+    """The boss is in a Cursor terminal whose window's bridge can't type yet (it is older, and is reloaded first)."""
+    from voice.desktop import cursor_term
+    record = _boss(boss.session) or boss
+    if record.tab.owner != cursor_term.OWNER:
+        return False
+    try:
+        note, _, _ = cursor_term.owner(record.tab)
+    except Exception:  # noqa: BLE001 - unknown: no note
+        return False
+    return note is None
+
+
+UNREACHABLE = ("warning: Henchline can't confirm which terminal you are in, so this helper's reports may not "
+               "reach you. Run in tmux, Konsole or a Cursor terminal directly for them to arrive.")
+# A boss in a Cursor terminal is confirmed, but its reports are typed by the Henchline bridge in that window
+OLD_BRIDGE = ("note: your Cursor window runs an older Henchline bridge. Reports reload that window to load the new "
+              "one, but only while nothing in it is working; until then they wait.")
 
 
 def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder: str, ask: str,
@@ -212,6 +227,8 @@ def _launch(chain: str, slot: str, boss: Speaker, depth: int, agent: str, folder
         return 1
     if not _reports_reach(boss):  # still started: the helper's work stands, only its reports may be refused
         print(UNREACHABLE)
+    elif _old_bridge(boss):
+        print(OLD_BRIDGE)
     tab = tmux.start(agent, match, flags=flags)
     if not tab:
         print(f"{agent} didn't start")
@@ -345,7 +362,8 @@ def report(args: list[str], caller) -> int:
     if chain:
         chains.append(chain, "report", session=child.session, text=words, exact=True)
     chains.mark_reported(child.session, prior)
-    print("reported")
+    note = getattr(delivery, "why", "")  # typed, but not confirmed (a Cursor terminal's bridge that didn't answer)
+    print("reported" + (f" ({note})" if note else ""))
     return 0
 
 

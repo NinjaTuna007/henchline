@@ -48,23 +48,54 @@ def pid_alive(pid: object) -> bool:
     return isinstance(pid, int) and pid > 0 and Path(f"/proc/{pid}").exists()
 
 
-def windows_of(project: str) -> list[tuple[Path, dict]]:
-    """The Cursor windows (their bridge note, and what it says) whose workspace folder is that project.
-    A note whose process is gone is removed: after a reboot it otherwise looks like a second window, and a chat
-    then opens in neither."""
+def live_notes() -> list[tuple[Path, dict]]:
+    """Every Cursor window's bridge note (its path, and what it says) whose window still runs. A note whose
+    process is gone is removed: after a reboot it otherwise looks like a second window, and a chat then opens in
+    neither."""
     found = []
     for note in DIR.glob("*.json"):
         try:
             window = json.loads(note.read_text())
         except (OSError, ValueError):
             continue
+        if not isinstance(window, dict):
+            continue
         if not pid_alive(window.get("pid")):
             note.unlink(missing_ok=True)
             note.with_suffix(".sock").unlink(missing_ok=True)
+            note.with_suffix(".reload").unlink(missing_ok=True)
             continue
-        if project in {project_of(f) for f in window.get("folders", []) if isinstance(f, str)}:
-            found.append((note, window))
+        found.append((note, window))
     return found
+
+
+def windows_of(project: str) -> list[tuple[Path, dict]]:
+    """The Cursor windows (their bridge note, and what it says) whose workspace folder is that project."""
+    return [(note, window) for note, window in live_notes()
+            if project in {project_of(f) for f in window.get("folders", []) if isinstance(f, str)}]
+
+
+def ask_note(note: Path, request: dict, socket_path: Path | None = None, wait: float = 5.0) -> dict | None:
+    """One request to one Cursor window's bridge (its note's socket, or `socket_path`) and its one-line answer;
+    None when it couldn't be reached. Sent, but no readable answer: {"ok": False, "unknown": True} (it may have
+    been done)."""
+    sent = False
+    try:
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(wait)
+            conn.connect(str(socket_path or note.with_suffix(".sock")))
+            conn.sendall(json.dumps(request).encode() + b"\n")
+            sent = True
+            answer = b""
+            while b"\n" not in answer and len(answer) < 65536:  # the whole answer line, however it arrives
+                part = conn.recv(65536)
+                if not part:
+                    break
+                answer += part
+        said = json.loads(answer.decode() or "{}")
+    except (OSError, ValueError):
+        return {"ok": False, "unknown": True} if sent else None
+    return said if isinstance(said, dict) and said else {"ok": False, "unknown": True}
 
 
 def ask_window(chat: str, request: dict) -> Delivery:
@@ -76,19 +107,8 @@ def ask_window(chat: str, request: dict) -> Delivery:
     owners = [note for note, _ in windows_of(project)]
     if len(owners) != 1:  # none, or two windows on that project: which has the chat can't be told, so neither
         return Delivery.refused(Refusal.NO_WINDOW if not owners else Refusal.TWO_WINDOWS)
-    try:
-        with socket.socket(socket.AF_UNIX) as conn:
-            conn.settimeout(5)
-            conn.connect(str(owners[0].with_suffix(".sock")))
-            conn.sendall(json.dumps(request).encode() + b"\n")
-            answer = b""
-            while b"\n" not in answer and len(answer) < 4096:  # the whole answer line, however it arrives
-                part = conn.recv(4096)
-                if not part:
-                    break
-                answer += part
-        said = json.loads(answer.decode() or "{}")
-    except (OSError, ValueError):
+    said = ask_note(owners[0], request)
+    if said is None:
         return Delivery.refused(Refusal.NO_ANSWER, "")
     if said.get("ok"):
         return Delivery.done()

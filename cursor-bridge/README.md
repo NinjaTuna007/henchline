@@ -10,8 +10,15 @@ its own chat on the phone: named by Cursor's own title, and what you text, recor
 ```
 
 No Node tools are needed (`pack.py` makes the `.vsix`). A Cursor window picks up a first install without a reload;
-after an update, run **Developer: Reload Window** (Ctrl+Shift+P) when no chat is in the middle of work (restarting
-the extension host alone keeps the old version).
+after an update, a window keeps the old version until it is reloaded (restarting the extension host alone keeps
+it). Henchline reloads it itself when it needs the new one, through a second, tiny extension installed with it
+(`reload/`, the reload helper: a first install, so it runs in open windows at once; it also lists its window's
+terminals, so the window holding one is known even under the older bridge). It reloads in the background, and only
+while nothing in that window is working: its terminals survive a reload (Cursor's persistent sessions, read from
+every settings file that can set them), Cursor's debugging port shows no chat generating, no chat was written to
+in the last minute, and no agent in that Cursor's terminals is in the middle of a turn (by its own log). Unsure
+counts as working; then the message is refused with the reason, and the next one checks again. You can always run
+**Developer: Reload Window** (Ctrl+Shift+P) yourself.
 
 ## How it works
 
@@ -20,8 +27,8 @@ the extension host alone keeps the old version).
   `state.vscdb`), so several chats in one window are told apart.
 - Each Cursor window runs the extension, which listens on a private socket in
   `~/.local/state/ptt/cursor-bridge/` (folder 0700, socket 0600) and accepts a few requests about one chat by
-  its id: open it (Cursor's `composer.openComposer`), stop it, and set its model (below). No text and no other
-  command.
+  its id: open it (Cursor's `composer.openComposer`), stop it, and set its model (below). No text reaches a chat
+  through it, and no other command runs (text goes only to an agent in one of its terminals, below).
 - Cursor says yes to any id, so Henchline picks the window itself: the one whose workspace folder is the project
   holding that chat's transcript (`~/.cursor/projects/<project>/agent-transcripts/<id>`). No such window, or two:
   nothing is typed, and the phone says why.
@@ -47,6 +54,27 @@ the extension host alone keeps the old version).
   focuses that chat's box on the page and checks it holds focus, then asks with `"focused": true`, so a chat in
   any pane works; focus stays in that box afterwards. Without the port, only the chat Cursor lists last is
   accepted.
+
+## Agents in a Cursor terminal
+
+Claude, Codex or the Cursor CLI started in Cursor's own terminal panel has no tmux pane or Konsole tab, so the
+bridge (0.2.0 and later) types into it instead:
+
+- Henchline knows the terminal by its top process (its shell, with its start time, so a reused pid never matches)
+  and finds the agent in front of it from the process tree. Which window shows it is asked each time:
+  `{"terminals": true}` lists a window's own terminals, and exactly one window must list it.
+- `{"type": {shell, shell_born, front, front_born, agent, agent_born, text, enter}}` writes the words into that
+  terminal as one bracketed paste (control characters taken out, here too), then Enter. Right before each write,
+  the bridge checks in `/proc` that the program in front of that terminal and the agent (itself, or its child) are
+  still the ones Henchline named (pids and start times), and that nothing else in that process group reads the
+  terminal (an editor the agent opened). A shell or any other program in front: nothing is written. Requests for
+  one terminal run one at a time.
+- The paste brackets are always sent. tmux sends them only when the program in front asked for bracketed paste;
+  Claude, Codex and the Cursor CLI are expected to ask, but a program that hasn't would show `[200~` around the
+  words. `{"escape"}` (the phone's stop)
+  and `{"enter"}` (the Cursor CLI's "send now") take the same check.
+- No screen is read back: whether the words arrived is read from the agent's own log, as the phone's ticks are.
+  Switching a model there, and reading its plan or its screen, work only in tmux.
 
 ## Limits
 

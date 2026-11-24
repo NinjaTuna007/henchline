@@ -1086,7 +1086,7 @@ class HelperNames(unittest.TestCase):
         (result,), start = self.deploy_all("docs", agent_pid=4444)
         self.assertEqual(result[0], 0)
         self.assertIn("can't confirm which terminal you are in", result[1])
-        self.assertIn("Run in tmux or Konsole directly", result[1])
+        self.assertIn("Run in tmux, Konsole or a Cursor terminal directly", result[1])
         start.assert_called_once()
 
     def test_an_editor_boss_is_reachable_and_one_with_no_tab_is_not(self):

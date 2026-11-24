@@ -106,7 +106,13 @@ object Messages {
      *  urgent: the held send button: the agent's work is interrupted so it gets the words now. */
     /** How a text went: why not (""), whether it waits in the agent's queue, whether the laptop couldn't be reached
      *  at all (then it waits in the Outbox, with a clock). */
-    data class Sent(val note: String, val queued: Boolean, val offline: Boolean = false)
+    data class Sent(val note: String, val queued: Boolean, val offline: Boolean = false, val told: String = "")
+
+    /** The laptop's answer to a text: typed ({"to"}), with something still to know about it ({"note"} beside "to":
+     *  it may not have arrived whole), or not (its "note" says why). */
+    fun sentFrom(body: JSONObject, code: Int, computer: String): Sent =
+        if (body.has("to")) Sent("", body.optBoolean("queued"), told = body.optString("note"))
+        else Sent(body.optString("note", "$computer said $code"), false)
 
     fun text(context: Context, session: String, words: String, id: String = "", urgent: Boolean = false,
              quick: Boolean = false): Sent = try {
@@ -117,8 +123,7 @@ object Messages {
             .post(JSONObject().put("text", words).put("session", session).put("id", id).put("urgent", urgent).toString()
                 .toRequestBody("application/json".toMediaType())).build()).execute().use { answer ->
             val body = try { JSONObject(answer.body?.string() ?: "") } catch (_: Exception) { JSONObject() }
-            if (body.has("to")) Sent("", body.optBoolean("queued"))
-            else Sent(body.optString("note", "${HostPush.computerName(context)} said ${answer.code}"), false)
+            sentFrom(body, answer.code, HostPush.computerName(context))
         }
     } catch (e: Exception) {
         Sent("Not sent: ${e.message ?: "${HostPush.computerName(context)} couldn't be reached"} (is Tailscale on?)", false, offline = true)
@@ -190,7 +195,12 @@ object Messages {
             // laptop away: a clock, and the Outbox sends it once it can
             if (sent.offline) Outbox.add(context, id, session, words)
             Chats.add(context, session, JSONObject().put("from", "you").put("mine", true).put("id", id)
-                .put("text", if (sent.note.isEmpty() || sent.offline) words else "$words  (${sent.note})")
+                .put("text", when {
+                    sent.offline -> words
+                    sent.note.isNotEmpty() -> "$words  (${sent.note})"
+                    sent.told.isNotEmpty() -> "$words  (${sent.told})"
+                    else -> words
+                })
                 .put("status", when { sent.offline -> "waiting"; sent.note.isEmpty() && !sent.queued -> "delivered"; else -> "sent" }))
             post(context, agent, session, sending = true)
         }

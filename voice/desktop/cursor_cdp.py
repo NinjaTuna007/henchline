@@ -126,6 +126,27 @@ def chat_status(where: str, chat: str) -> str:
         return ""
 
 
+def generating(where: str) -> bool | None:
+    """Is any chat on that window's page working now (its part of the page says "generating")? None when the
+    page can't be asked: the port is closed, or no page has that title."""
+    url = page_of(where) if where else ""
+    if not url:
+        return None
+
+    async def ask() -> bool | None:
+        import aiohttp
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.ws_connect(url, max_msg_size=0) as ws:
+                found = await _Page(ws).js(
+                    "document.querySelectorAll('[data-composer-status=\"generating\"]').length")
+                return found > 0 if isinstance(found, int) else None
+    try:
+        return asyncio.run(asyncio.wait_for(ask(), 10))
+    except Exception:
+        return None
+
+
 def same_words(a: str, b: str) -> bool:
     """Equal but for whitespace: the box reads back paragraphs as blank lines and may hold non-breaking spaces."""
     return " ".join(a.split()) == " ".join(b.split())

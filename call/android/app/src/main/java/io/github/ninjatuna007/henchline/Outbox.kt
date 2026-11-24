@@ -104,6 +104,7 @@ object Outbox {
             val sent = Messages.text(context, session, words, id)
             if (sent.offline) return true  // still away: the rest wait their turn behind it
             if (sent.note.isEmpty()) {
+                if (sent.told.isNotEmpty()) Chats.setText(context, session, id, "$words  (${sent.told})")
                 Chats.setStatus(context, session, id, if (sent.queued) "sent" else "delivered")
             } else {
                 Chats.setText(context, session, id, "$words  (${sent.note})")
