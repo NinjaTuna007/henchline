@@ -1890,15 +1890,19 @@ async def chat_minion_decide(request: web.Request) -> web.Response:
 
 
 async def chat_plan(request: web.Request) -> web.Response:
-    """The plan for the agent whose chat the phone shows: its steps and how many are done. {"note"} when it has none."""
+    """The plan for the agent whose chat the phone shows: its steps and how many are done, the one it touched last,
+    or ?plan= when that is one of this chat's own plans; "plans" lists them all. {"note"} when it has none."""
     trusted(request)
     session = request.query.get("session", "")
+    choice = request.query.get("plan", "")
     target = next((s for s in recent_speakers() if s.session == session), None)
     if target is None:
         return web.json_response({"note": f"That agent isn't known to {own_name()}."}, status=404)
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, project_of, target)
-    plan = await loop.run_in_executor(None, plans.of_session, session, project)
+    plan = await loop.run_in_executor(None, plans.of_session, session, project, choice or None)
+    if plan is None and choice:
+        return web.json_response({"note": "That plan isn't one of this chat's."}, status=404)
     if plan is None:
         return web.json_response({"note": "This chat has no plan."})
     return web.json_response(plan)
@@ -1908,7 +1912,9 @@ async def chat_plan_build(request: web.Request) -> web.Response:
     """The user approved the plan: the agent is told to build it and to keep the document updated."""
     trusted(request)
     try:
-        session = str((await request.json()).get("session", ""))
+        body = await request.json()
+        session = str(body.get("session", ""))
+        choice = str(body.get("plan") or "")  # the plan the phone shows, when it is one of this chat's own
     except (ValueError, AttributeError):
         raise web.HTTPBadRequest(text="expected JSON")
     target = next((s for s in recent_speakers() if s.session == session), None)
@@ -1916,7 +1922,9 @@ async def chat_plan_build(request: web.Request) -> web.Response:
         return web.json_response({"note": f"That agent isn't known to {own_name()}."}, status=404)
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, project_of, target)
-    plan = await loop.run_in_executor(None, plans.of_session, session, project)
+    plan = await loop.run_in_executor(None, plans.of_session, session, project, choice or None)
+    if plan is None and choice:
+        return web.json_response({"note": "That plan isn't one of this chat's."}, status=404)
     if plan is None:
         return web.json_response({"note": "This chat has no plan."}, status=404)
     got, why = await loop.run_in_executor(None, to_agent, plans.approval(plan), session, Heard.TEXTED, False)

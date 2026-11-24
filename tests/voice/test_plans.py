@@ -160,5 +160,131 @@ flowchart LR
         self.assertIsNone(got)
 
 
+def _plan(folder: Path, name: str, title: str) -> Path:
+    path = folder / name
+    path.write_text(f"---\nname: {title}\ntodos:\n  - id: a\n    content: one\n    status: completed\n"
+                    f"  - id: b\n    content: two\n    status: pending\n---\n")
+    return path
+
+
+def _editor_db(root: Path, chat: str, rows: list[Path], bubbles: list[tuple[str, dict]]) -> None:
+    """A fake Cursor editor database: the chat's plan rows, its conversation order, and its bubbles."""
+    import json
+    import sqlite3
+    import urllib.parse
+
+    path = root / ".config/Cursor/User/globalStorage/state.vscdb"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.execute("create table if not exists cursorDiskKV (key text unique on conflict replace, value blob)")
+    for plan in rows:
+        db.execute("insert into cursorDiskKV values (?, ?)",
+                   (f"ofsContent:{chat}:file://{urllib.parse.quote(str(plan))}", "x"))
+    headers = [{"bubbleId": bid, "type": 2} for bid, _ in bubbles]
+    db.execute("insert into cursorDiskKV values (?, ?)",
+               (f"composerData:{chat}", json.dumps({"fullConversationHeadersOnly": headers})))
+    for bid, value in bubbles:
+        db.execute("insert into cursorDiskKV values (?, ?)", (f"bubbleId:{chat}:{bid}", json.dumps(value)))
+    db.commit()
+    db.close()
+
+
+class SessionPlans(unittest.TestCase):
+    CHAT = "1e6e96a3-0000-4000-8000-000000000001"
+
+    def setUp(self):
+        plans._editor_cache.clear()
+        self.root = Path(tempfile.mkdtemp())
+        self.folder = self.root / ".cursor/plans"
+        self.folder.mkdir(parents=True)
+
+    def test_an_editor_chat_orders_its_plans_by_its_own_conversation(self):
+        import os
+        old = _plan(self.folder, "old_one.plan.md", "Old")
+        new = _plan(self.folder, "new one.plan.md", "New")
+        os.utime(new, (1, 1_000))  # file times say nothing: the old plan was saved last
+        os.utime(old, (1, 2_000))
+        import json
+        def tool(path):
+            return {"toolFormerData": {"params": json.dumps({"relativeWorkspacePath": str(path)})}}
+        _editor_db(self.root, self.CHAT, [new, old], [  # the rows' own order says old
+            ("b1", tool(old)), ("b2", tool(new)), ("b3", {"text": "edited"}),
+            # a later message with the old plan only as attached context, not a tool call on it
+            ("b4", {"context": {"fileSelections": {f"file://{old}": []}}}),
+        ])
+        got = plans.plans_for_session(f"cursor-{self.CHAT}", self.root)
+        self.assertEqual(got, [new, old])
+        self.assertEqual(plans.for_session(f"cursor-{self.CHAT}", self.root), new)
+
+    def test_a_later_tool_call_moves_a_plan_first(self):
+        import json
+        a = _plan(self.folder, "a.plan.md", "A")
+        b = _plan(self.folder, "b.plan.md", "B")
+        def tool(path):
+            return {"toolFormerData": {"params": json.dumps({"targetFile": str(path)})}}
+        _editor_db(self.root, self.CHAT, [a, b], [("x1", tool(b)), ("x2", tool(a)), ("x3", tool(b)), ("x4", tool(a))])
+        self.assertEqual(plans.plans_for_session(f"cursor-{self.CHAT}", self.root), [a, b])
+
+    def test_plans_never_named_follow_the_rows_and_missing_files_drop(self):
+        a = _plan(self.folder, "a.plan.md", "A")
+        b = _plan(self.folder, "b.plan.md", "B")
+        gone = self.folder / "gone.plan.md"
+        _editor_db(self.root, self.CHAT, [a, gone, b], [("x1", {"text": "nothing"})])
+        self.assertEqual(plans.plans_for_session(f"cursor-{self.CHAT}", self.root), [b, a])
+
+    def test_only_plan_files_count_and_same_names_do_not_tie(self):
+        import json
+        other = self.root / "elsewhere"
+        other.mkdir()
+        mine = _plan(self.folder, "same.plan.md", "Mine")
+        twin = _plan(other, "same.plan.md", "Twin")
+        slides = _plan(self.folder, "SLIDE_PLAN.md", "Slides")
+        upper = _plan(self.folder, "x.PLAN.MD", "Upper")
+
+        def tool(path):
+            return {"toolFormerData": {"params": json.dumps({"targetFile": str(path)})}}
+        _editor_db(self.root, self.CHAT, [twin, mine, slides, upper], [("x1", tool(twin)), ("x2", tool(mine))])
+        self.assertEqual(plans.plans_for_session(f"cursor-{self.CHAT}", self.root), [mine, twin])
+        plans._editor_cache.clear()
+        _editor_db(self.root, self.CHAT, [], [("x1", tool(twin)), ("x2", tool(mine)), ("x3", tool(twin))])  # twin last
+        self.assertEqual(plans.plans_for_session(f"cursor-{self.CHAT}", self.root), [twin, mine])
+
+    def test_an_unreadable_database_is_no_plan(self):
+        db = self.root / ".config/Cursor/User/globalStorage/state.vscdb"
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b"not a database")
+        self.assertEqual(plans.plans_for_session(f"cursor-{self.CHAT}", self.root), [])
+
+    def test_claude_lists_each_logged_plan_the_last_logged_first(self):
+        chat = "00000000-0000-4000-8000-0000000000aa"
+        first = _plan(self.root, "first.md", "First")
+        second = _plan(self.root, "second.md", "Second")
+        log = self.root / f".claude/projects/p/{chat}.jsonl"
+        log.parent.mkdir(parents=True)
+        log.write_text("\n".join(f'{{"planFilePath":"{p}"}}' for p in (first, second, first, self.root / "nope.md")))
+        self.assertEqual(plans.plans_for_session(f"claude-{chat}", self.root), [first, second])
+
+    def test_of_session_lists_the_plans_and_shows_only_its_own_on_request(self):
+        from unittest import mock
+
+        a = _plan(self.folder, "a.plan.md", "A")
+        b = _plan(self.folder, "b.plan.md", "B")
+        stranger = _plan(self.folder, "stranger.plan.md", "Stranger")
+        session = f"cursor-{self.CHAT}"
+        with mock.patch.object(plans, "plans_for_session", return_value=[a, b]):
+            latest = plans.of_session(session, None)
+            picked = plans.of_session(session, None, str(b))
+            refused = plans.of_session(session, None, str(stranger))
+            relative = plans.of_session(session, None, "../" + b.name)
+        self.assertEqual(latest["name"], "A")
+        self.assertEqual(latest["plans"], [{"file": str(a), "name": "A", "done": 1, "total": 2},
+                                           {"file": str(b), "name": "B", "done": 1, "total": 2}])
+        self.assertEqual(latest["session"], session)
+        self.assertEqual(picked["name"], "B")
+        self.assertEqual(picked["file"], str(b))
+        self.assertIsNone(refused)
+        self.assertIsNone(relative)
+
+
 if __name__ == "__main__":
     unittest.main()

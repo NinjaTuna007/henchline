@@ -211,33 +211,35 @@ def blocks(markdown: str, title: str = "") -> list[dict]:
 
 
 _PLAN_URI = re.compile(rb'"planUri"\s*:\s*"(file://[^"\\]+\.plan\.md)"')
-_plan_cache: dict[str, tuple[str, str]] = {}  # store path -> (latest blob, plan path)
+_plan_cache: dict[str, tuple[str, list[str]]] = {}  # store path -> (latest blob, plan paths, last touched first)
 
 
-def _plan_from_store(store: Path) -> Path | None:
-    """The plan this Cursor chat last created, from its own store (`planUri` on the plan tool's result)."""
+def _plans_from_store(store: Path) -> list[Path]:
+    """The plans this Cursor chat created, from its own store (`planUri` on the plan tool's result), the one it
+    touched last first: a plan is touched where its result blob, or a blob naming that result, comes in the chat."""
     import contextlib
+    import json
     import sqlite3
 
     try:
         with contextlib.closing(sqlite3.connect(f"file:{store}?mode=ro", uri=True, timeout=1)) as db:
             row = db.execute("select value from meta where key = '0'").fetchone()
             if not row:
-                return None
+                return []
             raw = row[0]
             if isinstance(raw, str) and re.fullmatch(r"[0-9a-f]+", raw):
                 raw = bytes.fromhex(raw).decode()
             elif isinstance(raw, bytes):
                 raw = raw.decode()
-            root_id = str(__import__("json").loads(raw).get("latestRootBlobId") or "")
+            root_id = str(json.loads(raw).get("latestRootBlobId") or "")
             cached = _plan_cache.get(str(store))
-            if cached and cached[0] == root_id and Path(cached[1]).is_file():
-                return Path(cached[1])
+            if cached and cached[0] == root_id:
+                return [Path(p) for p in cached[1] if Path(p).is_file()]
             blobs = {bid: data for bid, data in db.execute("select id, data from blobs")
                      if isinstance(data, (bytes, bytearray))}
             root = blobs.get(root_id)
             if not root:
-                return None
+                return []
             seen: set[str] = set()
             children: list[str] = []
             for i in range(len(root) - 32):
@@ -253,23 +255,20 @@ def _plan_from_store(store: Path) -> Path | None:
                 if found:
                     owners[bid] = found.group(1).decode()
             needles = [(bytes.fromhex(bid), uri) for bid, uri in owners.items()]
-            last = ""
-            for child in children:
+            touched: dict[str, int] = {}
+            for at, child in enumerate(children):
                 if child in owners:
-                    last = owners[child]
+                    touched[owners[child]] = at
                 blob = blobs.get(child, b"")
                 for needle, uri in needles:
                     if needle in blob:
-                        last = uri
-            if not last:
-                return None
-            path = Path(urllib.parse.unquote(last.removeprefix("file://")))
+                        touched[uri] = at
     except (OSError, sqlite3.Error, ValueError):
-        return None
-    if not path.is_file():
-        return None
-    _plan_cache[str(store)] = (root_id, str(path))
-    return path
+        return []
+    found = [str(Path(urllib.parse.unquote(uri.removeprefix("file://"))))
+             for uri in sorted(touched, key=lambda uri: -touched[uri])]
+    _plan_cache[str(store)] = (root_id, found)
+    return [Path(p) for p in found if Path(p).is_file()]
 
 
 def _cursor_store(home: Path, key: str) -> Path | None:
@@ -277,85 +276,176 @@ def _cursor_store(home: Path, key: str) -> Path | None:
     return found[0] if len(found) == 1 else None
 
 
+def plans_for_session(session: str, home: Path | None = None) -> list[Path]:
+    """Every plan file that chat itself wrote or opened, from the agent's own records (never guessed by name), the
+    one it touched last first: Claude logs planFilePath in its session log; Cursor links a chat to its plans in its
+    store, in the plan's opening comment, or (an editor chat) in Cursor's own database. (A plan path a transcript
+    merely mentions is not the chat's own: the CLI read another project's plan once.) File times don't order
+    them: two plans saved in the same minute are common."""
+    home = home or Path.home()
+    key = session.split("-", 1)[1] if "-" in session else ""
+    if session.startswith("claude-") and re.fullmatch(r"[0-9a-f-]{36}", key):
+        return _claude_plans(home, key)
+    if not session.startswith("cursor-") or not re.fullmatch(r"[0-9a-f-]{36}", key):
+        return []
+    # This chat's store records the plans it created (planUri): the plans it is on, not the newest files in the
+    # folder and not whichever file happens to mention the project.
+    found: list[Path] = []
+    store = _cursor_store(home, key)
+    for source in (lambda: _plans_from_store(store) if store is not None else [],
+                   lambda: _marked(home, key), lambda: _editor_plans(home, key)):
+        for path in source():
+            if path not in found:
+                found.append(path)
+    return found
+
+
 def for_session(session: str, home: Path | None = None) -> Path | None:
-    """The plan file that chat itself wrote or opened, from the agent's own records (never guessed by name):
-    Claude logs planFilePath in its session log; Cursor links an editor chat to its plan in its store. (A
-    plan path a transcript merely mentions is not the chat's own: the CLI read another project's plan once.)"""
+    """The plan that chat touched last (see plans_for_session)."""
+    found = plans_for_session(session, home)
+    return found[0] if found else None
+
+
+def _claude_plans(home: Path, key: str) -> list[Path]:
+    """Claude's planFilePath entries in its session log, the last one logged first."""
+    import json
+
+    for log in (home / ".claude/projects").glob(f"*/{key}.jsonl"):
+        try:
+            with log.open("rb") as f:
+                f.seek(max(0, log.stat().st_size - 8 * 1024 * 1024))
+                found = re.findall(rb'"planFilePath":"([^"]+)"', f.read())
+        except OSError:
+            continue
+        if not found:
+            continue
+        out: list[Path] = []
+        for raw in reversed(found):
+            try:
+                path = Path(json.loads(b'"' + raw + b'"'))  # a JSON string: its escapes undone
+            except ValueError:
+                continue
+            if path not in out and path.is_file():
+                out.append(path)
+        return out
+    return []
+
+
+_editor_cache: dict[str, tuple[tuple, list[str]]] = {}  # chat -> (what it was read from, plan paths)
+
+
+def _editor_plans(home: Path, key: str) -> list[Path]:
+    """A Cursor editor chat's plans (its ofsContent rows), the one its conversation touched last first. The
+    conversation's order is composerData's header list; a bubble whose tool call names a plan file touches it
+    (reading, editing, creating it), and any other mention counts only between plans no tool call touched. Plans it
+    never names follow, the newest row first. Read only; anything unreadable leaves the rows' own order."""
     import contextlib
     import json
     import sqlite3
 
-    home = home or Path.home()
-    key = session.split("-", 1)[1] if "-" in session else ""
-    if session.startswith("claude-") and re.fullmatch(r"[0-9a-f-]{36}", key):
-        for log in (home / ".claude/projects").glob(f"*/{key}.jsonl"):
-            try:
-                with log.open("rb") as f:
-                    f.seek(max(0, log.stat().st_size - 8 * 1024 * 1024))
-                    found = re.findall(rb'"planFilePath":"([^"]+)"', f.read())
-            except OSError:
-                continue
-            if found:
-                try:
-                    path = Path(json.loads(b'"' + found[-1] + b'"'))  # a JSON string: its escapes undone
-                except ValueError:
-                    continue
-                return path if path.is_file() else None
-        return None
-    if not session.startswith("cursor-") or not re.fullmatch(r"[0-9a-f-]{36}", key):
-        return None
-    # This chat's store records the plan it created (planUri). That is the plan it is on, not the newest
-    # file in the folder and not whichever file happens to mention the project.
-    store = _cursor_store(home, key)
-    if store is not None:
-        current = _plan_from_store(store)
-        if current is not None:
-            return current
-    current = _for_chat(home, key)
-    if current is not None:
-        return current
+    db_path = home / ".config/Cursor/User/globalStorage/state.vscdb"
+    if not db_path.is_file():
+        return []
+    paths: list[Path] = []
     try:
-        store = home / ".config/Cursor/User/globalStorage/state.vscdb"
-        with contextlib.closing(sqlite3.connect(f"file:{store}?mode=ro", uri=True, timeout=1)) as db:
-            rows = db.execute("select key from cursorDiskKV where key like ?", (f"ofsContent:{key}:%plan.md",)).fetchall()
-        for (row,) in reversed(rows):
-            path = Path(urllib.parse.unquote(row.split(":file://", 1)[-1]))
-            if path.is_file():
-                return path
-    except sqlite3.Error:
-        pass
-    return None
+        with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1)) as db:
+            # glob: case-sensitive, and a literal ".plan.md" (like matched SLIDE_PLAN.md too)
+            rows = db.execute("select key from cursorDiskKV where key glob ?",
+                              (f"ofsContent:{key}:*.plan.md",)).fetchall()
+            for (row,) in reversed(rows):
+                path = Path(urllib.parse.unquote(row.split(":file://", 1)[-1]))
+                if path.name.endswith(".plan.md") and path not in paths and path.is_file():
+                    paths.append(path)
+            if len(paths) < 2:
+                return paths
+            row = db.execute("select value from cursorDiskKV where key = ?", (f"composerData:{key}",)).fetchone()
+            headers = (json.loads(row[0]).get("fullConversationHeadersOnly") or []) if row and row[0] else []
+            order = {str(h.get("bubbleId")): at for at, h in enumerate(headers) if isinstance(h, dict)}
+            stamp = (str(db_path), tuple(map(str, paths)), len(headers), headers[-1].get("bubbleId") if headers else "")
+            cached = _editor_cache.get(key)
+            if cached and cached[0] == stamp:
+                return [Path(p) for p in cached[1]]
+            # A plan is known by its file name (a tool may name it relative to the workspace); two plans with the
+            # same name are known only by their full paths, so neither takes the other's touches.
+            shared = {p.name for p in paths if sum(q.name == p.name for q in paths) > 1}
+            names = {path: {str(path), urllib.parse.quote(str(path))} if path.name in shared
+                     else {path.name, urllib.parse.quote(path.name)} for path in paths}
+            needles = sorted({n for words in names.values() for n in words})
+            where = " or ".join("instr(value, ?) > 0" for _ in needles)
+            prefix = f"bubbleId:{key}:"
+            strong: dict[Path, int] = {}
+            weak: dict[Path, int] = {}
+            for bubble_key, value in db.execute(
+                    f"select key, value from cursorDiskKV where key >= ? and key < ? and ({where})",
+                    (prefix, prefix[:-1] + ";", *needles)):
+                at = order.get(bubble_key[len(prefix):])
+                if at is None:
+                    continue
+                text = value.decode(errors="replace") if isinstance(value, (bytes, bytearray)) else str(value or "")
+                try:
+                    tool = json.loads(text).get("toolFormerData") or {}
+                    called = " ".join(str(tool.get(k) or "") for k in ("params", "rawArgs"))
+                except (ValueError, AttributeError):  # not JSON, or a tool record that isn't an object
+                    called = ""
+                for path, words in names.items():
+                    if any(w in called for w in words):
+                        strong[path] = max(strong.get(path, -1), at)
+                    if any(w in text for w in words):
+                        weak[path] = max(weak.get(path, -1), at)
+    except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError):
+        return paths
+    ranked = sorted(paths, key=lambda p: (strong.get(p, -1), weak.get(p, -1)), reverse=True)  # stable: rows' order
+    _editor_cache[key] = (stamp, [str(p) for p in ranked])
+    return ranked
 
 
-def _for_chat(home: Path, key: str) -> Path | None:
-    """The newest plan file that names this chat in its opening comment."""
+def _marked(home: Path, key: str) -> list[Path]:
+    """The plan files that name this chat in their opening comment, the newest first."""
     folder = home / ".cursor/plans"
     if not folder.is_dir():
-        return None
+        return []
     mark = f"<!-- {key}"
     found = []
     for path in folder.glob("*.plan.md"):
         try:
             head = path.read_text(errors="replace")[:80]
+            if head.lstrip().startswith(mark):
+                found.append((path.stat().st_mtime, path))
         except OSError:
             continue
-        if head.lstrip().startswith(mark):
-            found.append(path)
-    if not found:
+    return [path for _, path in sorted(found, key=lambda item: -item[0])]
+
+
+def summary(path: Path) -> dict | None:
+    """A plan's name and how many of its steps are done, for a list of plans."""
+    try:
+        plan = parse(path.read_text(errors="replace"))
+    except OSError:
         return None
-    return max(found, key=lambda path: path.stat().st_mtime)
+    return {"file": str(path), "name": plan["name"], "done": plan["done"], "total": plan["total"]}
 
 
-def of_session(session: str, project: Path | None) -> dict | None:
-    """That exact chat's own plan, parsed. Never infer ownership from its agent or project."""
-    path = for_session(session)
-    if path is None:
+def of_session(session: str, project: Path | None, file: str | None = None) -> dict | None:
+    """That exact chat's own plan, parsed: the one it touched last, or `file` when that is one of its own plans
+    (never any other path). With "plans": every plan of that chat, the last touched first. Never infer ownership
+    from its agent or project."""
+    owned = plans_for_session(session)
+    if file:
+        owned_path = next((p for p in owned if str(p) == file), None)
+        if owned_path is None:
+            return None
+        path = owned_path
+    elif owned:
+        path = owned[0]
+    else:
         return None
     try:
         plan = parse(path.read_text(errors="replace"))
     except OSError:
         return None
     plan["file"] = str(path)
+    plan["session"] = session
+    plan["plans"] = [s for s in (summary(p) for p in owned[:20]) if s]
     return plan
 
 

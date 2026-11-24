@@ -3316,10 +3316,17 @@ class MainActivity : Activity() {
             findViewById<SwipeRefreshLayout>(R.id.planRefresh).isRefreshing = false
             return
         }
-        ask("/chat/plan?session=" + android.net.Uri.encode(session), null) { answer ->
+        val asked = PlanPicks.asked(this, session)  // the plan the user picked, if any
+        ask("/chat/plan?session=" + android.net.Uri.encode(session) +
+            (if (asked.isEmpty()) "" else "&plan=" + android.net.Uri.encode(asked)), null) { answer ->
             if (session != current) {
                 findViewById<SwipeRefreshLayout>(R.id.planRefresh).isRefreshing = false
                 return@ask
+            }
+            when (PlanPicks.settle(this, session, asked, answer)) {
+                PlanChoice.Verdict.IGNORE -> return@ask  // asked before the pick changed: the newer ask answers
+                PlanChoice.Verdict.ASK_AGAIN -> { refreshPlan(); return@ask }  // the pick no longer stands
+                PlanChoice.Verdict.SHOW -> {}
             }
             val bar = findViewById<View>(R.id.planBar)
             val todos = answer.optJSONArray("todos")
@@ -3336,7 +3343,8 @@ class MainActivity : Activity() {
             if (findViewById<View>(R.id.planRefresh).visibility != View.VISIBLE) showPlanSwitch(answer, onPlan = false)
             findViewById<View>(R.id.chatTab).setOnClickListener { switchPlan(onPlan = false) { showChatTab(animate = true) } }
             findViewById<View>(R.id.planTab).setOnClickListener { switchPlan(onPlan = true) { showPlanTab(answer, animate = true) } }
-            val key = answer.optString("name") + " " + answer.optInt("done") + "/" + answer.optInt("total") + " " + todos
+            val key = answer.optString("name") + " " + answer.optInt("done") + "/" + answer.optInt("total") + " " + todos +
+                " " + answer.optString("file") + " " + PlanChoice.files(answer)  // another plan, or the list changed
             val showing = findViewById<View>(R.id.planRefresh).visibility == View.VISIBLE
             if (showing && (key != planKey || findViewById<SwipeRefreshLayout>(R.id.planRefresh).isRefreshing)) showPlanTab(answer)
             planKey = key
@@ -3676,7 +3684,7 @@ class MainActivity : Activity() {
         showPlanSwitch(plan, onPlan = true, animate = animate)
         val list = findViewById<LinearLayout>(R.id.planList)
         list.setPadding(0, 0, 0, dp(88))  // room above the sticky button
-        (planView ?: PlanView(this).also { planView = it }).fill(list, plan)
+        (planView ?: PlanView(this).also { planView = it; it.onPick = { refreshPlan() } }).fill(list, plan)
         showBuildBar(plan)
     }
 
@@ -3722,7 +3730,7 @@ class MainActivity : Activity() {
                     buildSent = key
                     buildSentAt = System.currentTimeMillis()
                     showBuildBar(plan)
-                    ask("/chat/plan/build", JSONObject().put("session", current)) { answer ->
+                    ask("/chat/plan/build", JSONObject().put("session", current).put("plan", plan?.optString("file").orEmpty())) { answer ->
                         answer.optString("note").takeIf { it.isNotEmpty() }?.let {
                             buildSent = ""; showBuildBar(plan)
                             android.widget.Toast.makeText(this@MainActivity, it, android.widget.Toast.LENGTH_LONG).show()

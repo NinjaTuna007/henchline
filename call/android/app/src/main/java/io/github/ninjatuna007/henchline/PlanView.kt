@@ -34,6 +34,9 @@ class PlanView(private val activity: Activity) {
             topMargin = dp(top); bottomMargin = dp(bottom)
         }
     private val reading = 0xFFD5DDEB.toInt()
+
+    /** Called once the user picks another of the chat's plans (remembered in [PlanPicks]): ask for the plan again. */
+    var onPick: (() -> Unit)? = null
     private var showDone = false
     private var seededFile: String? = null  // null until the first plan: an empty path is still a plan
 
@@ -64,7 +67,11 @@ class PlanView(private val activity: Activity) {
 
     private fun header(plan: JSONObject, steps: List<JSONObject>) = card().apply {
         setPadding(dp(18), dp(16), dp(18), dp(16))
-        addView(draw.label("PLAN"))
+        addView(LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(draw.label("PLAN"), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            switcher(plan)?.let { addView(it) }
+        })
         addView(TextView(activity).apply {
             text = plan.optString("name"); textSize = 20f; setTextColor(colour(R.color.text))
             typeface = Typeface.DEFAULT_BOLD; setLineSpacing(0f, 1.2f)
@@ -87,6 +94,30 @@ class PlanView(private val activity: Activity) {
             addView(draw.small(listOfNotNull(if (going > 0) "$going in progress" else null,
                 if (total - done - going > 0) "${total - done - going} to go" else null).joinToString(" · ")
                 .ifEmpty { "All done" }))
+        }
+    }
+
+    /** "1 of 2 plans ▾" when the chat has more than one: a tap lists them to pick from ([PlanPickerSheet]). */
+    private fun switcher(plan: JSONObject): View? {
+        val list = plan.optJSONArray("plans") ?: return null
+        val plans = (0 until list.length()).mapNotNull { list.optJSONObject(it) }
+        val session = plan.optString("session")
+        if (plans.size < 2 || session.isEmpty()) return null
+        val file = plan.optString("file")
+        val at = plans.indexOfFirst { it.optString("file") == file }
+        return TextView(activity).apply {
+            text = (if (at >= 0) "${at + 1} of ${plans.size} plans" else "${plans.size} plans") + "  ▾"
+            textSize = 13f; setTextColor(colour(R.color.cyan))
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = rounded(colour(R.color.navy), 16, 1, colour(R.color.surface_high))
+            contentDescription = "Showing plan ${at + 1} of ${plans.size}: tap to pick another"
+            setOnClickListener {
+                PlanPickerSheet(activity, plans, file) { picked ->
+                    PlanPicks.choose(activity, session, PlanChoice.files(plan), picked)
+                    onPick?.invoke()
+                }.show()
+            }
+            Motion.ripple(this)
         }
     }
 
