@@ -80,7 +80,8 @@ class Listener:
         self.talkover = TalkOver(self.transcriber.quick_text)
         self.voiceprint = self.load_voiceprint(cfg)
         self.talkover.voiceprint = self.voiceprint
-        self.turns = Turn(cfg, self.transcriber, self.talkover, self.read, self.show, self.echo_slipped, stop)
+        self.turns = Turn(cfg, self.transcriber, self.talkover, self.read, self.show, self.echo_slipped, stop,
+                          behind=self.behind)
         self.whistle = None  # confirms wake words while Whisper is on the CPU (battery)
         if whistle.available():
             try:

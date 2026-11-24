@@ -95,11 +95,17 @@ def without_clip_lead(text: str, clip_text: str) -> str:
 
 
 class Turn:
+    # Seconds the frame just read lags its playing on the null sink (the listener's behind(): never less than the
+    # true lag); None: no lag known (taken as none)
+    behind: Callable[[], float] | None = None
+
     def __init__(self, cfg: whisper.Config, transcriber: whisper.Transcriber, talkover: TalkOver,
                  read: Callable[[], np.ndarray | None], show: Callable[[Mode], None],
-                 echo_slipped: Callable[[str], None], stop: threading.Event) -> None:
+                 echo_slipped: Callable[[str], None], stop: threading.Event,
+                 behind: Callable[[], float] | None = None) -> None:
         self.cfg, self.transcriber, self.talkover = cfg, transcriber, talkover
         self.read, self.show, self.echo_slipped, self.stop = read, show, echo_slipped, stop
+        self.behind = behind
         self.last_message: tuple[str, Heard] | None = None  # for "send that to …"
         self.live = None  # this turn, heard as it is recorded (Nemotron), when it is installed
         self.whistle = None  # set by the listener: quick checks (the wake word, "over") without Whisper
@@ -152,7 +158,7 @@ class Turn:
             if self.live:
                 self.live.feed(frame)
         since, quiet, peak = time.monotonic(), 0, -120.0
-        began = time.monotonic() - len(frames) / PER_SECOND  # for the phone's takeover: from the pre-roll on
+        began = self.played_at() - len(frames) / PER_SECOND  # for the phone's takeover: from the pre-roll on
         started = heard is not Heard.WOKE  # after "hey Claude" people pause for the chime
         calling = in_call()
         end = CALL_END_FRAMES if calling else END_FRAMES
@@ -219,6 +225,9 @@ class Turn:
                 elif time.monotonic() - voice_at > (VOICE_GONE if spoke else WAIT_FOR_WORDS):
                     voiceless = True  # their words ended a second ago, or none came at all
                     break
+        # What it heard ended here: taken now, before any wait for the phone below (audio said meanwhile isn't read
+        # yet, and a phone taking the ears later must hear it)
+        heard_until = self.played_at()
         # The pause that ended it may be the phone taking over: it says so in a moment, or the words are delivered here.
         # Only a phone that has this turn's words from its start drops it here (CALL_EAR_SINCE)
         if calling and (phone_took_ears_since(began, calling)
@@ -231,8 +240,18 @@ class Turn:
                   else "a finished sentence" if finished else "over" if quiet == OVER_FRAMES else "pause")
         log(HANDSFREE_LOG, f"recorded {time.monotonic() - since:.1f}s, ended by {reason} (floor {floor:.0f} dB)")
         if calling:  # kept here: a phone taking the ears later starts hearing after it, not again
-            note_laptop_heard(time.monotonic())
+            note_laptop_heard(heard_until)
         return frames
+
+    def played_at(self) -> float:
+        """When the frame just read played on the null sink (time.monotonic()): now, less how far reading lags."""
+        lag = 0.0
+        if self.behind is not None:
+            try:
+                lag = max(0.0, float(self.behind()))
+            except (TypeError, ValueError):
+                lag = 0.0
+        return time.monotonic() - lag
 
     @staticmethod
     def phone_takes_it(began: float, calling: bool) -> bool:

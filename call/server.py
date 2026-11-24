@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -40,10 +41,12 @@ import shutil
 import ssl
 import subprocess
 import sys
+import termios
 import threading
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import NamedTuple
@@ -60,6 +63,7 @@ from call.host_config import own_name  # noqa: E402  (this computer's name, in n
 from voice import chains, commands, cursor_cli, files, minions, pickup, plans, reminders, snaps, spool, screenshot, subagents, usage, voices, workflows  # noqa: E402
 from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
 from voice.delivery import Refusal  # noqa: E402
+from voice.state import LAPTOP_AUDIO_PATH  # noqa: E402  (bound of the phone audio's path here, for ear_cut)
 from voice.desktop import current as desktop, cursor_bridge, tmux  # noqa: E402
 from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CALL_SILENT, CALL_STAY_ON, CALL_HANGUP, CALL_MIRROR, CALL_ORIGIN,  # noqa: E402
                          CALL_DROPPED, REJOIN, CALL_EAR, CALL_EAR_SINCE, CALL_GAP, CALL_LAPTOP_HEARD, laptop_heard_until, LINE_DOWN_HOLD, BY_PHONE_EAR, Ears,
@@ -547,6 +551,8 @@ async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None,
     if listening is not None and "hearing" in message:
         listening.hears(bool(message["hearing"]))
         return ""
+    if "sound" in message and listening is not None and listening.mic is not None:
+        listening.mic.restarted()  # and the sound is logged below, as ever
     if str(message.get("note") or "").startswith("dropped:"):  # why the phone's line last dropped (CallService)
         note = " ".join(str(message["note"]).split())[:200]  # one line per event, whatever the exception said
         log(HANDSFREE_LOG, f"call: the phone says its line {note}")
@@ -1090,8 +1096,9 @@ def late_words(turn: PhoneTurn) -> dict:
     return {"delivered": turn.id, "to": got} if got else {"note": note, "unsent": turn.id}
 
 
-CUT_SLACK = 0.5  # seconds earlier than the laptop's last kept turn ended that the phone is told to hear from: the
-# laptop's audio runs behind the phone's by more than the message's trip, so a word after that turn is never skipped
+# Seconds earlier than the laptop's last kept turn ended (as counted in the phone's audio) that the phone is told to
+# hear from: its last frame before {"ear"} may have ended a read before "t" (20 ms frames, a busy mic thread)
+CUT_SLACK = 0.15
 EAR_FROM_SLACK = 0.25  # seconds later than the phone says it has the words from: the laptop's audio runs behind
 EAR_FROM_MOST = 15.0  # seconds back the phone's words can start (it keeps 10 s of audio): older is held to this
 
@@ -1100,25 +1107,95 @@ def is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def ear_cut(sent_ms: object, now: float, until: float | None) -> int | None:
-    """Where the phone starts hearing, on its own clock ("t" in its {"ear": "phone"}, sent at about `now`): just
-    before the laptop's last kept turn finished recording at `until` (both time.monotonic()), so that turn, delivered
-    by the laptop, isn't heard again from the phone's kept audio. None: no such turn in what the phone keeps, or no
-    clock to say it in. Always a little early (CUT_SLACK): at worst a word is heard twice, never skipped."""
-    if until is None or not is_number(sent_ms) or now - until > EAR_FROM_MOST:
+MIC_BYTES_PER_MS = MIC_RATE * 2 / 1000  # s16le mono
+MIC_KEPT = EAR_FROM_MOST + 5  # seconds of the mic's history kept for ear_cut
+
+
+class MicStream:
+    """The phone's mic on this connection, counted in bytes: how many arrived, and how far into them the null sink
+    had surely played at each moment. It maps a time here to a time on the phone's clock by counting audio, not by
+    any message's trip: the phone sends every frame it reads, in order, up to its {"ear": "phone"}, so the byte
+    `position` was read on the phone (received - position) / rate before that message's "t". A bad line delays the
+    audio however much it likes; the count stays true."""
+
+    def __init__(self) -> None:
+        self.received = 0  # bytes of mic audio from the phone on this connection
+        self.history: deque[tuple[float, int]] = deque()  # (monotonic, bytes surely handed to pacat by then)
+
+    def arrived(self, size: int) -> None:
+        self.received += size
+
+    def restarted(self) -> None:
+        """The phone's mic starts again ({"sound"} comes before every start: a route or sound switch, a dead mic):
+        the time it was off isn't in the count, so no byte before now maps to the phone's clock any more. Forgotten:
+        a cut is then None (a word twice), never late (words lost)."""
+        self.history.clear()
+
+    def handed(self, now: float, backlog: int) -> None:
+        """All but `backlog` bytes (in our write buffer and pacat's pipe) are with pacat at `now`."""
+        self.history.append((now, max(0, self.received - max(0, backlog))))
+        while self.history and now - self.history[0][0] > MIC_KEPT:
+            self.history.popleft()
+
+    def played_by(self, when: float) -> int | None:
+        """Bytes the null sink had surely played by `when` (monotonic); None if this connection's audio doesn't
+        reach back that far (an earlier connection's, or none yet)."""
+        found = None
+        for at, handed in self.history:
+            if at > when:
+                break
+            found = handed
+        if found is None:
+            return None
+        return max(0, found - round(LAPTOP_AUDIO_PATH * 1000 * MIC_BYTES_PER_MS))
+
+    def cut(self, sent_ms: object, received: int, until: float | None) -> int | None:
+        """Where the phone starts hearing, on its clock ("t" of its {"ear": "phone"}, `received` bytes in): just
+        before the audio the laptop's last kept turn heard up to (`until`, as it played here). None: no such turn in
+        this connection's audio, or no "t": the phone then hears all it keeps (a word twice, never one skipped)."""
+        if until is None or not is_number(sent_ms):
+            return None
+        played = self.played_by(until)
+        if played is None:
+            return None
+        return round(sent_ms - (received - played) / MIC_BYTES_PER_MS - CUT_SLACK * 1000)
+
+
+def pipe_backlog(writer: asyncio.StreamWriter) -> int:
+    """Bytes written to pacat's stdin it hasn't read yet: our write buffer and the pipe's."""
+    transport = writer.transport
+    size = transport.get_write_buffer_size()
+    pipe = transport.get_extra_info("pipe")
+    try:
+        found = bytearray(4)
+        fcntl.ioctl(pipe.fileno(), termios.FIONREAD, found)
+        size += int.from_bytes(found, sys.byteorder, signed=True)
+    except (AttributeError, OSError, ValueError):  # unknown: the most a pipe holds, so the cut stays early
+        size += 1 << 16
+    return size
+
+
+def ear_cut(sent_ms: object, now: float, until: float | None, mic: MicStream | None = None,
+            received: int | None = None) -> int | None:
+    """Where the phone starts hearing, on its own clock ("t" in its {"ear": "phone"}, handled at `now`): just
+    before the audio the laptop's last kept turn finished hearing at `until` (both time.monotonic()), so that turn,
+    delivered by the laptop, isn't heard again from the phone's kept audio. Counted in the phone's own audio
+    (MicStream), so a slow line can't make it late. None: no such turn in what the phone keeps or in this
+    connection's audio, or no clock to say it in: the phone hears all it keeps (a word twice, never one skipped)."""
+    if until is None or now - until > EAR_FROM_MOST or mic is None:
         return None
-    return round(sent_ms + (until - now - CUT_SLACK) * 1000)
+    return mic.cut(sent_ms, mic.received if received is None else received, until)
 
 
 def words_from(from_ms: object, sent_ms: object, now: float) -> float:
     """From when (time.monotonic(), as `now`) the phone has the words, as its {"ear": "phone"} says: "from_ms", its
-    clock (epoch ms) at the earliest audio it decodes, and "t", its clock as it sent the message. Their difference
-    needs no clocks to agree, and the message's own trip only makes the start later, never earlier: a laptop turn is
-    dropped only when the phone surely has it. Without "t", the two clocks are trusted to agree; without "from_ms",
-    the words start now (a turn already begun stays the laptop's)."""
-    if not is_number(from_ms) or from_ms <= 0:
+    clock at the earliest audio it decodes, and "t", its clock as it sent the message (elapsedRealtime: only their
+    difference means anything here). The message's own trip only makes the start later, never earlier: a laptop turn
+    is dropped only when the phone surely has it. Without either, the words start now (a turn already begun stays
+    the laptop's)."""
+    if not is_number(from_ms) or from_ms <= 0 or not is_number(sent_ms):
         return now
-    age = ((sent_ms if is_number(sent_ms) else time.time() * 1000) - from_ms) / 1000
+    age = (sent_ms - from_ms) / 1000
     return now - min(max(age, 0.0), EAR_FROM_MOST) + EAR_FROM_SLACK
 
 
@@ -1131,8 +1208,10 @@ class PhoneListening:
     gets in, on both ears): stopping the laptop's hands-free would not stop the phone hearing, and would leave nobody
     listening once the line is good again."""
 
-    def __init__(self, send: Callable[[str], Awaitable[None]], resumed: bool = False) -> None:
+    def __init__(self, send: Callable[[str], Awaitable[None]], resumed: bool = False,
+                 mic: MicStream | None = None) -> None:
         self.send = send  # to the phone, from the event loop
+        self.mic = mic  # this connection's audio, counted: where the phone starts hearing (ear_cut)
         self.loop = asyncio.get_running_loop()
         self.ear = Ears.LAPTOP
         if resumed:  # the phone listened on while the line was down, and says so again soon
@@ -1163,7 +1242,7 @@ class PhoneListening:
         if ear is Ears.PHONE:  # written first: hands-free reads it once CALL_EAR says phone
             now = time.monotonic()
             CALL_EAR_SINCE.write_text(f"{now:.6f} {words_from(from_ms, sent_ms, now):.6f}")
-            cut = ear_cut(sent_ms, now, laptop_heard_until())
+            cut = ear_cut(sent_ms, now, laptop_heard_until(), self.mic)
         CALL_EAR.write_text(ear.value)
         if ear is not self.ear:
             log(HANDSFREE_LOG, "call: the phone hears the user itself now" if ear is Ears.PHONE
@@ -3135,7 +3214,8 @@ async def call(request: web.Request) -> web.WebSocketResponse:
             if not ws.closed:
                 await ws.send_str(text)
 
-        listening = PhoneListening(send, resumed=resume)
+        mic_count = MicStream()  # bytes of the phone's mic on this connection, for where its ears start (ear_cut)
+        listening = PhoneListening(send, resumed=resume, mic=mic_count)
 
         async def to_phone() -> None:
             renders, asked = False, 0.0  # whether the phone speaks talkback: read at most twice a second
@@ -3326,8 +3406,10 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                     heard += len(msg.data)
                     if silent.feed(msg.data, last_audio[0]):
                         asyncio.get_running_loop().run_in_executor(None, tell_mic_silent)
+                    mic_count.arrived(len(msg.data))
                     mic.stdin.write(msg.data)
                     await mic.stdin.drain()
+                    mic_count.handed(time.monotonic(), pipe_backlog(mic.stdin))
                 elif msg.type == WSMsgType.TEXT:
                     message = msg.json()
                     if listening.ear is Ears.PHONE:  # no audio comes while the phone listens: this is the line

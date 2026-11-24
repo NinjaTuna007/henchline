@@ -123,9 +123,72 @@ class RecordGivesWay(unittest.TestCase):
         self.live.cancel.assert_not_called()
 
     def test_the_phone_says_so_while_the_turn_waits(self):
-        self.taker.read = self.reader(20, lambda: state.CALL_GAP.write_text(f"{time.monotonic():.3f}"))
-        with mock.patch.object(turn, "phone_took_ears_since", side_effect=[False, False, True]):
+        """(Was flaky, ~1 run in 300 alone, more in the suite: the pause was stamped to the millisecond, which
+        could round to just before the turn began, so the turn didn't wait. Stamped in full now, as the server does;
+        and a pause from just before the turn's start counts anyway: test_a_pause_on_the_turns_very_first_audio.)"""
+        self.taker.read = self.reader(20, lambda: state.CALL_GAP.write_text(f"{time.monotonic():.6f}"))
+        asked = []
+
+        def says_so(*_):
+            asked.append(time.monotonic())
+            return len(asked) >= 3  # not yet, not yet (the loop's end, the wait's first look), then yes
+        with mock.patch.object(turn, "phone_took_ears_since", side_effect=says_so):
             self.assertIsNone(self.taker.record([], -60.0, Heard.CALL))
+        self.assertEqual(len(asked), 3)
+
+    def test_a_pause_on_the_turns_very_first_audio(self):
+        """The pause is stamped as the phone's last audio arrived; it plays here a moment later. A turn begun on
+        that last audio still waits for the phone (it isn't delivered as a fragment the phone also has)."""
+        self.taker.read = self.reader(
+            20, lambda: state.CALL_GAP.write_text(f"{time.monotonic() - 1 - state.LAPTOP_AUDIO_PATH / 2:.6f}"))
+        self.taker.behind = lambda: 0.0
+        with mock.patch.object(turn, "phone_took_ears_since", side_effect=[False, True]):
+            self.assertIsNone(self.taker.record([np.zeros(480, np.float32)] * 33, -60.0, Heard.CALL))  # 1 s pre-roll
+        state.CALL_GAP.write_text(f"{time.monotonic() - 5:.6f}")  # a pause long before: no wait
+        self.assertFalse(state.gap_since(time.monotonic() - 1))
+
+    def test_the_laptop_heard_until_its_turn_ended_not_after_the_wait(self):
+        """A turn that waited for the phone in vain (TAKEOVER_WAIT) marks where its audio ended, not where the
+        wait did: the words said during the wait aren't read yet, and a phone taking the ears later must hear them."""
+        ended = []
+
+        def pause():
+            state.CALL_GAP.write_text(f"{time.monotonic():.6f}")
+        self.taker.read = self.reader(20, pause)
+        reads = self.taker.read
+
+        def read():
+            frame = reads()
+            if frame is None:
+                ended.append(time.monotonic())
+            return frame
+        self.taker.read = read
+        self.assertIsNotNone(self.taker.record([], -60.0, Heard.CALL))
+        done = time.monotonic()
+        heard = state.laptop_heard_until()
+        self.assertLessEqual(heard, ended[0] + 0.05)
+        self.assertGreaterEqual(done - heard, turn.TAKEOVER_WAIT - 0.05)  # the wait isn't counted as heard
+
+    def test_what_it_heard_is_dated_by_when_it_played_not_when_it_was_read(self):
+        self.taker.read = self.reader(1000, lambda: None)
+        self.taker.behind = lambda: 2.0  # reading 2 s behind the null sink (a busy laptop)
+        self.assertIsNotNone(self.taker.record([], -60.0, Heard.CALL))
+        self.assertLessEqual(state.laptop_heard_until(), time.monotonic() - 2.0)
+
+    def test_a_lag_it_cant_tell_counts_as_none(self):
+        self.taker.behind = lambda: None
+        before = time.monotonic()
+        self.assertGreaterEqual(self.taker.played_at(), before)
+
+    def test_the_talk_button_held_gives_way_to_the_phones_ears(self):
+        """The phone sends {"push"} to its own ears and to the server: a talk-button turn the laptop was recording
+        ends as the phone takes the ears, and isn't held open by the button."""
+        state.CALL_PUSH.touch()
+        self.addCleanup(state.CALL_PUSH.unlink, missing_ok=True)
+        self.taker.read = self.reader(20, self.take_ears(60))
+        self.assertIsNone(self.taker.record([], -60.0, Heard.PUSHED))
+        self.assertLess(self.reads, 20 + 2 * turn.GAP_CHECK)
+        self.live.cancel.assert_called_once_with()
 
     def test_a_takeover_from_before_the_turn_is_not_its_own(self):
         state.CALL_GAP.write_text(f"{time.monotonic() - 60:.3f}")

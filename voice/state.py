@@ -98,10 +98,17 @@ def phone_listens(calling: bool | None = None) -> bool:
     return said == Ears.PHONE.value and (in_call() if calling is None else calling)
 
 
+# Seconds at most the phone's audio spends here between the call server handing it to pacat and the null sink
+# playing it (pacat's own buffer at --latency-msec=60, and the sound server's): a bound, with room to spare
+LAPTOP_AUDIO_PATH = 0.3
+
+
 def gap_since(started: float) -> bool:
-    """The phone's audio paused for a takeover at or after `started` (time.monotonic())."""
+    """The phone's audio paused for a takeover at or after `started` (time.monotonic(), when the turn's first audio
+    played here). The pause is stamped as the phone's last audio *arrived* (the call server), which plays up to
+    LAPTOP_AUDIO_PATH later: a turn that began on the very last audio before the pause still saw it."""
     found = _read_float(CALL_GAP)
-    return found is not None and found >= started
+    return found is not None and found >= started - LAPTOP_AUDIO_PATH
 
 
 def ears_taken() -> tuple[float, float] | None:
@@ -116,7 +123,8 @@ def ears_taken() -> tuple[float, float] | None:
 
 
 def note_laptop_heard(until: float) -> None:
-    """A call turn the laptop keeps finished recording at `until` (time.monotonic())."""
+    """A call turn the laptop keeps finished recording at `until` (time.monotonic(), when the last audio it heard
+    played on the null sink, not when it was read: hands-free may read behind)."""
     try:
         CALL_LAPTOP_HEARD.write_text(f"{until:.6f}")
     except OSError:  # the phone may then hear that turn again: a duplicate, never words lost

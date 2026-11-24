@@ -132,8 +132,10 @@ class WordsFrom(Base):
             self.assertEqual(server.words_from(bad, 12_000, now), now)
         self.assertEqual(server.words_from(20_000, 12_000, now), now + server.EAR_FROM_SLACK)  # "from" ahead of "t"
         self.assertEqual(server.words_from(1, 10_000_000, now), now - server.EAR_FROM_MOST + server.EAR_FROM_SLACK)
-        with mock.patch.object(server.time, "time", return_value=100.0):  # no "t": our clock, trusted
-            self.assertEqual(server.words_from(96_000, None, now), now - 4 + server.EAR_FROM_SLACK)
+        for no_t in (None, "soon", float("nan")):  # no "t": the phone's clock isn't ours, so its words start now
+            self.assertEqual(server.words_from(96_000, no_t, now), now)
+        with mock.patch.object(server.time, "time", return_value=100.0):  # our wall clock means nothing to it
+            self.assertEqual(server.words_from(96_000, None, now), now)
 
     async def test_a_garbled_stamp_covers_nothing(self):
         for text in ("", "soon", "1 2 3"):
@@ -276,10 +278,92 @@ class HeardTurns(Base):
 class Cut(Base):
     """A turn the laptop delivered before the phone took the ears isn't heard again from the phone's kept audio."""
 
+    PER_S = round(server.MIC_BYTES_PER_MS * 1000)  # bytes of the phone's mic a second
+
+    def mic(self, now: float, seconds: int, backlog: int = 0) -> server.MicStream:
+        """A connection whose audio arrived one second's worth a second, up to `now`, all played at once."""
+        mic = server.MicStream()
+        for ago in range(seconds, 0, -1):
+            mic.arrived(self.PER_S)
+            mic.handed(now - ago + 1, backlog)
+        return mic
+
     async def test_the_phone_is_told_where_the_laptops_last_turn_ended_on_its_own_clock(self):
-        state.note_laptop_heard(time.monotonic() - 2)
+        now = time.monotonic()
+        self.listening.mic = self.mic(now, 10)
+        # played 2.5 s ago: surely as far as handed over 3 s ago (counted 3 s of audio before the phone's "t")
+        state.note_laptop_heard(now - 2.5)
         answer = json.loads(await self.page({"ear": "phone", "from_ms": 40_000, "t": 50_000}))
-        self.assertAlmostEqual(answer["ear_cut"], 50_000 - 2000 - server.CUT_SLACK * 1000, delta=50)
+        path = server.LAPTOP_AUDIO_PATH * 1000
+        self.assertAlmostEqual(answer["ear_cut"], 50_000 - 3000 - path - server.CUT_SLACK * 1000, delta=1)
+
+    async def test_a_slow_line_cannot_make_the_cut_late(self):
+        """The line stalled 3 s right as the laptop's turn ended, then caught up in a burst, and the phone took the
+        ears 5 s (its clock) after the turn's last word: the message came fast, the turn's audio slow. The old cut
+        (the message's trip taken as the audio's) put the phone's start 2.4 s after that word, and the words said
+        meanwhile, still in the pipe here, were heard by nobody. Counted in the phone's own audio, it is before it."""
+        now, t_ms = time.monotonic(), 50_000
+        mic = server.MicStream()
+        for second in range(5):  # phone seconds t-10 … t-6 arrived 0.1 s after being read
+            mic.arrived(self.PER_S)
+            mic.handed(now - (10 - second - 1) - 0.1, 0)
+        mic.arrived(self.PER_S)  # t-6 … t-5, the turn's last second: 3 s late
+        heard = now - 5 - 0.1 + 3  # when the laptop heard the turn's last word (t-5 on the phone's clock)
+        mic.handed(heard, 0)
+        mic.arrived(5 * self.PER_S)  # the burst, t-5 … t: mostly still in the pipe as the {"ear"} comes
+        mic.handed(now - 0.05, 3 * self.PER_S)
+        cut = server.ear_cut(t_ms, now, heard, mic)
+        self.assertLessEqual(cut, t_ms - 5000)  # never after what the laptop heard: no word skipped
+        self.assertGreaterEqual(cut, t_ms - 5000 - 1000)  # nor needlessly early
+        old = t_ms + (heard - now) * 1000 - 500  # the old cut, for the record
+        self.assertGreater(old, t_ms - 5000 + 2000)
+
+    async def test_audio_still_in_the_pipe_is_not_played_yet(self):
+        now = time.monotonic()
+        quick, slow = self.mic(now, 10), self.mic(now, 10, backlog=self.PER_S)
+        self.assertEqual(server.ear_cut(50_000, now, now - 2.5, quick) - server.ear_cut(50_000, now, now - 2.5, slow),
+                         1000)
+
+    async def test_no_cut_from_audio_this_connection_never_had(self):
+        now = time.monotonic()
+        self.assertIsNone(server.ear_cut(50_000, now, now - 20, self.mic(now, 10)))  # before its audio began
+        self.assertIsNone(server.ear_cut(50_000, now, now - 2, server.MicStream()))  # no audio at all
+        self.assertIsNone(server.ear_cut(50_000, now, now - 2, None))  # nothing counted
+        self.assertIsNone(server.ear_cut(None, now, now - 2, self.mic(now, 10)))  # no clock of the phone's
+
+    async def test_a_mic_restart_forgets_the_count(self):
+        """The phone's mic started again mid-connection (a sound or route switch sends {"sound"} first): the time it
+        was off isn't in the bytes, so a cut counted across it would be late by that much. No cut instead."""
+        now = time.monotonic()
+        self.listening.mic = self.mic(now, 10)
+        state.note_laptop_heard(now - 2.5)
+        with mock.patch.object(server, "write_json"):
+            await self.page({"sound": "call", "out": "earpiece", "aec": True})
+        answer = json.loads(await self.page({"ear": "phone", "from_ms": 40_000, "t": 50_000}))
+        self.assertEqual(answer, {"ear_cut": None})
+        self.listening.mic.arrived(self.PER_S)  # audio after the restart counts again
+        self.listening.mic.handed(time.monotonic(), 0)
+        self.assertIsNotNone(self.listening.mic.played_by(time.monotonic()))
+
+    async def test_the_count_keeps_only_what_the_phone_keeps(self):
+        mic = server.MicStream()
+        for at in range(100):
+            mic.arrived(self.PER_S)
+            mic.handed(float(at), 0)
+        self.assertLessEqual(len(mic.history), server.MIC_KEPT + 1)
+        self.assertIsNone(mic.played_by(50.0))
+
+    async def test_the_backlog_of_a_real_pipe(self):
+        import os
+        read, write = os.pipe()
+        self.addCleanup(os.close, read)
+        self.addCleanup(os.close, write)
+        os.write(write, b"x" * 1000)
+        transport = mock.Mock(get_write_buffer_size=mock.Mock(return_value=24),
+                              get_extra_info=mock.Mock(return_value=open(write, "wb", closefd=False)))
+        self.assertEqual(server.pipe_backlog(mock.Mock(transport=transport)), 1024)
+        transport.get_extra_info.return_value = None  # unknown: counted as a full pipe, so the cut stays early
+        self.assertEqual(server.pipe_backlog(mock.Mock(transport=transport)), 24 + (1 << 16))
 
     async def test_no_cut_without_a_laptop_turn_or_its_clock(self):
         self.assertEqual(json.loads(await self.page({"ear": "phone", "from_ms": 40_000, "t": 50_000})), {"ear_cut": None})
@@ -295,7 +379,8 @@ class Cut(Base):
 
     async def test_always_a_little_early(self):
         now = time.monotonic()
-        self.assertEqual(server.ear_cut(50_000, now, now), 50_000 - server.CUT_SLACK * 1000)
+        self.assertEqual(server.ear_cut(50_000, now, now, self.mic(now, 10)),
+                         50_000 - (server.LAPTOP_AUDIO_PATH + server.CUT_SLACK) * 1000)
 
     async def test_forgotten_when_the_call_ends(self):
         state.note_laptop_heard(time.monotonic())
@@ -421,6 +506,20 @@ class Playing(Base):
         with mock.patch.object(server.Playing, "now", return_value=None):
             self.assertEqual(self.listening.playing(), {"playing": None})
             self.assertIsNone(self.listening.playing())
+
+
+class TalkButton(Base):
+    async def test_the_button_while_the_phone_listens_opens_nothing_here(self):
+        """The app sends {"push"} to its own ears and here: the flag is kept (should the phone hand the ears back
+        mid-press, the laptop hears the rest of it), and nothing else happens: no phase, no turn of the laptop's
+        (the listener stands aside while the phone listens: test_phone_takeover.ListenerStandsAside)."""
+        await self.page({"ear": "phone"})
+        with mock.patch.object(server, "set_phase") as phase:
+            self.assertEqual(await self.page({"push": True}), "")
+            self.assertTrue(state.CALL_PUSH.exists())
+            await self.page({"push": False})
+            self.assertFalse(state.CALL_PUSH.exists())
+        phase.assert_not_called()
 
 
 class Gap(Base):
