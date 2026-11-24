@@ -136,6 +136,9 @@ object HostLists {
         else -> laptop
     }
 
+    /** The laptop didn't answer for a new chat: the first other computer not known to be offline, if any. */
+    fun fallbackFor(computers: List<String>, offline: Set<String>): String? = computers.firstOrNull { it !in offline }
+
     /** Unread: the agent spoke last, after the chat was last open here. */
     fun unread(c: ChatSummary, seenAt: Long): Boolean = !c.lastMine && c.lastText.isNotEmpty() && c.lastAt > seenAt
 

@@ -2,6 +2,7 @@ package io.github.ninjatuna007.henchline
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -118,6 +119,13 @@ class HostListsTest {
         assertEquals("laptop", HostLists.newChatOn(null, "gone", ids, emptySet(), "laptop"))
         assertEquals("laptop", HostLists.newChatOn(null, null, ids, emptySet(), "laptop"))
         assertEquals("laptop", HostLists.newChatOn(null, "desk", emptyList(), emptySet(), "laptop"))  // multi-host off
+    }
+
+    @Test fun aLaptopThatDoesntAnswerHandsTheNewChatToAComputerThatMight() {
+        assertEquals("desk", HostLists.fallbackFor(listOf("desk", "studio"), emptySet()))
+        assertEquals("studio", HostLists.fallbackFor(listOf("desk", "studio"), setOf("desk")))  // offline: skipped
+        assertNull(HostLists.fallbackFor(listOf("desk"), setOf("desk")))
+        assertNull(HostLists.fallbackFor(emptyList(), emptySet()))  // multi-host off: the laptop's failure stands
     }
 
     @Test fun rowsAreNamedAsTheLaptopsAre() {

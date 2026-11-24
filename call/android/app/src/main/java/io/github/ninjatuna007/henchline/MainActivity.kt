@@ -3879,8 +3879,9 @@ class MainActivity : Activity() {
      *  typed path) and agents, in a bottom sheet; the agent starts in its own tmux window there and its chat opens. */
     /** reply: from another computer's sheet (its COMPUTER row): null once this computer's sheet is up, else why
      *  not, shown in that sheet (a toast after it closed went unseen, 2026-11-22); without it, a toast. */
-    private fun newChat(on: String? = null, reply: ((String?) -> Unit)? = null) {
-        fun failed(why: String) {
+    private fun newChat(on: String? = null, reply: ((String?) -> Unit)? = null, after: String? = null) {
+        fun failed(reason: String) {
+            val why = if (after == null) reason else "$after didn't answer. $reason"  // a fallback: both are said
             android.util.Log.w("Henchline", "new chat on ${on ?: "the last computer"}: $why")
             if (reply != null) reply(why) else android.widget.Toast.makeText(this, why, android.widget.Toast.LENGTH_LONG).show()
         }
@@ -3901,8 +3902,11 @@ class MainActivity : Activity() {
         askAt(origin, who, "/crew/folders", null) { answer ->
             val folders = answer.optJSONArray("folders")
             val agents = answer.optJSONArray("agents")
-            if ((folders == null || agents == null) && on == null && host != null) {
-                return@askAt newChat(LAPTOP)  // the remembered computer didn't answer: the laptop, whose sheet can switch
+            if ((folders == null || agents == null) && on == null) {
+                // The remembered computer didn't answer: another that can, whose sheet can switch. The laptop asleep
+                // left no sheet at all, so no way to pick another computer (the user's catch, 2026-11-24)
+                if (host != null) return@askAt newChat(LAPTOP, after = who)
+                HostLists.fallbackFor(computers.map { it.hostId }, offline)?.let { return@askAt newChat(it, after = who) }
             }
             if (folders == null || agents == null || agents.length() == 0) {
                 return@askAt failed(answer.optString("note").ifEmpty { "No agent to start on $who (it needs tmux)." })
