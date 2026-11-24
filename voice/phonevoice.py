@@ -132,7 +132,7 @@ def stale(root: Path = ROOT) -> list[Path]:
 
 CHOSE_LAPTOP = "the user chose the laptop"  # a fallback the user picked mid-call, not one the phone needed
 SAID_PHONE = "Speaking from your phone now."  # said in the new voice when the user switches mid-call
-SAID_LAPTOP = "Back on the laptop."
+SAID_LAPTOP = "Back on {name}."  # this computer's name, filled in when said
 
 
 def offer(message: dict) -> None:
@@ -188,7 +188,13 @@ def confirmation(message: dict) -> str | None:
         return None
     if to_phone:
         return SAID_PHONE if phone_renders() else None
-    return SAID_LAPTOP
+    return said_laptop()
+
+
+def said_laptop() -> str:
+    """The words for a switch back to this computer's voice, by its own name."""
+    from call.host_config import own_name  # here, not at import: phonevoice loads where call/ may not
+    return SAID_LAPTOP.format(name=own_name())
 
 
 def _rtf(value) -> float | None:

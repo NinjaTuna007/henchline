@@ -118,11 +118,14 @@ object HostPush {
 
     const val UNNAMED = "your computer"
 
-    /** The laptop's id as learned, asked for again (off the main thread) when not known yet. */
-    fun laptopIdOrLearn(context: Context): String? = knownLaptopId(context) ?: run {
+    /** The laptop's id as learned, asked for again (off the main thread) when not known yet; once known, looked at
+     *  again hourly, so a computer renamed since (its host.json label) shows under its new name. */
+    fun laptopIdOrLearn(context: Context): String? {
         val now = System.currentTimeMillis()
-        if (now - lastAsked > 60_000L) { lastAsked = now; relearn(context) }  // the list redraws often: once a minute
-        null
+        val known = knownLaptopId(context)
+        val every = if (known == null) 60_000L else 3_600_000L  // the list redraws often: at most once a minute
+        if (now - lastAsked > every) { lastAsked = now; relearn(context) }
+        return known
     }
 
     @Volatile private var lastAsked = 0L
@@ -142,7 +145,13 @@ object HostPush {
         val descriptor = answer.json().optJSONObject("descriptor") ?: return
         val id = laptopIdFrom(descriptor, HostRegistry.of(context).all()) ?: return
         context.getSharedPreferences("call", Context.MODE_PRIVATE).edit().putString(LAPTOP_ID, id).putString(LAPTOP_FOR, at)
-            .putString(LAPTOP_LABEL, descriptor.optString("label").take(64)).apply()  // signed with the id: its own name
+            .putString(LAPTOP_LABEL, descriptor.optString("label").trim().take(64)).apply()  // signed with the id: its own name
+        val label = descriptor.optString("label").trim().take(64)
+        val seq = descriptor.optLong("descriptor_seq", 0)
+        if (label.isNotEmpty()) HostRegistry.of(context).update(id) {  // never an older descriptor's name, or one being removed
+            val kept = runCatching { JSONObject(it.descriptor).optLong("descriptor_seq", 0) }.getOrDefault(0)
+            if (it.label == label || it.revocationPending || seq < kept) it else it.copy(label = label)
+        }
     }
 
     private fun offersLegacyRoutes(host: Host): Boolean = try {

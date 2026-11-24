@@ -19,6 +19,7 @@ import numpy as np
 
 import routing
 from routing import Heard
+from call.host_config import own_name  # this computer's name, in words it says
 from sensing import (FRAME, PER_SECOND, RATE, EarbudButton, EchoWatch, Load, Output, Playback, Wake, Xruns, level,
                      mic_stream, read_frame, start_canceller)
 from talkover import CALL_SUSTAIN, CAREFUL_NEW_WORDS, NEW_WORDS, SUSTAIN, TalkOver, Verdict
@@ -73,6 +74,7 @@ class Listener:
     def __init__(self, cfg: whisper.Config, transcriber: whisper.Transcriber, stop, canceller_since: float) -> None:
         self.cfg, self.stop = cfg, stop
         self.canceller_since = canceller_since
+        own_name()  # its first lookup (tailscale, up to 2 s) now, not later inside the per-frame step
         self.transcriber = transcriber
         self.stream, self.source, self.opened, self.frames_read = None, "", 0.0, 0
         self.talkover = TalkOver(self.transcriber.quick_text)
@@ -345,7 +347,7 @@ class Listener:
         clip it began in)."""
         if playing and busy_laptop and not self.busy_told:
             self.busy_told = True
-            routing.say("The laptop's busy, so talking over me takes a little longer. The wake word works at once.")
+            routing.say(f"{own_name()} is busy, so talking over me takes a little longer. The wake word works at once.")
         elif not busy_laptop and not calling:
             self.busy_told = False
 

@@ -281,8 +281,8 @@ class ConfirmSwitch(unittest.TestCase):
         last = server.Speaker("claude-x", "claude", "henchline")
         with mock.patch.object(server.voices, "for_agent", lambda agent: f"voice-of-{agent}"):
             said, say = self.run_it({"tts": "laptop"}, last=last)
-        self.assertEqual(said, server.phonevoice.SAID_LAPTOP)
-        say.assert_called_once_with(server.phonevoice.SAID_LAPTOP, voice="voice-of-claude")
+        self.assertEqual(said, server.phonevoice.said_laptop())
+        say.assert_called_once_with(server.phonevoice.said_laptop(), voice="voice-of-claude")
 
     def test_skipped_while_the_user_talks_or_a_reply_waits(self):
         for kwargs in ({"idle": False}, {"queued": ["clip"]}, {"held": True}):

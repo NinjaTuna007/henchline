@@ -78,7 +78,7 @@ class Chosen(unittest.TestCase):
         phonevoice.offer({**self.OFFER, "chosen": True})
         self.assertEqual(phonevoice.confirmation({**self.OFFER, "chosen": True}), phonevoice.SAID_PHONE)
         phonevoice.offer({"tts": "laptop"})
-        self.assertEqual(phonevoice.confirmation({"tts": "laptop"}), phonevoice.SAID_LAPTOP)
+        self.assertEqual(phonevoice.confirmation({"tts": "laptop"}), phonevoice.said_laptop())
 
     def test_a_switch_to_a_model_the_laptop_wont_take_says_nothing(self):
         other = {"tts": {"engine": "sherpa-kokoro", "model": "kokoro-multi-lang-v1_0"}, "chosen": True}
