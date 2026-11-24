@@ -235,8 +235,11 @@ class CallService : Service() {
     val otherHost get() = hostId != null
 
     /** The computer this call is with, by its own name: a paired computer's label, else the main one's. */
-    private fun computer(): String = hostId?.let { id -> HostPush.hostsOrNull(HostRegistry.of(this))?.firstOrNull { it.hostId == id }?.label ?: "the computer" }
-        ?: HostPush.computerName(this)
+    private fun computer(): String = named ?: (hostId?.let { id ->
+        HostPush.nameOr(HostPush.hostsOrNull(HostRegistry.of(this))?.firstOrNull { it.hostId == id }?.label)
+    } ?: HostPush.computerName(this)).also { named = it }
+    // computer(), read once a call (the screens ask on every redraw); a renamed computer is called by its new name next call
+    @Volatile private var named: String? = null
     @Volatile private var lastDrop = ""  // why the line last dropped: told to the laptop once it's back
     @Volatile private var running = false
     @Volatile private var link = 0  // which connection is the call's now: a dropped one's late words are ignored
@@ -293,6 +296,7 @@ class CallService : Service() {
         }
         if (running) return START_NOT_STICKY  // already calling or connecting
         hostId = intent.getStringExtra(HOST_ID)?.takeIf { Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && MultiHost.enabled(this) }
+        named = null  // this call's computer, named afresh
         hostSession = if (hostId == null) "" else intent.getStringExtra(HOST_SESSION) ?: ""
         Bus.hostSession = hostSession
         Bus.host = hostId
@@ -407,7 +411,9 @@ class CallService : Service() {
         talking = !talking
         if (talking) talkingSince = android.os.SystemClock.elapsedRealtime()
         socket?.send(org.json.JSONObject().put("push", talking).toString())
-        if (earsTaken) ears?.press(talking)  // the phone's own turn, held until the button is let go
+        // The phone's own turn, held until the button is let go (or the screen's hold too, if that is on)
+        val press = hold.toggle(talking, talkingSince)
+        if (press != null && earsTaken) ears?.press(press)
         beep(talking)
         tell(org.json.JSONObject().put("talking", talking).toString())
         goForeground()  // the notification's button says Send while talking
@@ -472,8 +478,25 @@ class CallService : Service() {
         if ("button_only" in json) try {
             org.json.JSONObject(json).takeIf { it.has("button_only") }?.let { setButtonOnly(it.optBoolean("button_only")) }
         } catch (_: Exception) {}
+        // The call screen's held talk button: while the phone hears the user, its own ears hold the turn open too
+        // (only the notification's and the earbuds' button reached them, through toggleTalk)
+        if ("push" in json) try {
+            org.json.JSONObject(json).takeIf { it.has("push") }?.let { pushed ->
+                // Its own hold, apart from the toggle's `talking`: the notification keeps saying what the toggle
+                // does, and one never ends the other's turn
+                val press = hold.screen(pushed.optBoolean("push"), android.os.SystemClock.elapsedRealtime())
+                if (press != null && earsTaken) ears?.press(press)
+            }
+        } catch (_: Exception) {}
         socket?.send(json)
     }
+
+    /** Whether the phone's own ears hear a turn of the user's now (the talk button's red, on Always phone). */
+    val phoneHearing: Boolean get() = earsTaken && (hold.held || ears?.hearingNow == true)
+    private val hold = TalkHold()  // the talk button held for the phone's ears: the toggle's and the screen's
+
+    /** The computer this call is with, by its own name (for "… listening"). */
+    val computerName: String get() = computer()
 
     private fun setButtonOnly(on: Boolean) {
         buttonOnly = on
@@ -509,7 +532,7 @@ class CallService : Service() {
         val hearing = ears ?: return
         val webSocket = socket ?: return
         if (earsTaken || !ponged || !hearing.loaded || !running || ended || lostAt > 0) return
-        earsFrom = hearing.take(if (talking) talkingSince else null)
+        earsFrom = hearing.take(hold.since)
         webSocket.send(earsMessage())
         earSaid = "phone"
         earsTaken = true
@@ -911,8 +934,11 @@ class CallService : Service() {
                 // Kept here, by the call, whether or not the screen is showing: lines that came while another app
                 // was in front were lost (2026-11-15); the screen draws them from the kept chat when it comes back
                 message?.optJSONObject("chat")?.let { line ->
-                    val mine = line.optString("from") == "you"
-                    val keep = org.json.JSONObject().put("from", line.optString("from")).put("text", line.optString("text"))
+                    // A helper's report or a reminder is mirrored as typed by you: kept as Henchline's, not yours
+                    val relayed = Relayed.of(line.optString("text"))
+                    val mine = line.optString("from") == "you" && relayed == null
+                    val keep = org.json.JSONObject().put("from", if (relayed != null) "Henchline" else line.optString("from"))
+                        .put("text", line.optString("text"))
                         .put("mine", mine)
                     if (mine) keep.put("status", "delivered")  // the laptop says so once it has typed your words in
                     line.optString("tid").takeIf { it.isNotEmpty() }?.let {  // an agent's text: on the phone now

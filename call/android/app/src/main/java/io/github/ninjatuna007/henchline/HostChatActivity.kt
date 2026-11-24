@@ -309,7 +309,7 @@ class HostChatActivity : Activity() {
                     // live copy of the same line (this screen's call) goes, so it isn't shown twice
                     EventLook.CALL_YOU, EventLook.CALL_THEM -> {
                         val from = e.optString("from"); val text = e.optString("text")
-                        events.addView(if (ChatEvents.lookOf(e) == EventLook.CALL_YOU) bubble(text, "said on the call")
+                        events.addView(if (ChatEvents.lookOf(e) == EventLook.CALL_YOU) yours(text, "said on the call")
                             else theirs(from.ifEmpty { "Agent" }, text), at)
                         dropLive(ChatEvents.callKey(from, text), ChatEvents.ofCall(e, CallService.Bus.hostLines.startedFor(hostId, sessionId ?: "")))
                     }
@@ -352,6 +352,10 @@ class HostChatActivity : Activity() {
                 setPadding(px(12), px(8), px(12), px(8))
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = px(10) })
         }
+
+        /** A line mirrored as yours: a helper's report or a reminder (Relayed) is drawn as from them, not you. */
+        private fun yours(text: String, status: String): View =
+            Relayed.of(text)?.let { theirs(it.label, it.text) } ?: bubble(text, status)
 
         private fun bubble(text: String, status: String) = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.END
@@ -407,6 +411,10 @@ class HostChatActivity : Activity() {
             }
         }
 
+        /** The bar's words on a call: and who is listening, the phone or this computer by its name. */
+        private fun onACall() = "On a call · " + PhoneEar.listener(CallService.Bus.phoneEars,
+            CallService.Bus.service?.computerName ?: HostPush.nameOr(host.label))
+
         /** The bar as the call is now (coming back to this screen mid-call). */
         fun showCall() {
             val other = CallService.Bus.host?.takeIf { CallService.Bus.service != null && !ours() }
@@ -418,7 +426,7 @@ class HostChatActivity : Activity() {
             CallService.Bus.hostLines.of(hostId, sessionId).forEach { fromCall(it, replay = true) }
             CallService.Bus.hostLines.takeClosed(hostId, sessionId)?.let { show(it) }  // it ended while away
             callBar.visibility = if (ours()) View.VISIBLE else View.GONE
-            if (ours()) callState.text = if (CallService.Bus.hostConnected) "On a call" else "Connecting…"
+            if (ours()) callState.text = if (CallService.Bus.hostConnected) onACall() else "Connecting…"
         }
 
         /** Call this chat's agent on this computer (answering: the ring answered, which the computer routes to the
@@ -465,9 +473,10 @@ class HostChatActivity : Activity() {
             }
             if (m.has("closed")) CallService.Bus.hostLines.takeClosed(hostId, sessionId ?: "")  // seen here: not again
             when {
-                m.has("opened") -> { callBar.visibility = View.VISIBLE; callState.text = "On a call"; keptAhead.clear() }
-                m.has("reconnecting") -> callState.text = if (m.optBoolean("reconnecting")) "Reconnecting…" else "On a call"
+                m.has("opened") -> { callBar.visibility = View.VISIBLE; callState.text = onACall(); keptAhead.clear() }
+                m.has("reconnecting") -> callState.text = if (m.optBoolean("reconnecting")) "Reconnecting…" else onACall()
                 m.has("closed") -> { callBar.visibility = View.GONE; show(m.optString("closed")) }
+                m.has("ears") -> if (CallService.Bus.hostConnected) callState.text = onACall()  // the ears switched
                 m.has("talking") -> talk.text = if (m.optBoolean("talking")) "Send" else "Talk"
                 m.has("note") -> show(m.optString("note"))
             }
@@ -479,7 +488,7 @@ class HostChatActivity : Activity() {
                 val key = ChatEvents.callKey(line.optString("from"), line.optString("text"))
                 val ahead = keptAhead[key] ?: 0
                 if (ahead > 0) { keptAhead[key] = ahead - 1; return }  // the computer's kept copy is drawn already
-                callLines.addView((if (line.optString("from").equals("you", ignoreCase = true)) bubble(line.optString("text"), "said on the call")
+                callLines.addView((if (line.optString("from").equals("you", ignoreCase = true)) yours(line.optString("text"), "said on the call")
                     else theirs(line.optString("from").ifEmpty { "Agent" }, line.optString("text"))).apply { tag = key })
                 if (callLines.childCount > CallService.HostLines.MAX) callLines.removeViewAt(0)  // as many as are kept
                 empty.visibility = View.GONE

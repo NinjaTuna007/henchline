@@ -40,6 +40,22 @@ object PhoneEar {
         Mode.LAPTOP -> "Only the computer listens, as before: a bad line can cut your words."
     }
 
+    /** Who is listening on the call, for the call bar and the chat's header: "Phone listening" while the phone
+     *  hears the user itself, else the computer by its own name. */
+    fun listener(phoneEars: Boolean, computer: String): String =
+        if (phoneEars) "Phone listening" else "${HostPush.nameOr(computer).replaceFirstChar { it.uppercaseChar() }} listening"
+
+    /** The talk button's colour (MainActivity.showMode's mode) on a call. The computer's hands-free mode says it while
+     *  the computer hears the call; while the phone hears it, the computer's listener is idle ("waiting", grey), so
+     *  the phone's own state is shown instead: red while it hears a turn (or the button is held), green while the
+     *  line is open, grey only when the open line is off (only the held button gets in, as on the computer). */
+    fun talkMode(computerMode: String, phoneEars: Boolean, hearing: Boolean, buttonOnly: Boolean): String = when {
+        !phoneEars -> computerMode
+        hearing -> "recording"
+        buttonOnly -> "waiting"
+        else -> "listening"
+    }
+
     private fun prefs(context: Context) = context.getSharedPreferences("call", Context.MODE_PRIVATE)
 }
 
@@ -347,4 +363,32 @@ class Backlog {
 
     fun poll(ms: Long): Item? = items.poll(ms, java.util.concurrent.TimeUnit.MILLISECONDS)
     fun size() = items.size
+}
+
+/**
+ * The talk button held for the phone's own ears, from two places that must not undo each other: the earbuds' or the
+ * notification's toggle (CallService.talking, which the notification's Talk/Send follows) and the call screen's
+ * hold. The ears get one press when either starts and one release when both have ended; a turn is held from the
+ * earlier of the two. Times are elapsedRealtime.
+ */
+class TalkHold {
+    private var toggleSince: Long? = null
+    private var screenSince: Long? = null
+
+    val held: Boolean @Synchronized get() = toggleSince != null || screenSince != null
+
+    /** When the hold now began (the earlier source), or null when nothing holds it. */
+    val since: Long? @Synchronized get() = listOfNotNull(toggleSince, screenSince).minOrNull()
+
+    /** The toggle on or off: the ears' new press (true/false) when the combined hold changed, else null. */
+    @Synchronized fun toggle(on: Boolean, at: Long): Boolean? = change { toggleSince = if (on) toggleSince ?: at else null }
+
+    /** The screen's hold on or off: as toggle. */
+    @Synchronized fun screen(on: Boolean, at: Long): Boolean? = change { screenSince = if (on) screenSince ?: at else null }
+
+    private inline fun change(set: () -> Unit): Boolean? {
+        val before = held
+        set()
+        return held.takeIf { it != before }
+    }
 }

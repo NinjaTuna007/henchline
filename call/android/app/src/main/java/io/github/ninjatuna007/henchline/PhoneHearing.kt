@@ -50,6 +50,8 @@ class PhoneHearing(
     private var suspect = false  // over talkback, not yet told to be the user's: no {"hearing"} sent yet
     private var lookedAt = 0L  // audio ms since the turn opened at which its words were last compared with the clip
     @Volatile private var hearing = false  // {"hearing": true} sent for the turn open now
+    /** A turn of the user's is open now (heard, or the talk button held): the talk button shows red. */
+    val hearingNow: Boolean get() = hearing
     private val preroll = ArrayDeque<Pair<Long, FloatArray>>()
     private val window = FloatArray(VAD_WINDOW)
     private var windowAt = 0
@@ -289,10 +291,14 @@ class PhoneHearing(
         when {
             text.isEmpty() || (clip.isNotEmpty() && OwnWords.echoTurn(text, clip, ms)) -> {
                 log("turn of ${ms} ms, ended by ${step.end.why}: ${if (text.isEmpty()) "no words" else "our own talkback coming back"}")
-                if (hearing) send(JSONObject().put("hearing", false).toString())
+                // Not hearing before it is said: a screen reading hearingNow on the answer never stays red
+                val was = hearing
+                hearing = false
+                if (was) send(JSONObject().put("hearing", false).toString())
             }
             else -> {
                 if (suspect) confirm(null)  // new words at the very end of a short turn over talkback
+                hearing = false  // before the turn goes: its answer redraws the talk button
                 val late = lineDown()
                 send(turns.add(text, turnPushed, wallClock(turnFrom), late))
                 log("heard a turn: $words words, ${ms} ms, ended by ${step.end.why}${if (turnPushed) ", held the talk button" else ""}" +

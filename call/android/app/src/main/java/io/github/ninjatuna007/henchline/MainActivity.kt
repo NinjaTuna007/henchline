@@ -789,7 +789,11 @@ class MainActivity : Activity() {
                 }
             }
             status.has("agents") -> showAgents(status)
-            status.has("ears") -> showCallStatus()  // the phone hears the user itself now
+            status.has("ears") -> {  // the phone hears the user itself now (or the computer does again)
+                showCallStatus()
+                showCallState()
+                showMode(lastMode)
+            }
             status.has("delivered") -> tick(status.getString("delivered"), "delivered")  // in place: no jump
             status.has("reload") -> { showHistory(); if (listScreen.visibility == View.VISIBLE) showCrew() }  // a share or a file kept in a chat
             status.has("talking") ->  // the earbuds or the notification started or ended a turn
@@ -804,7 +808,8 @@ class MainActivity : Activity() {
                 say("", status.getString("note"), note = true)
             }
             status.has("mode") -> {
-                if (onCall()) state.text = subtitle(status.optString("state"))
+                callState = status.optString("state")
+                showCallState()
                 callWords = status.optString("state").substringBefore(" · ").lowercase()
                 showCallStatus()
                 showChipIn(status.optJSONObject("speaker"))
@@ -1032,6 +1037,7 @@ class MainActivity : Activity() {
             talking = true
             CallService.Bus.service?.send("""{"push": true}""")
             CallService.Bus.service?.beep(true)
+            showMode(lastMode)  // red at once on the phone's own ears (the computer's mode says nothing of them)
         }
         talk.setOnTouchListener { view, event ->
             when (event.actionMasked) {
@@ -1042,6 +1048,7 @@ class MainActivity : Activity() {
                         talking = false
                         CallService.Bus.service?.send("""{"push": false}""")
                         CallService.Bus.service?.beep(false)
+                        showMode(lastMode)
                     } else if (event.actionMasked == MotionEvent.ACTION_UP) {
                         buttonOnly = !buttonOnly
                         CallService.Bus.service?.send(JSONObject().put("button_only", buttonOnly).toString())
@@ -1400,11 +1407,24 @@ class MainActivity : Activity() {
 
     private var callWords = ""  // what is happening on the call ("speaking", "listening"), for the bar's second line
 
-    /** The bar's second line after the timer: "phone ears" while the phone hears the user itself, then what is
-     *  happening on the call. */
+    /** Who is listening on the call now: "Phone listening" while the phone hears the user itself, else the
+     *  computer's own name ("Aquabox listening"). Follows the ears as they switch ({"ears"}). */
+    private fun listening(): String =
+        PhoneEar.listener(CallService.Bus.phoneEars, CallService.Bus.service?.computerName ?: HostPush.computerName(this))
+
+    /** The bar's second line after the timer: who is listening, then what is happening on the call (its plain
+     *  "listening" left out: the first part says it). */
     private fun showCallStatus() {
-        val parts = listOfNotNull(PHONE_EARS.takeIf { CallService.Bus.phoneEars }, callWords.ifEmpty { null })
+        val parts = listOfNotNull(listening().takeIf { CallService.Bus.connected },
+            callWords.takeIf { it.isNotEmpty() && it != "listening" })
         findViewById<TextView>(R.id.callStatus).text = parts.joinToString("") { " · $it" }
+    }
+
+    private var callState = ""  // the call's own status line ("Hearing you…"), for the chat's header
+
+    /** The chat's header on a call: the call's status, and who is listening. */
+    private fun showCallState() {
+        if (onCall()) state.text = subtitle(listOf(listening(), callState).filter { it.isNotEmpty() }.joinToString(" · "))
     }
     private var pulse: android.animation.Animator? = null  // the live ring's beat: only while the bar shows and the app is seen
 
@@ -1679,9 +1699,16 @@ class MainActivity : Activity() {
         showCrew()
     }
 
-    /** The laptop tray's colours: grey while only the wake word gets in, then green, red, yellow. */
+    private var lastMode = "waiting"  // the computer's hands-free mode, as last told
+
+    /** The laptop tray's colours: grey while only the wake word gets in, then green, red, yellow. While the phone
+     *  hears the call itself the computer's listener is idle: the phone's own state instead (PhoneEar.talkMode). */
     private fun showMode(mode: String) {
-        val colour = when (mode) {
+        lastMode = mode
+        val service = CallService.Bus.service
+        val shown = PhoneEar.talkMode(mode, CallService.Bus.phoneEars && CallService.Bus.connected,
+            talking || service?.phoneHearing == true, buttonOnly)
+        val colour = when (shown) {
             "listening" -> 0xFF3CB371
             "recording" -> 0xFFE24A4A
             "transcribing" -> 0xFFE0A100
@@ -1700,13 +1727,26 @@ class MainActivity : Activity() {
     private fun say(from: String, words: String, mine: Boolean = false, note: Boolean = false, session: String = "",
                     keep: Boolean = true, status: String = "", at: Long = System.currentTimeMillis(),
                     live: Boolean = false): TextView {
+        // Typed in by Henchline, not you (a helper's report, a reminder): the computer mirrors it as yours, so it is
+        // told by its tag and drawn as from that helper or Henchline, its name over the words
+        val relayed = if (!note) Relayed.of(words) else null
+        return said(from, relayed?.text ?: words, mine && relayed == null, note, session, keep, status, at, live, relayed, words)
+    }
+
+    private fun said(from: String, words: String, mine: Boolean, note: Boolean, session: String, keep: Boolean,
+                     status: String, at: Long, live: Boolean, relayed: Relayed?, typed: String): TextView {
         // Kept: the line's own time, by which a long-press finds it to delete
-        val at = if (keep && !note) JSONObject().put("from", from).put("text", words).put("mine", mine)
+        val at = if (keep && !note) JSONObject().put("from", if (relayed != null) "Henchline" else from).put("text", typed).put("mine", mine)
             .also { Chats.add(this, session, it) }.optLong("at", at) else at
         if (!note && at > 0) dayLine(at)
         val bubble = Stamped(this).apply {
             if (!note) bubbleAt[this] = at
             text = if (note) words else stamp(this, words, if (mine) status else "")
+            if (relayed != null) text = android.text.SpannableStringBuilder(relayed.label).apply {
+                setSpan(android.text.style.ForegroundColorSpan(getColor(R.color.cyan)), 0, length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                setSpan(android.text.style.RelativeSizeSpan(0.8f), 0, length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD), 0, length, android.text.Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }.append("\n").append(text)
             setTextColor(getColor(if (note) R.color.muted else R.color.text))
             textSize = if (note) 13f else 15f
             if (!note) {
@@ -1726,8 +1766,8 @@ class MainActivity : Activity() {
             setTag(R.id.chat, session)
             visibility = if (session.isEmpty() || current.isEmpty() || session == current) View.VISIBLE else View.GONE
         }
-        if (!note && !mine && from.isNotEmpty()) {
-            row.addView(ImageView(this).apply { setImageResource(avatarOf(session.ifEmpty { from })) },
+        if (!note && !mine && (from.isNotEmpty() || relayed != null)) {
+            row.addView(ImageView(this).apply { setImageResource(relayed?.avatar ?: avatarOf(session.ifEmpty { from })) },
                 LinearLayout.LayoutParams(dp(28), dp(28)).apply { marginEnd = dp(8) })
         }
         if (!note) swipeToReply(row, words) { messageMenu(session.ifEmpty { current }, listOf(at), words) }
@@ -2799,7 +2839,8 @@ class MainActivity : Activity() {
             val line = found.ifEmpty {
                 flow?.let { f -> "⚙ ${f.optString("name")} · " + (if (f.optInt("phases") > 0) "${f.optInt("at").coerceAtLeast(1)}/${f.optInt("phases")} · " else "") +
                     "${f.optInt("done")}/${f.optInt("total")} done" }
-                    ?: last?.let { (if (it.optBoolean("mine")) "You: " else "") + it.optString("text").ifEmpty { "📎 file" } } ?: ""
+                    ?: last?.let { l -> Relayed.of(l.optString("text"))?.let { "${it.label}: ${it.text}" }
+                        ?: ((if (l.optBoolean("mine")) "You: " else "") + l.optString("text").ifEmpty { "📎 file" }) } ?: ""
             }
             val crewOf = if (!nested) null else if (remote != null) remote.bossName?.let { "Crew of $it" }
                 else bosses[session]?.let { b -> "Crew of " + (names[b]?.substringBefore(",") ?: b.substringBefore("-").replaceFirstChar { it.uppercase() }) }
@@ -5147,7 +5188,6 @@ class MainActivity : Activity() {
 
     companion object {
         private const val LAPTOP = "laptop"  // the laptop's key among computers (its heading's fold, New chat's pick)
-        private const val PHONE_EARS = "phone ears"  // the call bar's sign: the phone hears you itself
         private const val NEW_CHAT_ON = "new_chat_on"  // the computer whose chat was opened last: New chat starts there
         const val HOLD_MS = 300L  // longer than this is a hold; shorter is a tap
         const val ANSWER = "io.github.ninjatuna007.henchline.ANSWER"  // from IncomingActivity's Answer
