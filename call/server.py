@@ -56,6 +56,7 @@ import routing  # noqa: E402
 from routing import Heard  # noqa: E402
 from voice import phoneasr, phonevoice
 from call.auth import SIGNED  # noqa: E402  (a name only: the signed API itself loads with --api-v1)
+from call.host_config import own_name  # noqa: E402  (this computer's name, in notes the phone shows)
 from voice import chains, commands, cursor_cli, files, minions, pickup, plans, reminders, snaps, spool, screenshot, subagents, usage, voices, workflows  # noqa: E402
 from voice.agents import AGENT_VOICES, DEFAULT_VOICE  # noqa: E402
 from voice.delivery import Refusal  # noqa: E402
@@ -629,7 +630,7 @@ def agents() -> dict:
         print(f"ended: {e}", file=sys.stderr)
         over = []
     listed = [{"session": s.session,
-               "name": s.spoken() + chat_named(s) + (" (laptop locked)" if s.in_editor and locked else ""),
+               "name": s.spoken() + chat_named(s) + (f" ({own_name()} locked)" if s.in_editor and locked else ""),
                "spawned": s.tab.owner == tmux.OWNER and s.tab.address in started,
                "team": teams.get(s.session, ""),
                "boss": bosses.get(s.session, ""),
@@ -798,7 +799,7 @@ def to_agent(words: str, session: str, heard: Heard, switch: bool = True, urgent
     # said out loud on the laptop too
     delivery = routing.deliver(words, heard, to=target, urgent=urgent, sender=sender, ear=ear, said_at=said_at)
     if not delivery:
-        return "", "Not sent: " + (delivery.why or "the laptop couldn't type it into the agent.")
+        return "", "Not sent: " + (delivery.why or f"{own_name()} couldn't type it into the agent.")
     got = target or last_speaker()
     return (got.spoken() if got else "your agent"), ""
 
@@ -861,12 +862,12 @@ async def share_file(request: web.Request) -> web.Response:
                 if size > MAX_UPLOAD:
                     raise OSError(f"bigger than {files.size_text(MAX_UPLOAD)}")
                 if size % (64 << 20) < len(chunk) and shutil.disk_usage(folder).free < KEEP_FREE:
-                    raise OSError("the laptop's disk is nearly full")
+                    raise OSError(f"{own_name()}'s disk is nearly full")
                 out.write(chunk)
         if not as_signed(request, digest.hexdigest()):
             raise OSError("it changed on the way (not what the phone signed)")
         if shutil.disk_usage(folder).free < KEEP_FREE:
-            raise OSError("the laptop's disk is nearly full")
+            raise OSError(f"{own_name()}'s disk is nearly full")
         while True:  # a link never replaces a file: another upload of the same name may land meanwhile
             path = files.unused(folder, name)
             try:
@@ -894,7 +895,7 @@ async def share_tell(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="expected JSON")
     paths = [files.received(n) for n in names]
     if None in paths:
-        return web.json_response({"note": "Some of those files never arrived on the laptop."}, status=400)
+        return web.json_response({"note": f"Some of those files never arrived on {own_name()}."}, status=400)
     text, note = str(shared.get("text", "")), str(shared.get("note", ""))
     if not paths and not (text + note).strip():
         return web.json_response({"note": "Nothing to share."}, status=400)
@@ -919,7 +920,7 @@ async def share_snap(request: web.Request) -> web.Response:
     except (ValueError, AttributeError, TypeError):
         raise web.HTTPBadRequest(text="expected JSON")
     if not paths or None in paths:
-        return web.json_response({"note": "That photo never arrived on the laptop."}, status=400)
+        return web.json_response({"note": f"That photo never arrived on {own_name()}."}, status=400)
     if not in_call():
         return web.json_response({"note": "The camera button is for calls: share it from the chat instead."}, status=400)
     snaps.add(paths, session)
@@ -1227,7 +1228,7 @@ class PhoneListening:
 
         def unsent(delivery) -> None:
             answer.clear()
-            answer.update({"note": "Not sent: " + (delivery.why or "the laptop couldn't type it into the agent."),
+            answer.update({"note": "Not sent: " + (delivery.why or f"{own_name()} couldn't type it into the agent."),
                            "unsent": turn.id})
 
         routing.act_on_turn(turn.text, turn.text, turn.heard, self.last, ear=Ears.PHONE, off=self.open_line_off,
@@ -1670,7 +1671,7 @@ async def show_send(request: web.Request) -> web.Response:
     what = str(body.get("what", "pane"))
     target = next((s for s in recent_speakers() if s.session == session), None)
     if target is None:
-        return web.json_response({"note": "That agent isn't known to the laptop."}, status=404)
+        return web.json_response({"note": f"That agent isn't known to {own_name()}."}, status=404)
     loop = asyncio.get_running_loop()
     wid = str(body.get("id", ""))
     if what == "find":
@@ -1815,7 +1816,7 @@ async def chat_plan(request: web.Request) -> web.Response:
     session = request.query.get("session", "")
     target = next((s for s in recent_speakers() if s.session == session), None)
     if target is None:
-        return web.json_response({"note": "That agent isn't known to the laptop."}, status=404)
+        return web.json_response({"note": f"That agent isn't known to {own_name()}."}, status=404)
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, project_of, target)
     plan = await loop.run_in_executor(None, plans.of_session, session, project)
@@ -1833,7 +1834,7 @@ async def chat_plan_build(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="expected JSON")
     target = next((s for s in recent_speakers() if s.session == session), None)
     if target is None:
-        return web.json_response({"note": "That agent isn't known to the laptop."}, status=404)
+        return web.json_response({"note": f"That agent isn't known to {own_name()}."}, status=404)
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, project_of, target)
     plan = await loop.run_in_executor(None, plans.of_session, session, project)
@@ -1877,7 +1878,7 @@ async def cursor_chat_open(request: web.Request) -> web.Response:
     if not found:
         return web.json_response({"note": "Cursor doesn't have that chat any more."}, status=404)
     if not await loop.run_in_executor(None, cursor_bridge.open_anywhere, chat, found["folder"]):
-        return web.json_response({"note": "Cursor didn't open it: is the laptop unlocked, with Henchline's bridge "
+        return web.json_response({"note": f"Cursor didn't open it: is {own_name()} unlocked, with Henchline's bridge "
                                           "in Cursor?"})
     speaker = Speaker(f"cursor-{chat}", "cursor", Path(found["folder"]).name)
     await loop.run_in_executor(None, speaker.remember)
@@ -1901,9 +1902,9 @@ async def crew_new(request: web.Request) -> web.Response:
     if match is None and typed:  # a path the user typed (and confirmed trusting): any folder of theirs that exists
         match = typed_folder(folder)
         if match is None:
-            return web.json_response({"note": f"Not a folder of yours on the laptop: {folder}"}, status=400)
+            return web.json_response({"note": f"Not a folder of yours on {own_name()}: {folder}"}, status=400)
     if match is None or agent not in tmux.available():
-        return web.json_response({"note": "Not a folder or agent the laptop offers."}, status=400)
+        return web.json_response({"note": f"Not a folder or agent {own_name()} offers."}, status=400)
     if model and settings and tmux.checked(agent, model, {str(k): str(v) for k, v in settings.items()}) is None:
         return web.json_response({"note": f"{agent} has no such setting for {model}."}, status=400)
     known = ({m["id"] for m in await loop.run_in_executor(None, tmux.models, agent)}
@@ -1975,7 +1976,7 @@ async def crew_commands(request: web.Request) -> web.Response:
     session = request.query.get("session", "")
     target = next((s for s in recent_speakers() if s.session == session), None)
     if target is None:
-        return web.json_response({"note": "That agent isn't known to the laptop."}, status=404)
+        return web.json_response({"note": f"That agent isn't known to {own_name()}."}, status=404)
     loop = asyncio.get_running_loop()
     project = await loop.run_in_executor(None, project_of, target)
     listed = await loop.run_in_executor(None, commands.listed, target.agent, project)
@@ -1994,7 +1995,7 @@ async def crew_models(request: web.Request) -> web.Response:
     if session:
         target = next((s for s in recent_speakers() if s.session == session), None)
         if target is None:
-            return web.json_response({"note": "That agent isn't known to the laptop."}, status=404)
+            return web.json_response({"note": f"That agent isn't known to {own_name()}."}, status=404)
         agent = target.agent
         # Codex's /model only opens a picker; a Cursor editor chat switches through the bridge (Cursor's own
         # "Switch to Model Slug", found 2026-11-16 after its "cycle model" proved out of reach)
@@ -2907,7 +2908,7 @@ async def crew_stop(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="expected JSON")
     target = next((s for s in recent_speakers() if s.session == session), None)
     if target is None:
-        return web.json_response({"note": "That agent isn't known to the laptop."}, status=404)
+        return web.json_response({"note": f"That agent isn't known to {own_name()}."}, status=404)
     loop = asyncio.get_running_loop()
     if target.in_editor:
         chat = cursor_bridge.chat_of(target.session)
@@ -3021,7 +3022,7 @@ async def voice_note(request: web.Request) -> web.Response:
     session = request.query.get("session", "")
     # Only an agent hands-free knows (as /text): the session is never made into a path
     if not any(s.session == session for s in recent_speakers()):
-        return web.json_response({"note": "That agent isn't known to the laptop."}, status=400)
+        return web.json_response({"note": f"That agent isn't known to {own_name()}."}, status=400)
     VOICE_NOTES.mkdir(parents=True, exist_ok=True)
     if sum(1 for m in VOICE_NOTES.glob("*.json") if read_json(m).get("status") in ("waiting", "transcribing")) >= 5:
         return web.json_response({"note": "Too many voice messages waiting."}, status=429)
@@ -3058,7 +3059,7 @@ async def voice_note_status(request: web.Request) -> web.Response:
         raise web.HTTPNotFound()
     if meta.get("status") == "waiting" and time.time() - meta.get("at", 0) > VOICE_NOTE_STALE:
         # Hands-free never got to it (off, or down): dropped now, so it is never typed after the phone gave up
-        meta.update(status="failed", note="Not sent: the laptop didn't transcribe it in time.")
+        meta.update(status="failed", note=f"Not sent: {own_name()} didn't transcribe it in time.")
         write_json(VOICE_NOTES / f"{nid}.json", meta, private=True)
         (VOICE_NOTES / f"{nid}.wav").unlink(missing_ok=True)
     return web.json_response({k: meta.get(k, "") for k in ("status", "text", "note")})
@@ -3196,7 +3197,7 @@ async def call(request: web.Request) -> web.WebSocketResponse:
                         CALL_HANGUP.unlink(missing_ok=True)
                         hung_up_here.append(True)
                         log(HANDSFREE_LOG, "call: hung up from the laptop")
-                        await ws.close(message=b"Hung up from the laptop")
+                        await ws.close(message=f"Hung up from {own_name()[:40]}".encode())
                         return
                 if time.monotonic() - listed > AGENTS_EVERY:  # the menu: who is reachable, who is current
                     listed = time.monotonic()
@@ -3517,6 +3518,7 @@ async def deliver_reminders(app: web.Application) -> None:
 
 async def start_watchers(app: web.Application) -> None:
     """The server's own loops: due reminders delivered, and finished workflow runs told to the phone."""
+    await asyncio.get_running_loop().run_in_executor(None, own_name)  # its first lookup (tailscale, ≤2 s) off the loop
     app["reminders"] = asyncio.create_task(deliver_reminders(app))
     app["workflows"] = asyncio.create_task(watch_workflows(app))
 

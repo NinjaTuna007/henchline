@@ -38,7 +38,7 @@ object PhoneAsr {
     /** Whether the laptop's manifest offers the model this app listens with; else why not. */
     fun offered(manifest: JSONObject): String? = when {
         manifest.optString("version") == MODEL && manifest.optString("engine") == ENGINE -> null
-        else -> "The laptop offers another speech model: update Henchline on both."
+        else -> "The computer offers another speech model: update Henchline on both."
     }
 
     fun ready(context: Context): Boolean = ModelDownload.ready(dir(context), REQUIRED)
@@ -66,7 +66,7 @@ object PhoneAsr {
 
     fun spec(context: Context) = ModelDownload.Spec(
         route = "/phone-asr", dir = dir(context), required = REQUIRED, safeName = ::safeName, offered = ::offered,
-        notPrepared = "The laptop hasn't prepared the speech model yet (python -m voice.phoneasr prepare).",
+        notPrepared = "${HostPush.capitalName(context)} hasn't prepared the speech model yet (python -m voice.phoneasr prepare).",
         minFree = MIN_FREE, elsewhere = { benchCopies(context, it) },
         whole = { stale(root(context)).forEach { clear(it) } })
 

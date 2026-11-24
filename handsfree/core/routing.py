@@ -822,7 +822,7 @@ def deliver_words(text: str, heard: Heard, to: Speaker | None = None, urgent: bo
         if ok:
             return Delivery.done()
         if desktop().locked():
-            return refuse(Refusal.SCREEN_LOCKED, "The laptop's screen is locked, so I can't type into Cursor. "
+            return refuse(Refusal.SCREEN_LOCKED, "The computer's screen is locked, so I can't type into Cursor. "
                           "Agents in a terminal still get your words.", quiet)
         return refuse(Refusal.NOT_RAISED, "I couldn't bring Cursor's window to the front, so I didn't type that "
                       "anywhere. Click Cursor's window and say it again.", quiet)

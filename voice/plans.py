@@ -70,7 +70,7 @@ def html(markdown: str) -> str:
                 code = []
             else:
                 if fence == "mermaid":
-                    out.append("<p><i>(a diagram: see it on the laptop)</i></p>")
+                    out.append("<p><i>(a diagram: see it on the computer)</i></p>")
                 else:
                     out.append("<p><tt>" + "<br>".join(escape.escape(c) for c in code) + "</tt></p>")
                 fence = None

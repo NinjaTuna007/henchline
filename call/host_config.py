@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import json
 import os
 import re
+import socket
+import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +33,46 @@ UTC_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 def utc_now() -> str:
     """RFC 3339 UTC to the second, the one form descriptors carry."""
     return rfc3339()
+
+
+def own_name(path: Path = DEFAULT_CONFIG) -> str:
+    """What this computer is called on the phone, for words the server sends it: host.json's label, else its own
+    name. Read each time (a renamed computer needs no restart); never raises."""
+    try:
+        label = json.loads(Path(path).read_text()).get("label")
+    except (OSError, ValueError, AttributeError):
+        label = None
+    label = "" if label is None else " ".join(str(label).split())[:80]
+    return label or _machine_name_once()
+
+
+@functools.lru_cache(maxsize=1)
+def _machine_name_once() -> str:
+    return machine_name()
+
+
+def machine_name() -> str:
+    """This computer's own name, for a host.json without a label: its Tailscale name (as the tailnet shows it to
+    phones), spelled the way the computer's hostname spells it when the two agree but for case, else the hostname.
+    Best effort: a missing or slow tailscale just leaves the hostname."""
+    own = socket.gethostname().split(".")[0].strip()
+    try:
+        out = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=2,
+                             check=False).stdout
+        me = json.loads(out).get("Self") or {}
+        # The tailnet's own name for it (MagicDNS, renamed in the admin console too), else the name it reports
+        tailnet = str(me.get("DNSName") or "").split(".")[0].strip() or str(me.get("HostName") or "").strip()
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        tailnet = ""
+    if tailnet and own.lower() != tailnet.lower():
+        return tailnet[:80]
+    return (own or tailnet or "Computer")[:80]
+
+
+def _label(value: Any) -> str:
+    """host.json's label when it has one, else this computer's own name."""
+    label = "" if value is None else str(value).strip()
+    return label or machine_name()
 
 
 def _utc_stamp(value: Any) -> str:
@@ -71,7 +114,7 @@ class HostConfig:
             raise ValueError("host config must be an object")
         try:
             host_id = str(uuid.UUID(str(raw["host_id"])))
-            label = str(raw["label"]).strip()
+            label = _label(raw.get("label"))
             base_url, expected = _origin(raw["base_url"])
             authority = str(raw["tls_authority"]).lower()
             seq = int(raw.get("descriptor_seq", 1))
@@ -128,6 +171,8 @@ def initialize(path: Path, *, label: str, base_url: str, capabilities: dict[str,
                now: str | None = None) -> HostConfig:
     """Create a stable host config without overwriting an existing identity.
 
+    A blank label is this computer's own name (machine_name), written down so it stays put.
+
     Everything is validated before the file exists, so a bad base URL or label
     leaves no half-made identity behind.
     """
@@ -137,7 +182,7 @@ def initialize(path: Path, *, label: str, base_url: str, capabilities: dict[str,
     base, authority = _origin(base_url)
     data = {
         "host_id": str(uuid.uuid4()),
-        "label": label,
+        "label": _label(label),
         "base_url": base,
         "tls_authority": authority,
         "api_version": API_VERSION,

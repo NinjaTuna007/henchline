@@ -110,7 +110,7 @@ object Messages {
 
     fun text(context: Context, session: String, words: String, id: String = "", urgent: Boolean = false,
              quick: Boolean = false): Sent = try {
-        val origin = Files.origin(context) ?: throw IllegalStateException("no laptop address set")
+        val origin = Files.origin(context) ?: throw IllegalStateException("no computer address set")
         // A delivery can take a while (a Cursor chat, a turn behind another); a timeout is taken as "away" and sent
         // again from the outbox, which the laptop answers by id without typing it twice
         (if (quick) QUICK else PATIENT).newCall(Request.Builder().url("$origin/text").header("Origin", origin)
@@ -118,10 +118,10 @@ object Messages {
                 .toRequestBody("application/json".toMediaType())).build()).execute().use { answer ->
             val body = try { JSONObject(answer.body?.string() ?: "") } catch (_: Exception) { JSONObject() }
             if (body.has("to")) Sent("", body.optBoolean("queued"))
-            else Sent(body.optString("note", "the laptop said ${answer.code}"), false)
+            else Sent(body.optString("note", "${HostPush.computerName(context)} said ${answer.code}"), false)
         }
     } catch (e: Exception) {
-        Sent("Not sent: ${e.message ?: "the laptop couldn't be reached"} (is Tailscale on?)", false, offline = true)
+        Sent("Not sent: ${e.message ?: "${HostPush.computerName(context)} couldn't be reached"} (is Tailscale on?)", false, offline = true)
     }
 
     private val QUICK = okhttp3.OkHttpClient.Builder().callTimeout(8, java.util.concurrent.TimeUnit.SECONDS).addNetworkInterceptor(LegacySigner).build()

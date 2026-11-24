@@ -65,7 +65,7 @@ class PhoneVoiceTest {
     @Test fun theLaptopsManifestMustOfferJenny() {
         assertNull(PhoneVoice.offered(JSONObject("""{"version": "vits-piper-en_GB-jenny_dioco-medium", "files": []}""")))
         // a laptop not yet updated still offers Kokoro: told to update it, nothing fetched
-        assertTrue(PhoneVoice.offered(JSONObject("""{"version": "kokoro-multi-lang-v1_0"}"""))!!.contains("laptop"))
+        assertTrue(PhoneVoice.offered(JSONObject("""{"version": "kokoro-multi-lang-v1_0"}"""))!!.contains("update Henchline on the computer"))
         assertTrue(PhoneVoice.offered(JSONObject("""{"version": "something-newer"}"""))!!.contains("update the app"))
         assertTrue(PhoneVoice.offered(JSONObject("{}")) != null)
     }

@@ -85,7 +85,7 @@ open class VoicePanel(activity: Activity) : BottomPanel(activity) {
         val old = PhoneVoice.staleSize(activity) / 1_000_000
         val status = TextView(activity).apply {
             textSize = 14f; setTextColor(colour(R.color.text))
-            text = JennyDownload.note ?: ("Jenny · about ${JennyDownload.ABOUT_MB} MB, from your laptop" +
+            text = JennyDownload.note ?: ("Jenny · about ${JennyDownload.ABOUT_MB} MB, from ${HostPush.computerName(activity)}" +
                 if (old > 0) " (the earlier voice's $old MB go once she's here)" else "")
             if (phase != null) visibility = android.view.View.GONE  // the bar says it
         }
@@ -166,10 +166,11 @@ class PhoneVoiceSheet(activity: Activity, private val changed: () -> Unit = {}) 
         content.removeAllViews()
         val ready = PhoneVoice.ready(activity)
         content.addView(TextView(activity).apply {
-            text = "On a call, the laptop sends the words and the phone says them itself, in one British voice for " +
-                "every agent (not the laptop's voices), so a weak signal (a lift, " +
+            val computer = HostPush.computerName(activity)
+            text = "On a call, $computer sends the words and the phone says them itself, in one British voice for " +
+                "every agent (not $computer's voices), so a weak signal (a lift, " +
                 "a train) cuts no words off. It uses this phone's processor while it speaks; if the phone falls " +
-                "behind, gets hot or runs low on battery, the laptop's audio takes over by itself."
+                "behind, gets hot or runs low on battery, $computer's audio takes over by itself."
             textSize = 13f; setTextColor(colour(R.color.muted))
         }, wide(0))
         if (ready) content.addView(TextView(activity).apply {

@@ -16,7 +16,7 @@ object PhoneEar {
     enum class Mode(val key: String, val label: String) {
         AUTOMATIC("automatic", "Automatic"),
         PHONE("phone", "Always phone"),
-        LAPTOP("laptop", "Always laptop");
+        LAPTOP("laptop", "Always computer");
 
         companion object {
             /** A stored value back to its mode; anything unknown is the default. */
@@ -34,10 +34,10 @@ object PhoneEar {
 
     /** The line under the setting in the Voices sheet. */
     fun line(chosen: Mode, ready: Boolean): String = when (effective(chosen, ready)) {
-        Mode.AUTOMATIC -> if (ready) "The laptop listens; when the line is bad, this phone does until it recovers."
-            else "The laptop listens. Download the speech model so this phone can listen when the line is bad."
-        Mode.PHONE -> "This phone hears you on every call, and sends the laptop your words."
-        Mode.LAPTOP -> "Only the laptop listens, as before: a bad line can cut your words."
+        Mode.AUTOMATIC -> if (ready) "The computer listens; when the line is bad, this phone does until it recovers."
+            else "The computer listens. Download the speech model so this phone can listen when the line is bad."
+        Mode.PHONE -> "This phone hears you on every call, and sends the computer your words."
+        Mode.LAPTOP -> "Only the computer listens, as before: a bad line can cut your words."
     }
 
     private fun prefs(context: Context) = context.getSharedPreferences("call", Context.MODE_PRIVATE)

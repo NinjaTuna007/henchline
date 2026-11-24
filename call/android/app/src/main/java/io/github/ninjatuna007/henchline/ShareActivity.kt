@@ -53,7 +53,7 @@ class ShareActivity : Activity() {
         val text = if (uris.isEmpty()) intent.getStringExtra(Intent.EXTRA_TEXT) ?: "" else ""
         if (uris.isEmpty() && text.isBlank()) return finish()
         if (Files.origin(this) == null) {
-            AlertDialog.Builder(this).setTitle("Henchline").setMessage("Set the laptop's address in Henchline first.")
+            AlertDialog.Builder(this).setTitle("Henchline").setMessage("Set ${HostPush.computerName(this)}'s address in Henchline first.")
                 .setPositiveButton("OK", null).setOnDismissListener { finish() }.show()
             return
         }

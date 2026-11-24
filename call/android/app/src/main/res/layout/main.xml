@@ -848,7 +848,7 @@
                 android:layout_weight="1"
                 android:ellipsize="middle"
                 android:maxLines="1"
-                android:text="Set the laptop's address"
+                android:text="Set your computer's address"
                 android:textColor="@color/text"
                 android:textSize="16sp" />
         </LinearLayout>

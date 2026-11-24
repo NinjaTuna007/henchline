@@ -54,7 +54,7 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
     }
 
     private fun askAddress(typed: String = "") {
-        val address = box("laptop.your-tailnet.ts.net", typed)
+        val address = box("computer.your-tailnet.ts.net", typed)
         AlertDialog.Builder(activity)
             .setTitle("Pair a computer")
             .setMessage("On the computer, run: voice-call pair\nIt shows its address, a fingerprint and a code.")
@@ -148,7 +148,7 @@ class HostsSheet(private val activity: Activity, private val onChanged: () -> Un
         Store(activity).use { store -> if (store.migratedTo() != null) { show(); return } }
         AlertDialog.Builder(activity)
             .setTitle("Bring your chats along?")
-            .setMessage("${host.label} is the laptop this phone already talks to. Copy its chats, calls and unsent messages " +
+            .setMessage("${host.label} is the computer this phone already talks to. Copy its chats, calls and unsent messages " +
                 "on this phone into the new store for ${host.label}? Nothing is deleted or changed; the app keeps working as now.")
             .setPositiveButton("Copy") { _, _ -> background {
                 val prefs = activity.getSharedPreferences("call", android.content.Context.MODE_PRIVATE).all

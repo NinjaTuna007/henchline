@@ -91,8 +91,8 @@ object PhoneVoice {
     /** Whether the laptop's manifest offers the model this app speaks with; else why not. */
     fun offered(manifest: JSONObject): String? = when {
         manifest.optString("version") == MODEL -> null
-        manifest.optString("version").startsWith("kokoro") -> "The laptop still offers the earlier voice: update Henchline on the laptop."
-        else -> "The laptop offers another voice model: update the app."
+        manifest.optString("version").startsWith("kokoro") -> "The computer still offers the earlier voice: update Henchline on the computer."
+        else -> "The computer offers another voice model: update the app."
     }
 
     /** Downloaded and every file checked: the manifest it was checked against is kept as the marker (an older
@@ -120,7 +120,7 @@ object PhoneVoice {
      *  earlier voice's folder goes once she's whole, not before, so a cut download leaves the phone no worse off. */
     fun spec(context: Context) = ModelDownload.Spec(
         route = "/phone-voice", dir = dir(context), required = REQUIRED, safeName = ::safeName, offered = ::offered,
-        notPrepared = "The laptop hasn't prepared the voice yet (python -m voice.phonevoice prepare).",
+        notPrepared = "${HostPush.capitalName(context)} hasn't prepared the voice yet (python -m voice.phonevoice prepare).",
         whole = { stale(context).forEach { it.deleteRecursively() } })
 
     // --- the engine -----------------------------------------------------------------------------------------

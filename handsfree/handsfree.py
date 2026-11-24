@@ -98,6 +98,7 @@ import tray  # noqa: E402
 from listener import Listener  # noqa: E402
 from sensing import EC_UNIT, start_canceller  # noqa: E402
 from voice import files  # noqa: E402
+from call.host_config import own_name  # noqa: E402
 from voice.speech import whisper  # noqa: E402
 from voice.state import (ANNOUNCE, AWAY, BY_HANDSFREE, CALL_CHECK, CALL_HANGUP, CALL_MIRROR, CALL_ORIGIN, CALL_RING, CALL_RINGER,  # noqa: E402
                          CHAT_KEY, CLOSE, HANDSFREE_LOG, HANDSFREE_ON, TEXTS, VOICE_NOTE_STALE, VOICE_NOTES, read_json,
@@ -542,7 +543,7 @@ def voice_notes(transcriber: whisper.Transcriber, stop: threading.Event) -> None
                 voice_note(transcriber, meta_path)
             except Exception as exc:
                 log(HANDSFREE_LOG, f"voice message {meta_path.stem} failed: {exc!r}")
-                write_json(meta_path, {**read_json(meta_path), "status": "failed", "note": "The laptop failed on it."},
+                write_json(meta_path, {**read_json(meta_path), "status": "failed", "note": f"{own_name()} failed on it."},
                            private=True)
                 meta_path.with_suffix(".wav").unlink(missing_ok=True)
 
@@ -556,7 +557,7 @@ def voice_note(transcriber: whisper.Transcriber, meta_path: Path) -> None:
             meta_path.unlink(missing_ok=True)
         return
     if age > VOICE_NOTE_STALE:  # the phone has given up on it: never typed late
-        late = "Not sent: the laptop didn't transcribe it in time."
+        late = f"Not sent: {own_name()} didn't transcribe it in time."
         write_json(meta_path, {**meta, "status": "failed", "note": late}, private=True)
         wav.unlink(missing_ok=True)
         return

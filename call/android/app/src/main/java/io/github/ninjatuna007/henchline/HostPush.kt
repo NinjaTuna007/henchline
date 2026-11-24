@@ -106,6 +106,18 @@ object HostPush {
         return prefs.getString(LAPTOP_LABEL, null)?.takeIf { it.isNotBlank() && prefs.getString(LAPTOP_FOR, null) == at }
     }
 
+    /** The main computer's name in the app's words: its own label (from its descriptor, so each computer names
+     *  itself) once learned, else a neutral "your computer"; never a fixed machine name. */
+    fun computerName(context: Context): String = nameOr(laptopLabel(context))
+
+    /** computerName at the start of a sentence: "Your computer", or the label as the computer spells it. */
+    fun capitalName(context: Context): String = computerName(context).replaceFirstChar { it.uppercaseChar() }
+
+    /** The label when there is one, else UNNAMED. */
+    fun nameOr(label: String?): String = label?.trim()?.takeIf { it.isNotEmpty() } ?: UNNAMED
+
+    const val UNNAMED = "your computer"
+
     /** The laptop's id as learned, asked for again (off the main thread) when not known yet. */
     fun laptopIdOrLearn(context: Context): String? = knownLaptopId(context) ?: run {
         val now = System.currentTimeMillis()

@@ -56,7 +56,7 @@ object Files {
      *  thread). size: the file's size, to know it again among copies saved before this was remembered. */
     fun open(context: Context, url: String, name: String, type: String, size: Long = 0, session: String = "",
              note: (String) -> Unit) {
-        val address = resolve(context, url) ?: return note("That file isn't from your laptop's address, so I didn't open it.")
+        val address = resolve(context, url) ?: return note("That file isn't from ${HostPush.computerName(context)}'s address, so I didn't open it.")
         val main = android.os.Handler(context.mainLooper)
         Thread {
             val kept = savedCopy(context, address, name, size)
@@ -82,7 +82,7 @@ object Files {
 
     /** That file in Downloads/Henchline, saved there first if it isn't yet (off the main thread): for sharing it. */
     fun keep(context: Context, url: String, name: String, type: String, size: Long = 0, session: String = ""): Uri {
-        val address = resolve(context, url) ?: throw IllegalStateException("not from your laptop's address")
+        val address = resolve(context, url) ?: throw IllegalStateException("not from ${HostPush.computerName(context)}'s address")
         val saved = savedCopy(context, address, name, size)
             ?: download(context, address, name, type).also { remember(context, address, it) }
         Media.record(context, saved, address, name, session)
@@ -147,7 +147,7 @@ object Files {
                 resolver.openOutputStream(uri)!!.use { out -> fetched.inputStream().use { it.copyTo(out) } }
             } else client.newCall(Request.Builder().url(url).build()).execute().use { answer ->
                 if (!answer.isSuccessful) throw IllegalStateException(
-                    if (answer.code == 404) "the laptop no longer has it (kept a week)" else "the laptop said ${answer.code}")
+                    if (answer.code == 404) "${HostPush.computerName(context)} no longer has it (kept a week)" else "${HostPush.computerName(context)} said ${answer.code}")
                 resolver.openOutputStream(uri)!!.use { out -> answer.body!!.byteStream().copyTo(out) }
             }
         } catch (e: Exception) {

@@ -22,7 +22,7 @@ PHONE = [
     ("usage", "Plan limits and context, as bars"),
     ("context", "How full the context is, and what fills it"),
     ("workflow", "This chat's workflows: phases and agents, live"),
-    ("away", "Away on or off: no listening at the laptop, agents text you instead of speaking"),
+    ("away", "Away on or off: no listening at the computer, agents text you instead of speaking"),
     ("show", "A picture of this terminal, the screen, or one window"),
 ]
 

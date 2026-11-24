@@ -64,7 +64,7 @@ class PhoneAsrTest {
         assertEquals(PhoneEar.Mode.AUTOMATIC, PhoneEar.Mode.of(null))
         assertEquals(PhoneEar.Mode.AUTOMATIC, PhoneEar.Mode.of("nonsense"))
         for (m in PhoneEar.Mode.entries) assertEquals(m, PhoneEar.Mode.of(m.key))
-        assertEquals(listOf("Automatic", "Always phone", "Always laptop"), PhoneEar.Mode.entries.map { it.label })
+        assertEquals(listOf("Automatic", "Always phone", "Always computer"), PhoneEar.Mode.entries.map { it.label })
         // Always phone waits for the model; the others stand as chosen
         assertEquals(PhoneEar.Mode.AUTOMATIC, PhoneEar.effective(PhoneEar.Mode.PHONE, ready = false))
         assertEquals(PhoneEar.Mode.PHONE, PhoneEar.effective(PhoneEar.Mode.PHONE, ready = true))

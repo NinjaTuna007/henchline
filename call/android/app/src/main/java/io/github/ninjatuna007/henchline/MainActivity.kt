@@ -596,7 +596,7 @@ class MainActivity : Activity() {
     private fun showServer() {
         findViewById<TextView>(R.id.server).text =
             prefs().getString("server", "")?.removePrefix("https://")?.trimEnd('/')?.ifEmpty { null }
-                ?: "Set the laptop's address"
+                ?: "Set ${HostPush.computerName(this)}'s address"
     }
 
     /** While the app is open, texts that never came as a push are fetched every 15 s (Messages.catchUp). */
@@ -703,10 +703,10 @@ class MainActivity : Activity() {
     private fun askServer(then: () -> Unit) {
         val box = EditText(this).apply {
             setText(prefs().getString("server", "https://"))
-            hint = "https://laptop.your-tailnet.ts.net/"
+            hint = "https://computer.your-tailnet.ts.net/"
         }
         AlertDialog.Builder(this)
-            .setTitle("The laptop's address")
+            .setTitle("${HostPush.capitalName(this)}'s address")
             .setView(LinearLayout(this).apply { setPadding(48, 16, 48, 0); addView(box) })
             .setPositiveButton("Save") { _, _ ->
                 prefs().edit().putString("server", box.text.toString().trim()).apply()
@@ -984,7 +984,7 @@ class MainActivity : Activity() {
             val laptopChats = if (query.isEmpty()) groups.filter { it.first != "Pinned" } else listOf("" to byRecent)
             if (query.isEmpty() || byRecent.isNotEmpty()) {
                 val open = query.isNotEmpty() || LAPTOP !in folded
-                into = computerCard(LAPTOP, HostPush.laptopLabel(this) ?: "This laptop",
+                into = computerCard(LAPTOP, HostPush.capitalName(this),
                     if (names.isNotEmpty()) HostLists.Dot.LIVE else HostLists.Dot.UNKNOWN, "",
                     rest.sumOf { unread(it.session, it.last) }, open, null, accents.getValue(LAPTOP))
                 if (open) drawGroups(laptopChats.filter { it.second.isNotEmpty() }, inComputer = true)
@@ -2666,7 +2666,7 @@ class MainActivity : Activity() {
 
     private fun showUsage(fresh: Boolean = false) {
         val waiting = TextView(this).apply {
-            text = if (fresh) "Asking every AI again…" else "Asking the laptop…"
+            text = if (fresh) "Asking every AI again…" else "Asking ${HostPush.computerName(this@MainActivity)}…"
             setTextColor(getColor(R.color.muted)); setPadding(dp(20), dp(24), dp(20), dp(24))
         }
         if (fresh) crew.removeAllViews()
@@ -3080,7 +3080,7 @@ class MainActivity : Activity() {
     }
 
     private fun computerMenu(key: String, label: String, host: Host?) {
-        panel = ActionsSheet(this, label, if (host == null) "This phone's laptop" else host.baseUrl, buildList {
+        panel = ActionsSheet(this, label, if (host == null) "This phone's main computer" else host.baseUrl, buildList {
             add(Triple("➕", "New chat on $label") { newChat(host?.hostId ?: LAPTOP) })
             add(Triple("↻", "Refresh") { if (host == null) findCrew() else HostLists.refresh(this@MainActivity, host) })
             add(Triple("🎨", "Colour") {
@@ -3404,10 +3404,10 @@ class MainActivity : Activity() {
         explain(soundRow, "Calls start with it. The call menu changes it for one call.")
         explain(thoughts, "The agents' thought bubbles in the chat.")
         explain(dance, "Avatars move while an agent works. Off: a calmer screen.")
-        explain(server, "Your laptop's address on Tailscale: where Henchline reaches your agents.")
+        explain(server, "${HostPush.capitalName(this)}'s address on Tailscale: where Henchline reaches your agents.")
         section(soundRow, "CALLS")
         section(thoughts, "CHATS")
-        section(server, "LAPTOP")
+        section(server, HostPush.computerName(this).uppercase())
 
         fun line(title: String, value: TextView, onClick: () -> Unit) = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
@@ -3435,13 +3435,13 @@ class MainActivity : Activity() {
         val voiceValue = TextView(this)
         fun showVoice() {
             voiceValue.text = VoiceSource.summary(PhoneVoice.ready(this@MainActivity) && PhoneVoice.enabled(this@MainActivity),
-                PhoneVoice.laptopMode(this@MainActivity))
+                PhoneVoice.laptopMode(this@MainActivity), HostPush.laptopLabel(this@MainActivity) ?: "Computer")
         }
         showVoice()
         voicesChanged = { runOnUiThread { showVoice() } }
         list.addView(line("Agents' voices", voiceValue) { voices() })
         list.addView(TextView(this).apply {
-            text = "Made on the laptop, each its own or one for all, or by this phone: a weak signal cuts no words off."
+            text = "Made on ${HostPush.computerName(this@MainActivity)}, each its own or one for all, or by this phone: a weak signal cuts no words off."
             textSize = 13f; setTextColor(getColor(R.color.muted)); setPadding(dp(20), 0, dp(20), dp(10))
         })
         list.addView(UsageDraw(this).label("NEW CALLS").apply { setPadding(dp(20), dp(24), dp(20), dp(6)) })
@@ -3471,7 +3471,7 @@ class MainActivity : Activity() {
             })
             list.addView(computers)
             list.addView(TextView(this).apply {
-                text = "Pair this phone with other computers running Henchline. Your laptop's chats are unchanged."
+                text = "Pair this phone with other computers running Henchline. ${HostPush.capitalName(this@MainActivity)}'s chats are unchanged."
                 textSize = 13f; setTextColor(getColor(R.color.muted)); setPadding(dp(20), 0, dp(20), dp(10))
             })
             showMulti()
@@ -3504,7 +3504,7 @@ class MainActivity : Activity() {
         if (Files.origin(this) == null) return
         ask("/voices", null) { answer ->
             if (!answer.has("showing")) {
-                android.widget.Toast.makeText(this, answer.optString("note").ifEmpty { "Couldn't reach the laptop." },
+                android.widget.Toast.makeText(this, answer.optString("note").ifEmpty { "Couldn't reach ${HostPush.computerName(this)}." },
                     android.widget.Toast.LENGTH_LONG).show()
                 return@ask
             }
@@ -3535,7 +3535,7 @@ class MainActivity : Activity() {
         ask("/away", JSONObject().put("on", to)) { answer ->
             if (!answer.has("away")) {  // not reached: as it was
                 showAway(!to)
-                android.widget.Toast.makeText(this, "Couldn't reach the laptop.", android.widget.Toast.LENGTH_SHORT).show()
+                android.widget.Toast.makeText(this, "Couldn't reach ${HostPush.computerName(this)}.", android.widget.Toast.LENGTH_SHORT).show()
                 return@ask
             }
             showAway(answer.optBoolean("away"))
@@ -3543,7 +3543,7 @@ class MainActivity : Activity() {
                 prefs().edit().putBoolean("away_card", true).apply()
                 android.app.AlertDialog.Builder(this)
                     .setTitle("Away")
-                    .setMessage("The laptop stops listening. Agents are told, and they text you. Push-to-talk still works.")
+                    .setMessage("${HostPush.capitalName(this)} stops listening. Agents are told, and they text you. Push-to-talk still works.")
                     .setPositiveButton("OK", null)
                     .show()
             }
@@ -3754,7 +3754,7 @@ class MainActivity : Activity() {
 
     /** Pull down on the list: the laptop looks for every agent running (as "switch me to" does) and lists them. */
     private fun findCrew() {
-        val origin = Files.origin(this) ?: run { refresh.isRefreshing = false; return say("", "Set the laptop's address in Settings first.", note = true).let {} }
+        val origin = Files.origin(this) ?: run { refresh.isRefreshing = false; return say("", "Set ${HostPush.computerName(this)}'s address in Settings first.", note = true).let {} }
         Thread {
             val found = try {
                 Files.client.newCall(okhttp3.Request.Builder().url("$origin/crew").header("Origin", origin)
@@ -3764,11 +3764,11 @@ class MainActivity : Activity() {
             main.post {
                 refresh.isRefreshing = false
                 if (found == null) {
-                    android.widget.Toast.makeText(this, "Couldn't reach the laptop (is Tailscale on?)", android.widget.Toast.LENGTH_SHORT).show()
+                    android.widget.Toast.makeText(this, "Couldn't reach ${HostPush.computerName(this)} (is Tailscale on?)", android.widget.Toast.LENGTH_SHORT).show()
                     return@post
                 }
                 if (!found.has("agents")) {
-                    android.widget.Toast.makeText(this, "Couldn't reach the laptop (is Tailscale on?)", android.widget.Toast.LENGTH_SHORT).show()
+                    android.widget.Toast.makeText(this, "Couldn't reach ${HostPush.computerName(this)} (is Tailscale on?)", android.widget.Toast.LENGTH_SHORT).show()
                     return@post
                 }
                 takeCrew(found)
@@ -3779,8 +3779,8 @@ class MainActivity : Activity() {
 
     /** A request to the laptop off the main thread: the JSON answer (with "note" saying why not), on the main thread. */
     private fun ask(path: String, body: JSONObject?, then: (JSONObject) -> Unit) {
-        val origin = Files.origin(this) ?: return say("", "Set the laptop's address in Settings first.", note = true).let {}
-        askAt(origin, "the laptop", path, body, then)
+        val origin = Files.origin(this) ?: return say("", "Set ${HostPush.computerName(this)}'s address in Settings first.", note = true).let {}
+        askAt(origin, HostPush.computerName(this), path, body, then)
     }
 
     /** The same request to any computer's address: another paired computer's is signed on the way (LegacySigner,
@@ -3893,12 +3893,12 @@ class MainActivity : Activity() {
         val offline = computers.filter { HostLists.status(looks[it.hostId], now).first == HostLists.Dot.OFFLINE }.map { it.hostId }.toSet()
         val key = HostLists.newChatOn(on, prefs().getString(NEW_CHAT_ON, null), computers.map { it.hostId }, offline, LAPTOP)
         val host = computers.firstOrNull { it.hostId == key }
-        val who = host?.label ?: "the laptop"
+        val who = host?.label ?: HostPush.computerName(this)
         // Another computer's requests go to its own address only, never the laptop's in its place
         val origin = if (host != null) HostPush.origin(host.baseUrl)?.trimEnd('/')
             ?: return failed("${host.label}'s address can't be used: pair it again in Settings › Computers.")
-        else Files.origin(this) ?: return if (reply != null) failed("Set the laptop's address in Settings first.")
-            else say("", "Set the laptop's address in Settings first.", note = true).let {}
+        else Files.origin(this) ?: return if (reply != null) failed("Set ${HostPush.computerName(this)}'s address in Settings first.")
+            else say("", "Set ${HostPush.computerName(this)}'s address in Settings first.", note = true).let {}
         askAt(origin, who, "/crew/folders", null) { answer ->
             val folders = answer.optJSONArray("folders")
             val agents = answer.optJSONArray("agents")
@@ -3933,7 +3933,7 @@ class MainActivity : Activity() {
                     }
                 },
                 computers = if (computers.isEmpty()) emptyList()
-                    else listOf(LAPTOP to (HostPush.laptopLabel(this) ?: "This laptop")) + computers.map { it.hostId to it.label },
+                    else listOf(LAPTOP to HostPush.capitalName(this)) + computers.map { it.hostId to it.label },
                 computer = key,
                 offline = offline,
                 pickComputer = { picked, answer -> newChat(picked, answer) }
@@ -3960,7 +3960,7 @@ class MainActivity : Activity() {
     private fun cursorChats() {
         ask("/crew/cursor-chats", null) { answer ->
             val list = answer.optJSONArray("chats")
-                ?: return@ask android.widget.Toast.makeText(this, answer.optString("note").ifEmpty { "The laptop didn't list them." },
+                ?: return@ask android.widget.Toast.makeText(this, answer.optString("note").ifEmpty { "${HostPush.capitalName(this)} didn't list them." },
                     android.widget.Toast.LENGTH_LONG).show()
             panel = CursorChatsSheet(this, (0 until list.length()).map { list.getJSONObject(it) }) { session, done ->
                 ask("/crew/cursor-chats/open", JSONObject().put("session", session)) { opened ->
@@ -4326,7 +4326,7 @@ class MainActivity : Activity() {
         "later" to "Send a message later: /later your words, then pick a time",
         "usage" to "Plan limits and context, as bars", "context" to "How full the context is, and what fills it",
         "workflow" to "This chat's workflows: phases and agents, live",
-        "away" to "Away on or off: no listening at the laptop, agents text you instead of speaking",
+        "away" to "Away on or off: no listening at the computer, agents text you instead of speaking",
         "show" to "A picture of this terminal, the screen, or one window",
     ).map { (name, about) -> JSONObject().put("name", name).put("about", about).put("kind", "phone") }
 
@@ -4385,8 +4385,8 @@ class MainActivity : Activity() {
             "workflow" -> workflows()
             "away" -> ask("/away", JSONObject()) { answer ->
                 android.widget.Toast.makeText(this, if (answer.optBoolean("away"))
-                    "Away: the laptop isn't listening, and agents text you instead of speaking. /away again, or a call, ends it."
-                    else "Back: hands-free listens and agents speak at the laptop again.", android.widget.Toast.LENGTH_LONG).show()
+                    "Away: ${HostPush.computerName(this)} isn't listening, and agents text you instead of speaking. /away again, or a call, ends it."
+                    else "Back: hands-free listens and agents speak at ${HostPush.computerName(this)} again.", android.widget.Toast.LENGTH_LONG).show()
             }
             "show" -> showGrab("")
         }
@@ -4499,7 +4499,7 @@ class MainActivity : Activity() {
                     val sent = Messages.text(this, session, "/rename $name", java.util.UUID.randomUUID().toString())
                     main.post {
                         android.widget.Toast.makeText(this, when {
-                            sent.offline -> "Not renamed: the laptop couldn't be reached"
+                            sent.offline -> "Not renamed: ${HostPush.computerName(this)} couldn't be reached"
                             sent.note.isNotEmpty() -> sent.note
                             else -> "Renamed to “$name”"
                         }, android.widget.Toast.LENGTH_LONG).show()

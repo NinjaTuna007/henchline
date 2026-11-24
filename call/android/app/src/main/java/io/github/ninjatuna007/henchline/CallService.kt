@@ -233,6 +233,10 @@ class CallService : Service() {
     val voiceFellBehind get() = voiceFailed || phoneVoice?.fellBehind == true
     /** This call is with another computer: its voices aren't the laptop's, so the phone's own voice can't stand in. */
     val otherHost get() = hostId != null
+
+    /** The computer this call is with, by its own name: a paired computer's label, else the main one's. */
+    private fun computer(): String = hostId?.let { id -> HostPush.hostsOrNull(HostRegistry.of(this))?.firstOrNull { it.hostId == id }?.label ?: "the computer" }
+        ?: HostPush.computerName(this)
     @Volatile private var lastDrop = ""  // why the line last dropped: told to the laptop once it's back
     @Volatile private var running = false
     @Volatile private var link = 0  // which connection is the call's now: a dropped one's late words are ignored
@@ -492,7 +496,7 @@ class CallService : Service() {
                     ears = null
                     hearing.close()
                     if (running) tell(org.json.JSONObject().put("note",
-                        "This phone couldn't load its speech model: the laptop hears you on this call.").toString())
+                        "This phone couldn't load its speech model: ${computer()} hears you on this call.").toString())
                 }
             }
         }, "henchline-ears-load").start()
@@ -525,7 +529,7 @@ class CallService : Service() {
         earMessage()?.let { socket?.send(it) }
         android.util.Log.w("Henchline", "call: the phone's ears stopped: the laptop hears the user again")
         tell(org.json.JSONObject().put("ears", "laptop").toString())
-        tell(org.json.JSONObject().put("note", "This phone stopped hearing you: the laptop does again.").toString())
+        tell(org.json.JSONObject().put("note", "This phone stopped hearing you: ${computer()} does again.").toString())
     }
 
     /** {"ear": "phone", "from_ms", "t"} (both elapsedRealtime: only their difference counts on the server). */
@@ -808,7 +812,7 @@ class CallService : Service() {
         val me = ++link
         val base = Uri.parse(server)
         if (base.scheme != "https") {  // Android refuses plain http, and the call page needs https for the mic
-            fail("The address must start with https:// (the laptop's `tailscale serve` name). Long-press Call.")
+            fail("The address must start with https:// (the computer's `tailscale serve` name). Long-press Call.")
             return
         }
         val origin = "${base.scheme}://${base.authority}"  // the server lets only its own page's origin in

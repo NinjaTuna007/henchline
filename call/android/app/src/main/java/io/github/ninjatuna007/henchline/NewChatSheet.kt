@@ -347,7 +347,7 @@ class NewChatSheet(
 
     fun show() {
         val where = computers.firstOrNull { it.first == computer }?.second
-        val sheet = open("New chat", if (where == null) "Starts an agent on your laptop, in its own tmux window"
+        val sheet = open("New chat", if (where == null) "Starts an agent on ${HostPush.computerName(activity)}, in its own tmux window"
             else "Starts an agent on $where, in its own tmux window")
         if (computers.size > 1 && pickComputer != null) {
             sheet.addView(label("COMPUTER"), wide(16))
@@ -587,9 +587,9 @@ class ChatActionsSheet(
         rows.addView(row("🗑", "Remove chat", "From this phone's list; it comes back only if the agent is still running", R.color.text) {
             onRemove(); close()
         })
-        if (canEnd && !gone) rows.addView(row("⏹", "End agent", "Closes its tmux window on the laptop", R.color.hang) { confirm(rows) })
+        if (canEnd && !gone) rows.addView(row("⏹", "End agent", "Closes its tmux window on ${HostPush.computerName(activity)}", R.color.hang) { confirm(rows) })
         else if (!gone) rows.addView(TextView(activity).apply {
-            text = "Started on the laptop, so it can't be ended from here."
+            text = "Started on ${HostPush.computerName(activity)}, so it can't be ended from here."
             setTextColor(colour(R.color.muted)); textSize = 12f; setPadding(px(4), px(8), px(4), 0)
         })
         sheet.addView(quiet("Cancel") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -883,7 +883,7 @@ class LaterSheet(
         sheet.addView(rows, wide(16))
         if (words.isNotEmpty()) {
             val awake = android.widget.CheckBox(activity).apply {
-                text = "Keep the laptop awake until then (a wake-up)"
+                text = "Keep ${HostPush.computerName(activity)} awake until then (a wake-up)"
                 setTextColor(colour(R.color.text)); textSize = 14f
                 buttonTintList = android.content.res.ColorStateList.valueOf(colour(R.color.cyan))
             }
@@ -940,7 +940,7 @@ class CursorChatsSheet(
     private val pick: (session: String, done: (String?) -> Unit) -> Unit,
 ) : BottomPanel(activity) {
     fun show() {
-        val sheet = open("Cursor chats", "Opens it in Cursor on the laptop, then you can talk to it here")
+        val sheet = open("Cursor chats", "Opens it in Cursor on ${HostPush.computerName(activity)}, then you can talk to it here")
         val rows = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         val status = TextView(activity).apply { textSize = 13f; setTextColor(colour(R.color.muted)); visibility = View.GONE }
         fun ago(ms: Long): String {
@@ -970,7 +970,7 @@ class CursorChatsSheet(
                 })
             }
             if (shown.isEmpty()) rows.addView(TextView(activity).apply {
-                text = if (chats.isEmpty()) "No Cursor chats found on the laptop." else "No chat matches."
+                text = if (chats.isEmpty()) "No Cursor chats found on ${HostPush.computerName(activity)}." else "No chat matches."
                 setTextColor(colour(R.color.muted)); textSize = 13f; setPadding(px(4), px(12), px(4), px(12))
             })
         }
@@ -1317,7 +1317,7 @@ class MinionSheet(
                 val refresh = {
                     val seconds = if (since > 0) (nowSeconds() - since).coerceAtLeast(0.0) else 0.0
                     if (since > 0 && seconds >= 90) {
-                        detail.text = "Still starting · the laptop hasn't seen its chat yet"
+                        detail.text = "Still starting · ${HostPush.computerName(activity)} hasn't seen its chat yet"
                         detail.setTextColor(colour(R.color.hang))
                     } else {
                         detail.text = if (since > 0) "Starting · ${took(seconds)}" else "Starting"
@@ -1579,7 +1579,7 @@ class YouSheet(
     private val onSettings: () -> Unit,
 ) : BottomPanel(activity) {
     fun show() {
-        val sheet = open(name, if (away) "Away: agents text you, the laptop isn't listening" else "Available")
+        val sheet = open(name, if (away) "Away: agents text you, ${HostPush.computerName(activity)} isn't listening" else "Available")
         val track = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             background = rounded(colour(R.color.surface), 20f); setPadding(px(3), px(3), px(3), px(3))
@@ -1591,7 +1591,7 @@ class YouSheet(
             setOnClickListener { close(); onAway(on) }
         }, LinearLayout.LayoutParams(0, px(38), 1f))
         sheet.addView(track, wide(16))
-        sheet.addView(actionRow("⚙", "Settings", "Calls, chats, your laptop", R.color.text) { close(); onSettings() }, wide(14))
+        sheet.addView(actionRow("⚙", "Settings", "Calls, chats, ${HostPush.computerName(activity)}", R.color.text) { close(); onSettings() }, wide(14))
         sheet.addView(quiet("Close") { close() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { gravity = Gravity.END; topMargin = px(8) })
     }
@@ -1697,7 +1697,7 @@ class VoicesSheet(
         if (!running && phase == null) body.addView(TextView(activity).apply {  // the bar says it while there is one
             textSize = 14f; setTextColor(colour(R.color.text))
             text = if (ready) "${PhoneAsr.NAME} · ready · ${PhoneAsr.sizeOnPhone(activity) / 1_000_000} MB on this phone"
-                else PhoneAsr.download.note ?: "${PhoneAsr.NAME} · about ${PhoneAsr.ABOUT_MB} MB, from your laptop (Wi-Fi)"
+                else PhoneAsr.download.note ?: "${PhoneAsr.NAME} · about ${PhoneAsr.ABOUT_MB} MB, from ${HostPush.computerName(activity)} (Wi-Fi)"
         }, wide(10))
         if (running) body.addView(quiet("Cancel") { PhoneAsr.download.cancel() },
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -1742,7 +1742,7 @@ class VoicesSheet(
         val metered = !PhoneVoice.unmetered(activity)
         android.app.AlertDialog.Builder(activity)
             .setTitle("Download the speech model?")
-            .setMessage("Always phone needs it: up to ${PhoneAsr.ABOUT_MB} MB from your laptop (less if part of it is " +
+            .setMessage("Always phone needs it: up to ${PhoneAsr.ABOUT_MB} MB from ${HostPush.computerName(activity)} (less if part of it is " +
                 "already on this phone)." + if (metered) " You're not on Wi-Fi: it would use mobile data." else "")
             .setPositiveButton("Download") { _, _ -> startEars(body, mobileOk = metered, thenPhone = true) }  // consent only when the dialog said mobile data
             .setNegativeButton("Not now", null)
@@ -1764,7 +1764,7 @@ class VoicesSheet(
             orientation = LinearLayout.HORIZONTAL
             background = rounded(colour(R.color.navy), 20f); setPadding(px(3), px(3), px(3), px(3))
         }
-        for ((phone, words) in listOf(false to "Laptop", true to "Phone")) {
+        for ((phone, words) in listOf(false to (HostPush.laptopLabel(activity) ?: "Computer"), true to "Phone")) {
             val on = phone == state.phone
             track.addView(TextView(activity).apply {
                 text = words; gravity = Gravity.CENTER; textSize = 13f
@@ -1829,7 +1829,7 @@ class VoicesSheet(
             }, LinearLayout.LayoutParams(px(48), px(48)))
         }, wide(16))
         body.addView(TextView(activity).apply {
-            text = "Your laptop voices are kept for when you switch back."
+            text = "${HostPush.capitalName(activity)}'s voices are kept for when you switch back."
             textSize = 12f; setTextColor(colour(R.color.muted))
         }, wide(4))
         body.addView(quiet("Manage download") { PhoneVoiceSheet(activity) { activity.runOnUiThread { if (isOpen) draw(body) } }.show() },

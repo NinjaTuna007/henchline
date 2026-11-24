@@ -26,6 +26,11 @@ class HostPushTest {
     private fun ring(hostId: String) = JSONObject().put("agent", "claude").put("why", "done").put("reply", "r").put("host_id", hostId)
     private fun file(hostId: String) = JSONObject().put("agent", "claude").put("file", JSONObject().put("url", "u")).put("host_id", hostId)
 
+    @Test fun theMainComputerIsCalledByItsOwnLabelElseNeutrally() {
+        assertEquals("Studio", HostPush.nameOr(" Studio "))  // as the computer spells it
+        for (unknown in listOf(null, "", "   ")) assertEquals("your computer", HostPush.nameOr(unknown))  // never a fixed name
+    }
+
     @Test fun aPushFromAnotherPairedComputerIsItsOwn() {
         assertEquals(other, HostPush.sender(text(otherId), hosts, laptopOrigin, laptopId))
         assertEquals(other, HostPush.sender(text(otherId.uppercase()), hosts, laptopOrigin, laptopId))

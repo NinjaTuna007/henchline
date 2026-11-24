@@ -56,7 +56,7 @@ class UploadService : Service() {
                 share(uris, names, intent.getStringExtra(TEXT) ?: "", intent.getStringExtra(NOTE) ?: "",
                     intent.getStringExtra(SESSION) ?: "", intent.getBooleanExtra(SNAP, false))
             } catch (e: Exception) {
-                "Not shared: ${e.message ?: "the laptop couldn't be reached"} (is Tailscale on?)"
+                "Not shared: ${e.message ?: "${HostPush.computerName(this)} couldn't be reached"} (is Tailscale on?)"
             }
             CallService.Bus.listener?.invoke(JSONObject().put("note", result).toString())  // on the call screen too
             manager.notify(DONE + startId, Notification.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_notify)
@@ -86,7 +86,7 @@ class UploadService : Service() {
 
     private fun share(uris: List<Uri>, names: List<String>, text: String, note: String, session: String,
                       snap: Boolean = false): String {
-        val origin = Files.origin(this) ?: return "Set the laptop's address in Henchline first."
+        val origin = Files.origin(this) ?: return "Set ${HostPush.computerName(this)}'s address in Henchline first."
         val saved = JSONArray()
         val failed = mutableListOf<String>()  // the others still go, and the agent hears about those that arrived
         uris.forEachIndexed { i, uri ->
@@ -107,7 +107,7 @@ class UploadService : Service() {
             val kept = post("$origin/share/snap", origin, JSONObject().put("files", saved).put("session", session)
                 .toString().toRequestBody("application/json".toMediaTypeOrNull()))
             return if (kept.has("waiting")) "Photo with you: it goes with what you say next."
-            else "Photo saved on the laptop, but: ${kept.optString("note")}"
+            else "Photo saved on ${HostPush.computerName(this)}, but: ${kept.optString("note")}"
         }
         val told = post("$origin/share/tell", origin, JSONObject().put("files", saved).put("text", text).put("note", note)
             .put("session", session).toString().toRequestBody("application/json".toMediaTypeOrNull()))
@@ -115,13 +115,13 @@ class UploadService : Service() {
             else "${saved.length()} files"
         val missing = if (failed.isEmpty()) "" else " Not sent: ${failed.joinToString("; ")}."
         return (if (told.has("to")) "Shared $what with ${told.getString("to").substringBefore(",")}."
-        else "Saved $what on the laptop (Downloads/Henchline), but: ${told.optString("note")}") + missing
+        else "Saved $what on ${HostPush.computerName(this)} (Downloads/Henchline), but: ${told.optString("note")}") + missing
     }
 
     private fun post(url: String, origin: String, body: RequestBody): JSONObject =
         client.newCall(Request.Builder().url(url).header("Origin", origin).post(body).build()).execute().use { answer ->
             val text = answer.body?.string() ?: ""
-            try { JSONObject(text) } catch (_: Exception) { JSONObject().put("note", "the laptop said ${answer.code}") }
+            try { JSONObject(text) } catch (_: Exception) { JSONObject().put("note", "${HostPush.computerName(this)} said ${answer.code}") }
         }
 
     /** A shared file read straight from the app that shared it, never copied on the phone first, unless it is to

@@ -2,8 +2,10 @@
 
 import json
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests import sandbox  # noqa: F401  (first: a throwaway HOME)
 
@@ -48,12 +50,60 @@ class Initialize(unittest.TestCase):
                 self.assertFalse(self.path.exists())
 
     def test_a_bad_label_or_capability_writes_nothing(self):
-        for label, caps in (("", {}), ("a\nb", {}), ("x" * 81, {}), ("M", {"teleport": True}),
+        for label, caps in (("a\nb", {}), ("x" * 81, {}), ("M", {"teleport": True}),
                             ("M", {"chat": "yes"})):
             with self.subTest(label=label, caps=caps):
                 with self.assertRaises(ValueError):
                     host_config.initialize(self.path, label=label, base_url="https://m.example/", capabilities=caps)
                 self.assertFalse(self.path.exists())
+
+
+def tailnet(name: str | None = None, *, missing: bool = False):
+    """Patch `tailscale status --json` to report Self.HostName = name (or tailscale to be absent)."""
+    def run(argv, **kwargs):
+        if missing:
+            raise FileNotFoundError(argv[0])
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"Self": {"HostName": name}}), "")
+    return mock.patch.object(host_config.subprocess, "run", side_effect=run)
+
+
+class Label(unittest.TestCase):
+    """Without a label of its own, a computer is called by its own name, never by a fixed one."""
+
+    def test_an_explicit_label_wins(self):
+        with tailnet("other"), mock.patch.object(host_config.socket, "gethostname", return_value="box"):
+            self.assertEqual(hostkit.config(label="  Desk  ").label, "Desk")
+
+    def test_a_missing_or_blank_label_is_the_tailscale_name(self):
+        for raw in ({"label": None}, {"label": ""}, {"label": "   "}):
+            with self.subTest(raw=raw), tailnet("Studio"), \
+                    mock.patch.object(host_config.socket, "gethostname", return_value="localhost"):
+                self.assertEqual(hostkit.config(**raw).label, "Studio")
+        folder = Path(tempfile.mkdtemp(dir=sandbox.HOME))
+        (folder / "host.json").write_text(json.dumps({
+            "host_id": hostkit.HOST_ID, "base_url": f"https://{hostkit.AUTHORITY}/",
+            "tls_authority": hostkit.AUTHORITY, "updated_at": "2026-11-21T12:00:00Z"}))
+        with tailnet("Studio"), mock.patch.object(host_config.socket, "gethostname", return_value="x"):
+            self.assertEqual(HostConfig.load(folder / "host.json").label, "Studio")
+
+    def test_the_hostname_spells_a_tailscale_name_that_matches_it(self):
+        with tailnet("studiobox"), mock.patch.object(host_config.socket, "gethostname", return_value="StudioBox"):
+            self.assertEqual(host_config.machine_name(), "StudioBox")
+
+    def test_without_tailscale_the_hostname(self):
+        for patch in (tailnet(missing=True), tailnet(""),
+                      mock.patch.object(host_config.subprocess, "run",
+                                        side_effect=subprocess.TimeoutExpired("tailscale", 2))):
+            with self.subTest(patch=patch), patch, \
+                    mock.patch.object(host_config.socket, "gethostname", return_value="desk.local"):
+                self.assertEqual(host_config.machine_name(), "desk")
+
+    def test_a_new_identity_without_a_label_writes_down_the_name(self):
+        path = Path(tempfile.mkdtemp(dir=sandbox.HOME)) / "host.json"
+        with tailnet("Studio"), mock.patch.object(host_config.socket, "gethostname", return_value="x"):
+            config = host_config.initialize(path, label="", base_url="https://m.example/", capabilities={})
+        self.assertEqual(config.label, "Studio")
+        self.assertEqual(json.loads(path.read_text())["label"], "Studio")
 
 
 class Load(unittest.TestCase):

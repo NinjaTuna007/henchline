@@ -51,16 +51,16 @@ class ModelDownload(private val context: Context, private val spec: Spec,
      *  cost nothing and are taken only once the download goes ahead. */
     fun run(mobileOk: Boolean = false): Outcome {
         stage(DownloadPhase.CHECKING)
-        val origin = Files.origin(context) ?: return Outcome.Failed("Set the laptop's address in Settings first.")
+        val origin = Files.origin(context) ?: return Outcome.Failed("Set ${HostPush.computerName(context)}'s address in Settings first.")
         val manifest = try {
             Files.client.newCall(okhttp3.Request.Builder().url("$origin${spec.route}/manifest")
                 .header("Origin", origin).build()).execute().use {
                 if (!it.isSuccessful) return Outcome.Failed(spec.notPrepared)
                 JSONObject(it.body!!.string())
             }
-        } catch (e: Exception) { return Outcome.Failed("Couldn't reach the laptop (is Tailscale on?)") }
+        } catch (e: Exception) { return Outcome.Failed("Couldn't reach ${HostPush.computerName(context)} (is Tailscale on?)") }
         spec.offered(manifest)?.let { return Outcome.Failed(it) }
-        val files = entries(manifest, spec.safeName) ?: return Outcome.Failed("The laptop named an odd file: stopped.")
+        val files = entries(manifest, spec.safeName) ?: return Outcome.Failed("${HostPush.capitalName(context)} named an odd file: stopped.")
         val folder = spec.dir.apply { mkdirs() }
         var have = 0L
         val missing = ArrayList<Entry>()
@@ -112,7 +112,7 @@ class ModelDownload(private val context: Context, private val spec: Spec,
             val request = okhttp3.Request.Builder().url("$origin${spec.route}/file/${f.name}").header("Origin", origin)
             if (have > 0) request.header("Range", "bytes=$have-")
             Files.client.newCall(request.build()).execute().use { answer ->
-                if (!answer.isSuccessful) return "The laptop couldn't send ${f.name}."
+                if (!answer.isSuccessful) return "The computer couldn't send ${f.name}."
                 val append = have > 0 && answer.code == 206
                 stage(DownloadPhase.DOWNLOADING)
                 java.io.FileOutputStream(part, append).use { out ->
@@ -134,7 +134,7 @@ class ModelDownload(private val context: Context, private val spec: Spec,
             }
         } catch (e: Exception) { return "The download broke off: try again to carry on." }
         if (last) stage(DownloadPhase.CHECKING)
-        if (part.length() != f.size || sha256(part) != f.sha256) { part.delete(); return "${f.name} didn't match the laptop's copy: try again." }
+        if (part.length() != f.size || sha256(part) != f.sha256) { part.delete(); return "${f.name} didn't match the computer's copy: try again." }
         if (!part.renameTo(target)) return "Couldn't keep ${f.name} on this phone."
         return null
     }

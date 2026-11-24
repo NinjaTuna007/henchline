@@ -70,11 +70,11 @@ class VoiceNote {
         /** Sends it to the laptop for that agent and waits for what was heard: ("", words) once typed to the
          *  agent, or (why not, "") when it failed. Off the main thread. */
         fun send(context: Context, session: String, wav: ByteArray): Pair<String, String> = try {
-            val origin = Files.origin(context) ?: throw IllegalStateException("no laptop address set")
+            val origin = Files.origin(context) ?: throw IllegalStateException("no computer address set")
             val nid = Files.client.newCall(Request.Builder().url("$origin/voice-note?session=" + android.net.Uri.encode(session))
                 .header("Origin", origin).post(wav.toRequestBody("audio/wav".toMediaType())).build()).execute().use { answer ->
                 val body = try { JSONObject(answer.body?.string() ?: "") } catch (_: Exception) { JSONObject() }
-                body.optString("id").ifEmpty { throw IllegalStateException(body.optString("note", "the laptop said ${answer.code}")) }
+                body.optString("id").ifEmpty { throw IllegalStateException(body.optString("note", "${HostPush.computerName(context)} said ${answer.code}")) }
             }
             var result: Pair<String, String>? = null
             val until = System.currentTimeMillis() + 180_000  // Whisper is busy with a call turn at worst
@@ -92,9 +92,9 @@ class VoiceNote {
                         }
                 } catch (_: Exception) { null }  // a blip: ask again
             }
-            result ?: ("the laptop hasn't transcribed it yet" to "")
+            result ?: ("${HostPush.computerName(context)} hasn't transcribed it yet" to "")
         } catch (e: Exception) {
-            "Not sent: ${e.message ?: "the laptop couldn't be reached"} (is Tailscale on?)" to ""
+            "Not sent: ${e.message ?: "${HostPush.computerName(context)} couldn't be reached"} (is Tailscale on?)" to ""
         }
     }
 }

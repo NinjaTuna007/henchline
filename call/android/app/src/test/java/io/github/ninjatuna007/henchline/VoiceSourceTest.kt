@@ -54,10 +54,12 @@ class VoiceSourceTest {
 
     @Test fun settingsSummary() {
         assertEquals("Phone · Jenny", VoiceSource.summary(true, "own"))
-        assertEquals("Laptop · Each its own", VoiceSource.summary(false, "own"))
-        assertEquals("Laptop · One voice", VoiceSource.summary(false, "one"))
-        assertEquals("Laptop · Surprise me", VoiceSource.summary(false, "surprise"))
-        assertEquals("Laptop", VoiceSource.summary(false, null))
+        assertEquals("Computer · Each its own", VoiceSource.summary(false, "own"))
+        assertEquals("Computer · One voice", VoiceSource.summary(false, "one"))
+        assertEquals("Computer · Surprise me", VoiceSource.summary(false, "surprise"))
+        assertEquals("Computer", VoiceSource.summary(false, null))
+        assertEquals("Desk · One voice", VoiceSource.summary(false, "one", "Desk"))  // the computer's own name, when known
+        assertEquals("Phone · Jenny", VoiceSource.summary(true, "one", "Desk"))
     }
 
     @Test fun mobileDataStartsUntickedMidCallOnMobileData() {
