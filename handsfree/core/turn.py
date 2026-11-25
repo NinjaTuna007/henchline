@@ -18,6 +18,7 @@ import numpy as np
 from faster_whisper.vad import get_speech_timestamps
 
 import routing
+from callprobe import ON_CALL
 from routing import Heard
 from sensing import PER_SECOND, RATE, SPEECH, level
 from talkover import TalkOver, our_own_words, own_share, word_keys
@@ -27,6 +28,7 @@ from voice.state import (BY_HANDSFREE, CALL_PUSH, HANDSFREE_LOG, HANDSFREE_WAV, 
                          note_laptop_heard, phone_listens, phone_took_ears_since, ptt_busy, release_phase, set_phase, set_target)
 
 BUDS_LEAVING = 1.0  # seconds: buds that disconnect this soon before a tap turn starts, or during it, drop it
+PROBE_GRACE = 1.5  # seconds a tap's turn waits, once recorded, for the phone to say whether it is on a call
 WAIT_FOR_WORDS = 5.0  # after the wake word, seconds to start talking before it gives up
 CHIME_GRACE = 1.2  # the listening chime is loud in the mic; it must not count as them starting, then the pause close the turn
 END_DB, END_FRAMES = 6, 50  # 1.5 s at most END_DB over the floor ends the turn
@@ -98,6 +100,7 @@ class Turn:
     # Seconds the frame just read lags its playing on the null sink (the listener's behind(): never less than the
     # true lag); None: no lag known (taken as none)
     behind: Callable[[], float] | None = None
+    probe = None  # with a tap's turn, the question to the phone whether it is on a call (callprobe.py)
 
     def __init__(self, cfg: whisper.Config, transcriber: whisper.Transcriber, talkover: TalkOver,
                  read: Callable[[], np.ndarray | None], show: Callable[[Mode], None],
@@ -110,7 +113,8 @@ class Turn:
         self.live = None  # this turn, heard as it is recorded (Nemotron), when it is installed
         self.whistle = None  # set by the listener: quick checks (the wake word, "over") without Whisper
         self.tapped = None  # the earbud button, while a turn it started records
-        self.buds_left = False
+        self.dropped = False  # the tap was not the user's (buds leaving, a phone call): no window after it
+        self.during_call = False  # dropped as the phone's call: the listener closes every window too
         self.streamer = None
         if cfg.streaming and nemotron.available():
             try:
@@ -122,7 +126,7 @@ class Turn:
         """One turn, end to end; returns seconds to keep listening (0: the default), None if no words."""
         frames = self.record(frames, floor, heard)
         if frames is None:
-            return None if self.buds_left else 0.0
+            return None if self.dropped else 0.0
         try:
             text, rich = self.transcribe(frames)
             tone = TONE_NOTE.search(rich)
@@ -167,7 +171,7 @@ class Turn:
         voice_at, spoke = since, False  # when Silero last heard speech in the turn, and whether it ever did (calls)
         voiceless = False
         held = heard is Heard.PUSHED  # the button decides when it ends, not a pause
-        self.buds_left = False
+        self.dropped = self.during_call = False
         released = False
         handed = False  # the phone took the ears midway, without the start of this turn
         while (quiet < end or held) and time.monotonic() - since < MAX_SECONDS:
@@ -190,9 +194,11 @@ class Turn:
                 if self.live:
                     self.live.cancel()
                     self.live = None
-                self.buds_left = True
+                self.dropped = True
                 release_phase(BY_HANDSFREE)  # take() releases only a turn it transcribes; talkback must not hold on
                 return None
+            if self.probe is not None and self.probe.answer == ON_CALL:  # stop recording their call at once
+                return self.phone_on_call()
             if calling and len(frames) % GAP_CHECK == 0 and phone_listens(calling):
                 if phone_took_ears_since(began, calling):
                     return self.phone_took_over()
@@ -228,6 +234,12 @@ class Turn:
         # What it heard ended here: taken now, before any wait for the phone below (audio said meanwhile isn't read
         # yet, and a phone taking the ears later must hear it)
         heard_until = self.played_at()
+        # A tap's answer from the phone gets a moment more; none by then, and the turn goes out as ever
+        # A phone that left the last probe unanswered (off the net) isn't waited for: taps stay prompt
+        if self.probe is not None:
+            self.probe.done.wait(PROBE_GRACE if self.probe.expected else 0)
+            if self.probe.answer == ON_CALL:
+                return self.phone_on_call()
         # The pause that ended it may be the phone taking over: it says so in a moment, or the words are delivered here.
         # Only a phone that has this turn's words from its start drops it here (CALL_EAR_SINCE)
         if calling and (phone_took_ears_since(began, calling)
@@ -272,6 +284,17 @@ class Turn:
         if self.live:
             self.live.cancel()
             self.live = None
+        release_phase(BY_HANDSFREE)  # take() releases only a turn it transcribes; talkback must not hold on
+        return None
+
+    def phone_on_call(self) -> None:
+        """The tap came from the phone's call (multipoint buds pause the laptop as it is answered): nothing of it
+        is heard, sent or kept, and no window stays open after it."""
+        log(HANDSFREE_LOG, "earbud tap during a phone call: turn dropped")
+        if self.live:
+            self.live.cancel()
+            self.live = None
+        self.dropped = self.during_call = True
         release_phase(BY_HANDSFREE)  # take() releases only a turn it transcribes; talkback must not hold on
         return None
 

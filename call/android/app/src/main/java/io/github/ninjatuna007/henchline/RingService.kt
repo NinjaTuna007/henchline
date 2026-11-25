@@ -24,7 +24,7 @@ class RingService : PushService() {
 
     override fun onNewEndpoint(endpoint: PushEndpoint, instance: String) {
         getSharedPreferences("call", MODE_PRIVATE).edit().putString(ENDPOINT, endpoint.url).apply()
-        CallService.Bus.service?.send(JSONObject().put("ring_endpoint", endpoint.url).toString())
+        CallService.Bus.service?.send(JSONObject().put("ring_endpoint", endpoint.url).put("probe", true).toString())
         share(this)  // off a call too: a changed address must reach the laptop at once
     }
 
@@ -35,6 +35,15 @@ class RingService : PushService() {
             JSONObject(String(message.content))
         } catch (_: Exception) {
             JSONObject()
+        }
+        // An earbud tap asks whether the phone is on a call: answered, never rung or shown. Keep this before
+        // HostPush.handle and every ring path below: they would ring the phone for it
+        if (ring.has("probe")) {
+            val mode = getSystemService(android.media.AudioManager::class.java).mode
+            val ours = CallService.Bus.service != null
+            android.util.Log.d("Henchline", "call probe: audio mode $mode, Henchline call ${if (ours) "up" else "down"}")
+            Reply.send(Reply.valid(ring.optString("reply")), ProbeAnswer.of(mode, ours))
+            return
         }
         if (HostPush.handle(this, ring)) return  // from another paired computer (multi-host): shown as its own
         if (ring.has("text")) {  // `handsfree text`: a message, not a call
@@ -91,7 +100,8 @@ class RingService : PushService() {
             Thread {
                 try {
                     Files.client.newCall(okhttp3.Request.Builder().url("$origin/ring-endpoint").header("Origin", origin)
-                        .post(JSONObject().put("endpoint", endpoint).toString()
+                        // "probe": this app answers call probes (an older one would ring for one)
+                        .post(JSONObject().put("endpoint", endpoint).put("probe", true).toString()
                             .toRequestBody("application/json".toMediaType())).build()).execute().close()
                 } catch (_: Exception) {}  // offline: the next opening tries again
             }.start()

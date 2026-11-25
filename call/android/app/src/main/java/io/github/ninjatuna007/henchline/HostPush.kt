@@ -225,7 +225,7 @@ object HostPush {
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU)
                     try { learnLaptopId(context) } catch (_: Exception) {}  // offline: what was learned before stands
                 recipients(HostRegistry.of(context).all(), laptop(context), knownLaptopId(context))
-                    .forEach { post(it, "ring-endpoint", JSONObject().put("endpoint", endpoint), wait = true) }
+                    .forEach { post(it, "ring-endpoint", JSONObject().put("endpoint", endpoint).put("probe", true), wait = true) }
             } catch (e: Exception) {
                 android.util.Log.w("HostPush", "push address not shared: ${e.javaClass.simpleName}")
             }

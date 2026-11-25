@@ -71,7 +71,7 @@ from voice.state import (AWAY, RENAMED, BY_HANDSFREE, CALL, CALL_BUTTON_ONLY, CA
                          CALL_PINNED, CALL_RANG_BACK, CALL_SOUND, CALL_TOLD, PHASE,
                          SPAWNED, TEXTS, VOICE_NOTE_STALE, VOICE_NOTES,
                          CALL_PORT, CALL_PUSH, CALL_INTERRUPT, CALL_CUT_IN, CALL_CHECK, CLAUDE_MODE,
-                         CALL_RING, CALL_RINGER, CALL_RING_NOTE, CALL_TLS, HANDSFREE_LOG, HANDSFREE_MODE,
+                         CALL_RING, CALL_RINGER, CALL_RING_NOTE, CALL_RING_PROBES, CALL_TLS, HANDSFREE_LOG, HANDSFREE_MODE,
                          PHONE_MIC, PHONE_SPEAKER, PHONE_SPEAKER_MONITOR, Phase, Playing, SENT, SPEAKERS,
                          SPOOL, Sent, Speaker, in_call, last_speaker, log, phase_now, read_json,
                          recent_speakers, turn_on_handsfree, file_lock, write_json)
@@ -414,20 +414,30 @@ def flag(path: Path, on: bool) -> None:
         path.unlink(missing_ok=True)
 
 
-def keep_ring_endpoint(address: str) -> bool:
-    """Where texts and rings reach the app (its push address): only the phone's distributor, nobody's URL."""
+def keep_ring_endpoint(address: str, probes: bool = False) -> bool:
+    """Where texts and rings reach the app (its push address): only the phone's distributor, nobody's URL.
+    `probes`: the app said it answers call probes. Kept as this very address, so an app that says nothing (an older
+    build, which would ring for a probe) never gets one."""
     url = urllib.parse.urlsplit(address)
     if url.scheme != "https" or url.hostname not in RING_HOSTS:
         log(HANDSFREE_LOG, f"call: refused a ring address on {url.hostname or 'no host'} (not {', '.join(RING_HOSTS)})")
         return False
+    if not probes:
+        CALL_RING_PROBES.unlink(missing_ok=True)
+    elif not CALL_RING_PROBES.exists() or CALL_RING_PROBES.read_text().strip() != url.geturl():
+        private_write(CALL_RING_PROBES, url.geturl())
     if CALL_RING.exists() and CALL_RING.read_text().strip() == url.geturl():
         return True
-    fd = os.open(CALL_RING, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)  # an older file keeps its mode through O_CREAT
-    with os.fdopen(fd, "w") as out:
-        out.write(url.geturl())
+    private_write(CALL_RING, url.geturl())
     log(HANDSFREE_LOG, "the app's push address changed: kept")
     return True
+
+
+def private_write(path: Path, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # an older file keeps its mode through O_CREAT
+    with os.fdopen(fd, "w") as out:
+        out.write(text)
 
 
 async def ring_endpoint(request: web.Request) -> web.Response:
@@ -435,10 +445,11 @@ async def ring_endpoint(request: web.Request) -> web.Response:
     reinstalls the laptop kept an old one, and every text went nowhere). {"endpoint"} → {"ok"}."""
     trusted(request)
     try:
-        address = str((await request.json()).get("endpoint", ""))
+        body = await request.json()
+        address, probes = str(body.get("endpoint", "")), body.get("probe") is True
     except (ValueError, AttributeError):
         raise web.HTTPBadRequest(text="expected JSON")
-    return web.json_response({"ok": keep_ring_endpoint(address)})
+    return web.json_response({"ok": keep_ring_endpoint(address, probes)})
 
 
 def confirm_switch(message: dict) -> str:
@@ -563,7 +574,7 @@ async def from_page(message: dict, ear: Ear, silent: SilentMic | None = None,
     elif "answering" in message:  # this call answers a ring: to the agent that rang
         await asyncio.get_running_loop().run_in_executor(None, route_to_ringer, str(message["answering"]))
     elif "ring_endpoint" in message:  # where `handsfree ring` reaches the app: kept private, never logged
-        keep_ring_endpoint(str(message["ring_endpoint"]))
+        keep_ring_endpoint(str(message["ring_endpoint"]), message.get("probe") is True)
     elif "sound" in message:  # the app's sound mode: turns after this line ran in it, for comparing them
         out = f", {message['out']}" if message.get("out") else ""
         aec = {True: ", echo canceller on", False: ", no echo canceller"}.get(message.get("aec"), "")

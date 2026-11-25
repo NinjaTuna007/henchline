@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 
 import routing
+from callprobe import FREE, PhoneCalls
 from routing import Heard
 from call.host_config import own_name  # this computer's name, in words it says
 from sensing import (FRAME, PER_SECOND, RATE, EarbudButton, EchoWatch, Load, Output, Playback, Wake, Xruns, level,
@@ -42,6 +43,7 @@ FLOOR_MIN = 30  # frames of history before a floor is trusted; until then the fr
 PREROLL = 15  # frames kept from before speech started
 XRUN_REST = 30.0  # seconds a canceller is given before an xrun restarts it; doubles while xruns keep coming
 XRUN_REST_MAX = 5 * 60.0
+BLOCKED_TAP_WAIT = 2.0  # seconds a tap while the phone was last on a call waits for the phone to say it ended
 
 
 @dataclass
@@ -71,8 +73,10 @@ def floor_of(history: collections.deque, fallback: float) -> float:
 
 
 class Listener:
-    def __init__(self, cfg: whisper.Config, transcriber: whisper.Transcriber, stop, canceller_since: float) -> None:
+    def __init__(self, cfg: whisper.Config, transcriber: whisper.Transcriber, stop, canceller_since: float,
+                 phone: PhoneCalls | None = None) -> None:
         self.cfg, self.stop = cfg, stop
+        self.phone = phone  # asks the phone whether it is on a call, on each earbud tap
         self.canceller_since = canceller_since
         own_name()  # its first lookup (tailscale, up to 2 s) now, not later inside the per-frame step
         self.transcriber = transcriber
@@ -161,12 +165,7 @@ class Listener:
                 if self.button.tap.is_set():
                     self.button.tap.clear()
                     if not ptt_busy():
-                        log(HANDSFREE_LOG, "earbud tap")
-                        self.turns.tapped = self.button
-                        try:
-                            self.turn([], Heard.WOKE, floor_of(self.room, level(frame)))
-                        finally:
-                            self.turns.tapped = None
+                        self.earbud_tap(frame)
                         was_busy = talkback_busy()
                         continue
                 self.watch_xruns()
@@ -178,6 +177,22 @@ class Listener:
                     self.transcriber.settle()  # back to the GPU once a training run lets go
         finally:
             self.stream.terminate()
+
+    def earbud_tap(self, frame: np.ndarray) -> None:
+        """A turn, as after "hey Claude"; none while the phone is on a call (its buds pause the laptop too)."""
+        # Asked on every tap, also one ignored: its answer keeps the phone's call known, or clears it
+        probe = self.phone.ask() if self.phone else None
+        # The call may have ended since: this tap's own answer, if it comes in a moment, lets the tap through
+        if self.phone and self.phone.on_call() and (
+                probe is None or not probe.done.wait(BLOCKED_TAP_WAIT) or probe.answer != FREE):
+            log(HANDSFREE_LOG, "earbud tap ignored: the phone is on a call")
+            return
+        log(HANDSFREE_LOG, "earbud tap")
+        self.turns.tapped, self.turns.probe = self.button, probe
+        try:
+            self.turn([], Heard.WOKE, floor_of(self.room, level(frame)))
+        finally:
+            self.turns.tapped = self.turns.probe = None
 
     def show(self, mode: Mode) -> None:
         """The tray's colour, and the call page's talk button."""
@@ -479,6 +494,11 @@ class Listener:
         extra = self.turns.take(frames, floor, heard)
         self.gate.clear()
         self.preroll.clear()
+        if extra is None and self.turns.during_call:
+            # The phone's call: talk in the room now is the call's, so no window lets it in as a turn
+            self.window.close()
+            LISTEN.unlink(missing_ok=True)
+            return
         if extra is None:  # no words in it (a noise): the window they had stays theirs
             self.window.until, self.window.kind = kept
             if kept[0] > time.monotonic() and not LISTEN.exists():

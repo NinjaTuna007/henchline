@@ -878,7 +878,7 @@ class CallService : Service() {
                 reply?.let { webSocket.send(org.json.JSONObject().put("answering", it.substringAfterLast('/')).toString()) }
                 // Where the laptop can ring this phone later (`handsfree ring`), refreshed every call
                 getSharedPreferences("call", MODE_PRIVATE).getString(RingService.ENDPOINT, null)?.let {
-                    webSocket.send(org.json.JSONObject().put("ring_endpoint", it).toString())
+                    webSocket.send(org.json.JSONObject().put("ring_endpoint", it).put("probe", true).toString())
                 }
                 offerPhoneVoice(webSocket)
                 if (ears != null && !pinging) {  // asks whether the server knows the phone's ears

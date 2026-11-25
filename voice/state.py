@@ -180,6 +180,8 @@ def _read_float(path: Path) -> float | None:
     except (OSError, ValueError):
         return None
 CALL_RING = STATE / "call.ring-endpoint"  # where Henchline can be rung (its UnifiedPush address): private, never logged
+# That same address again once the app said it answers call probes (an older app would ring for one): private
+CALL_RING_PROBES = STATE / "call.ring-probes"
 CALL_RINGER = STATE / "call.ringer"  # who rang the user last (session, when): the call server routes the answer there
 CALL_RING_NOTE = STATE / "call.ring-note"  # why a ring no agent placed rang: goes with the call's first turn
 CALL_RANG_BACK = STATE / "call.rang_back"  # a quiet call last rung back then: one per chain

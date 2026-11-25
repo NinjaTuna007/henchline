@@ -95,6 +95,7 @@ sys.path[:0] = [str(HERE / "core"), str(HERE.parent)]  # hands-free's modules (c
 
 import routing  # noqa: E402
 import tray  # noqa: E402
+from callprobe import PhoneCalls  # noqa: E402
 from listener import Listener  # noqa: E402
 from sensing import EC_UNIT, start_canceller  # noqa: E402
 from voice import files  # noqa: E402
@@ -462,11 +463,12 @@ def with_host(body: bytes) -> bytes:
     return json.dumps({**message, "host_id": host_id}).encode()
 
 
-def push(body: bytes, headers: dict | None = None) -> bool:
-    """Henchline's own push address (the ntfy app wakes it): never printed."""
+def push(body: bytes, headers: dict | None = None, to: str = "") -> bool:
+    """Henchline's own push address (the ntfy app wakes it): never printed. `to`: that address as already read
+    (a call probe goes only to the one checked as understanding it)."""
     body = with_host(body)
     try:
-        urllib.request.urlopen(urllib.request.Request(CALL_RING.read_text().strip(), data=body,
+        urllib.request.urlopen(urllib.request.Request(to or CALL_RING.read_text().strip(), data=body,
                                                       headers={"Content-Type": "application/json", **(headers or {})}),
                                timeout=10).close()
         return True
@@ -516,7 +518,7 @@ def run() -> int:
     transcriber = whisper.Transcriber(cfg, HANDSFREE_LOG)
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    listener = Listener(cfg, transcriber, stop, canceller_since)
+    listener = Listener(cfg, transcriber, stop, canceller_since, phone=PhoneCalls(push, replies, RING_SERVER))
     threading.Thread(target=listener.run, daemon=True).start()
     threading.Thread(target=voice_notes, args=(transcriber, stop), daemon=True).start()
     log(HANDSFREE_LOG, "on")
