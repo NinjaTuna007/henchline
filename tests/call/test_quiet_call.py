@@ -39,10 +39,16 @@ class Reminders(unittest.TestCase):
     def test_with_no_agent_behind_it_a_text_is_kept_as_from_reminders(self):
         from unittest import mock
         TEXTS.mkdir(parents=True, exist_ok=True)
+        ring = TEXTS.parent / "ring-endpoint-test"  # Henchline set up on the phone: an unpushed text is queued, kept
+        ring.write_text("https://push.example/up-test")
+        self.addCleanup(ring.unlink, missing_ok=True)
         with mock.patch.object(handsfree, "caller", return_value=None), \
+             mock.patch.object(handsfree, "CALL_RING", ring), \
              mock.patch.object(handsfree, "identity", return_value=("agent", "agent-_tmp")), \
              mock.patch.object(handsfree, "in_call", return_value=False), \
-             mock.patch.object(handsfree, "push", return_value=False):
+             mock.patch.object(handsfree, "push_outcome", return_value="unreachable"), \
+             mock.patch.object(handsfree, "call_server_up", return_value=True), \
+             mock.patch.object(handsfree, "start_detached"):
             handsfree.text("class in 30 minutes")
             handsfree.text("dryer done", sent_by="Laundry")
         kept = sorted((read_json(p) for p in TEXTS.glob("*.json")), key=lambda r: r.get("at", 0))

@@ -38,7 +38,7 @@ Files the user shares from their phone arrive as a message tagged `[phone · sha
 
 ## Texting the user
 
-When something is worth telling the user but not worth ringing them, run `handsfree text "a few words"`. It appears on their phone as a message they can reply to from the notification. Their reply comes back tagged `[phone · text]`. On a call, the message goes into the chat instead. Use it sparingly, as you would text a person. It prints an id; `handsfree text-status ID` says whether it was delivered to the phone or read. For something that matters but can wait a little, `handsfree text --until-read 10 "…"` rings the user if they haven't read it within 10 minutes, and `--until-replied 10` if they haven't answered it.
+When something is worth telling the user but not worth ringing them, run `handsfree text "a few words"`. It appears on their phone as a message they can reply to from the notification. Their reply comes back tagged `[phone · text]`. On a call, the message goes into the chat instead. Use it sparingly, as you would text a person. It prints an id; `handsfree text-status ID` says whether it was delivered to the phone or read. If the phone can't be reached right now it prints "queued" and still succeeds: it is pushed again every minute for two hours, and the app fetches it when opened, so don't send it again. For something that matters but can wait a little, `handsfree text --until-read 10 "…"` rings the user if they haven't read it within 10 minutes, and `--until-replied 10` if they haven't answered it.
 
 ## Helpers of your own
 

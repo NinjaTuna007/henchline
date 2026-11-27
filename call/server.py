@@ -3097,12 +3097,15 @@ def advance_text(tid: str, status: str) -> bool:
 async def texts_pending(request: web.Request) -> web.Response:
     """Agents' texts the phone hasn't confirmed yet, so the app fetches them itself (2026-11-18: with the phone in
     hand on mobile data, pushes sat on the ntfy server for half an hour while the ntfy app's connection had
-    silently stalled). The last two days, oldest first: {"texts": [{id, agent, session, text}]}."""
+    silently stalled). The last two days, oldest first: {"texts": [{id, agent, session, text}]}. Not one that went
+    out as a plain ntfy notification (its "ntfy_at"): the user has seen those words, and the app would show them
+    as a second new notification."""
     trusted(request)
     found = []
     for path in TEXTS.glob("*.json"):
         record = read_json(path)
-        if (record.get("status") == "sent" and record.get("words") and time.time() - record.get("at", 0) < 2 * 86400
+        if (record.get("status") == "sent" and record.get("words") and not record.get("ntfy_at")
+                and time.time() - record.get("at", 0) < 2 * 86400
                 and re.fullmatch(r"[0-9a-f]{16}", str(record.get("id", "")))):
             found.append(record)
     found.sort(key=lambda r: r.get("at", 0))

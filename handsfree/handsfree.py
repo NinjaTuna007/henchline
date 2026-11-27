@@ -29,10 +29,15 @@
                                        [phone · text]); on a call it goes to the chat.
                                        Prints its id. --until-read MIN: wait that long for the user to read
                                        it, then ring if they haven't; --until-replied MIN: the same, until
-                                       they answer it (any message of theirs to this agent after it).
+                                       they answer it (any message of theirs to this agent after it). The
+                                       ring comes after the wait; while the phone is offline it may fail.
                                        --from NAME: a script's own name; run with no agent (a timer, a
                                        script) it shows as Reminders, a chat with a bell that takes no
-                                       replies. Exit 0 sent (or read, or answered), 1 not
+                                       replies. When the phone's push address can't be reached (no
+                                       network, not a refusal) and the call server is up, it prints
+                                       "queued": it is pushed again every minute for 2 h, and the open
+                                       app fetches it for two days. Don't send it again. Exit 0 sent or
+                                       queued (or read, or answered), 1 not
     handsfree text-status ID            sent, delivered (on the phone) or read (opened, or replied to)
     handsfree remind [--keep-awake] [--to "AGENT [in WORKSPACE]" | --to NAME] TIME WORDS
                                        type WORDS into an agent at TIME (08:30, tomorrow 08:30,
@@ -87,6 +92,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -386,6 +392,7 @@ def text(words: str, until_read: float = 0, until: str = "read", as_session: str
                 old.unlink()
         except OSError:
             pass
+    expire_queued()
     write_json(TEXTS / f"{tid}.json", {"id": tid, "agent": agent, "session": session, "status": "sent",
                                        "at": time.time(), "words": words}, private=True)
     sent = False
@@ -394,15 +401,29 @@ def text(words: str, until_read: float = 0, until: str = "read", as_session: str
                                                             "text": words, "tid": tid}, private=True)
         print(f"sent to the call's chat (id {tid})")
         sent = True
-    elif CALL_RING.exists() and push(json.dumps({"agent": agent, "session": session, "text": words,
-                                                  "id": tid}).encode(),
-                                      {"Priority": "high", "Tags": "speech_balloon"}):
-        log(HANDSFREE_LOG, f"{agent} texted the phone")
-        print(f"sent to the phone (id {tid})")
+    outcome = ""
+    if not sent and CALL_RING.exists():
+        outcome = push_outcome(text_push(tid, agent, session, words), {"Priority": "high", "Tags": "speech_balloon"})
+        if outcome == "sent":
+            log(HANDSFREE_LOG, f"{agent} texted the phone")
+            print(f"sent to the phone (id {tid})")
+            sent = True
+            start_detached("text-backup", tid)
+        elif outcome == "refused":  # a dead or rejected address: waiting won't help, so it is not queued
+            log(HANDSFREE_LOG, f"{agent} text {tid}: the push address refused it")
+    if not sent and ntfy_text(tid, agent, words):
+        print("sent as an ntfy notification (no reply box: Henchline couldn't be pushed)")
+        return 0
+    if not sent and outcome == "unreachable" and call_server_up():
+        # Kept for the app's own catch-up (/texts/pending) and pushed again by a worker until it lands: a text on
+        # its way, not a failure. Reported as one, a caller that retries (the class reminders) sent it again every
+        # five minutes, and the phone got them all at once later (2026-11-26). Never the words in the log
+        update_text(tid, queued=time.time())
+        log(HANDSFREE_LOG, f"{agent} text {tid} queued: the phone couldn't be reached")
+        print(f"queued (id {tid}): the phone can't be reached now; it is pushed again every minute for "
+              f"{RETRY_FOR // 3600} h, and the app fetches it when opened")
+        start_detached("text-retry", tid)
         sent = True
-        subprocess.Popen(  # not a thread: this command must return now, and the backup still runs after 20 s
-            [sys.executable, str(Path(__file__).resolve()), "text-backup", tid],
-            start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if sent:
         if until_read <= 0:
             return 0
@@ -414,10 +435,9 @@ def text(words: str, until_read: float = 0, until: str = "read", as_session: str
             time.sleep(5)
         print(f"not {until} in {until_read:g} min: ringing")
         return ring(words, now=False, wait=True)
-    topic = RING_TOPIC.read_text().strip() if RING_TOPIC.exists() else ""
-    if topic and ntfy(topic, f"{agent.capitalize()}", words, {"Tags": "speech_balloon"}):
-        print("sent as an ntfy notification (no reply box: Henchline couldn't be pushed)")
-        return 0
+    TEXTS.joinpath(f"{tid}.json").unlink(missing_ok=True)  # never shown: the app mustn't fetch it later either
+    if outcome == "unreachable":
+        print("not queued: the call server is down, and it is what the app fetches missed texts from")
     print("couldn't reach the phone")
     return 1
 
@@ -432,6 +452,81 @@ def text_status(tid: str) -> str:
     return str(read_json(TEXTS / f"{tid}.json").get("status", "")) if tid else ""
 
 
+RETRY_EVERY = 60  # seconds between a queued text's pushes
+RETRY_FOR = 2 * 3600  # how long a queued text is pushed again before only the app's catch-up is left
+PENDING_FOR = 2 * 86400  # the call server's /texts/pending window: a queued text unseen after it is gone
+
+
+def text_push(tid: str, agent: str, session: str, words: str) -> bytes:
+    return json.dumps({"agent": agent, "session": session, "text": words, "id": tid}).encode()
+
+
+def update_text(tid: str, **fields) -> None:
+    record = read_json(TEXTS / f"{tid}.json")
+    if record:
+        write_json(TEXTS / f"{tid}.json", {**record, **fields}, private=True)
+
+
+def ntfy_text(tid: str, agent: str, words: str, headers: dict | None = None) -> bool:
+    """The text as a plain ntfy notification. When it went, the record says so, and the call server no longer
+    offers it to the app's catch-up: that would show the same words as a second new notification."""
+    topic = RING_TOPIC.read_text().strip() if RING_TOPIC.exists() else ""
+    if not (topic and ntfy(topic, agent.capitalize(), words, {"Tags": "speech_balloon", **(headers or {})})):
+        return False
+    update_text(tid, ntfy_at=time.time())
+    return True
+
+
+def start_detached(command: str, tid: str) -> None:
+    subprocess.Popen(  # not a thread: `handsfree text` must return now, and the worker outlives it
+        [sys.executable, str(Path(__file__).resolve()), command, tid],
+        start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def call_server_up() -> bool:
+    """The call server serves /texts/pending and takes the phone's delivered/read: without it nothing is queued."""
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", "call.service"]).returncode == 0
+
+
+def _retry_text(tid: str, every: float = RETRY_EVERY, retry_for: float = RETRY_FOR) -> str:
+    """A queued text pushed again until it lands: every minute, push and then ntfy, until the phone confirms it
+    (its status leaves "sent"), a push or ntfy goes through, or `retry_for` is up. How it ended."""
+    deadline = time.time() + retry_for
+    while True:
+        time.sleep(every)
+        record = read_json(TEXTS / f"{tid}.json")
+        agent = str(record.get("agent") or "Henchline")
+        if record.get("status") != "sent":
+            return "confirmed" if record else "gone"
+        words = str(record.get("words") or "")
+        outcome = push_outcome(text_push(tid, agent, str(record.get("session") or ""), words),
+                               {"Priority": "high", "Tags": "speech_balloon"}) if CALL_RING.exists() else "refused"
+        if outcome == "sent":
+            log(HANDSFREE_LOG, f"{agent} text {tid} pushed after being queued")
+            return "pushed"
+        if ntfy_text(tid, agent, words, {"Priority": "high"}):
+            log(HANDSFREE_LOG, f"{agent} text {tid} sent by ntfy after being queued")
+            return "ntfy"
+        if outcome == "refused":
+            log(HANDSFREE_LOG, f"{agent} text {tid} queued, then the push address refused it: left to the app")
+            return "refused"
+        if time.time() >= deadline:
+            log(HANDSFREE_LOG, f"{agent} text {tid} still not pushed after {retry_for / 3600:g} h: left to the "
+                               "app's catch-up")
+            return "gave up"
+
+
+def expire_queued() -> None:
+    """A queued text the phone never fetched within the call server's window is gone unseen: said once in the log."""
+    for path in TEXTS.glob("*.json"):
+        record = read_json(path)
+        if (record.get("queued") and record.get("status") == "sent" and not record.get("expired")
+                and time.time() - float(record.get("at", 0)) > PENDING_FOR):
+            log(HANDSFREE_LOG, f"{record.get('agent') or 'Henchline'} text {record.get('id')} expired unseen: "
+                               "the phone never fetched it")
+            write_json(path, {**record, "expired": time.time()}, private=True)
+
+
 def _backup_text(tid: str) -> None:
     """The app push can be accepted and still never shown (the phone asleep, or its address stale). If the phone
     hasn't confirmed the text, say it as a normal notification too. Run as its own process: the text command
@@ -440,10 +535,8 @@ def _backup_text(tid: str) -> None:
     record = read_json(TEXTS / f"{tid}.json")
     if record.get("status") != "sent":
         return
-    topic = RING_TOPIC.read_text().strip() if RING_TOPIC.exists() else ""
     agent = str(record.get("agent") or "Henchline")
-    if topic and ntfy(topic, agent.capitalize(), str(record.get("words") or ""),
-                      {"Tags": "speech_balloon", "Priority": "high"}):
+    if ntfy_text(tid, agent, str(record.get("words") or ""), {"Priority": "high"}):
         log(HANDSFREE_LOG, f"{agent} text not confirmed by the phone: sent the backup notification")
 
 
@@ -466,15 +559,27 @@ def with_host(body: bytes) -> bytes:
 def push(body: bytes, headers: dict | None = None, to: str = "") -> bool:
     """Henchline's own push address (the ntfy app wakes it): never printed. `to`: that address as already read
     (a call probe goes only to the one checked as understanding it)."""
+    return push_outcome(body, headers, to) == "sent"
+
+
+def push_outcome(body: bytes, headers: dict | None = None, to: str = "") -> str:
+    """push, saying how it went: "sent"; "unreachable" (no network, DNS, a timeout: worth trying again later); or
+    "refused" (the push server answered with an HTTP error, or the address is unusable: trying again won't help)."""
     body = with_host(body)
     try:
         urllib.request.urlopen(urllib.request.Request(to or CALL_RING.read_text().strip(), data=body,
                                                       headers={"Content-Type": "application/json", **(headers or {})}),
                                timeout=10).close()
-        return True
-    except (OSError, ValueError) as exc:
+        return "sent"
+    except urllib.error.HTTPError as exc:  # before OSError: an HTTPError is one
+        print(f"Henchline's push address refused it (HTTP {exc.code})")
+        return "refused"
+    except ValueError as exc:
         print(f"Henchline's push address failed ({exc.__class__.__name__})")
-        return False
+        return "refused"
+    except OSError as exc:  # URLError (DNS, refused connection), a timeout
+        print(f"Henchline's push address failed ({exc.__class__.__name__})")
+        return "unreachable"
 
 
 def replies(reply: str, since: int) -> set[str]:
@@ -761,9 +866,12 @@ def main() -> int:
     if command == "text-backup" and args:  # internal: the backup, detached so `handsfree text` returns now
         _backup_text(args[0])
         return 0
+    if command == "text-retry" and args:  # internal: a queued text's pushes, detached the same way
+        _retry_text(args[0])
+        return 0
     if command == "text-status":
         status = text_status(args[0] if args else "")
-        down = subprocess.run(["systemctl", "--user", "is-active", "--quiet", "call.service"]).returncode != 0
+        down = not call_server_up()
         print((status or "unknown id") + (" (the call server is down: the phone can't report back)"
                                          if status == "sent" and down else ""))
         return 0 if status else 1
